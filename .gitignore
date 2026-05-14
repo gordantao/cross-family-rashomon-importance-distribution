@@ -1,0 +1,8 @@
+falcon_cano_featured.csv
+.claude
+.conda
+.vscode
+data/
+rid/
+*__pycache__
+*.DS_Store
