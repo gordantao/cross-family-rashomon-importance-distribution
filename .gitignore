@@ -3,6 +3,5 @@ falcon_cano_featured.csv
 .conda
 .vscode
 data/
-rid/
 *__pycache__
 *.DS_Store
