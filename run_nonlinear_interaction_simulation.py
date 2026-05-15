@@ -7,7 +7,7 @@ command-line workflow suitable for Slurm jobs.
 
 Usage:
     python run_nonlinear_interaction_simulation.py
-    sbatch run_nonlinear_interaction_simulation.sh
+    sbatch run_nonlinear_interaction_simulation.sl
 """
 
 import argparse

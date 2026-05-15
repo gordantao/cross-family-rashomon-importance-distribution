@@ -3,19 +3,16 @@
 #SBATCH --output=rid-analysis_%j.out
 #SBATCH --error=rid-analysis_%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=50          # <-- NUM_WORKERS is read from SLURM_CPUS_PER_TASK
+#SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
-#SBATCH --partition=general        # Uncomment and set your partition
-#SBATCH --account=your_account     # Uncomment and set your account/allocation
+#SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
 # -------------------------------------------------------
-# Sync note:
-#   --cpus-per-task above automatically sets the env var
-#   SLURM_CPUS_PER_TASK, which the Python script reads
-#   to set NUM_WORKERS. No manual syncing needed.
+# SLURM automatically sets:
+#   SLURM_CPUS_PER_TASK
+# which your Python script can read for NUM_WORKERS.
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -28,21 +25,35 @@ echo "Memory:        $SLURM_MEM_PER_NODE MB"
 echo "Start time:    $(date)"
 echo "========================================"
 
-# --- Environment setup ---
-# Adjust these to match your cluster's module system / conda location
+# --- Clean module environment ---
 module purge
-module add anaconda/2024.02
 
 # --- Change to the working directory ---
 cd "$SLURM_SUBMIT_DIR"
 
+# --- Explicitly set thread counts to match SLURM allocation ---
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+echo "Thread settings:"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
+echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"
+
+# --- Use Python directly from your conda environment ---
+PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab/bin/python"
+
+echo "Using python from: $PYTHON_ENV"
+$PYTHON_ENV --version
+
 # --- Run the analysis ---
-python run_rashomon_falcon_cano.py \
-    --data /users/g/t/gtao/falcon_cano_featured.csv \
+$PYTHON_ENV script.py \
+    --data /users/g/t/gtao/rid/falcon_cano_featured.csv \
     --output-dir results \
     --n-bootstraps 500 \
     --epsilon 0.05 \
-    --n-models-pool 50
+    --n-models-pool 50 \
 
 echo "========================================"
 echo "End time: $(date)"
