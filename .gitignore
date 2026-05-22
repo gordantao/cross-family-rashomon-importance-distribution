@@ -5,3 +5,5 @@ falcon_cano_featured.csv
 data/
 *__pycache__
 *.DS_Store
+results/
+analysis/

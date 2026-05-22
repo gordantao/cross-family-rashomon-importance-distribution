@@ -879,7 +879,137 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
 
 
 class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
-    """Cross-family RID estimator with a sklearn-style fit API."""
+    """Cross-family Rashomon Importance Distribution estimator.
+
+    This estimator builds a Rashomon set separately for each model family,
+    merges feature-importance samples across families, and returns empirical
+    importance distributions that can be summarized or ranked.
+
+    Parameters
+    ----------
+    model_configs : mapping of str to model config spec
+        Mapping from a family label (for example ``"Lasso"`` or ``"SVM"``)
+        to a model configuration accepted by
+        :func:`rid.models.resolve_model_config`.
+
+        Each value can be one of:
+
+        - Tuple forms:
+          - ``(model_class_or_trainer, kwargs)``
+          - ``(model_class_or_trainer, kwargs, search_grid)``
+          - ``(model_class_or_trainer, kwargs, search_grid, random_state_multiplier)``
+        - Mapping form with aliases:
+          - ``{"model": ...}``, ``{"estimator": ...}``, or ``{"trainer": ...}``
+            (all three keys are aliases for the model/trainer entry point)
+          - Optional ``"kwargs"``
+          - Optional ``"search_grid"``
+          - Optional ``"random_state_multiplier"``
+
+        Notes:
+        - ``search_grid`` and ``random_state_multiplier`` overrides are supported
+          when the config references a model class, not an already-created
+          trainer instance.
+        - Family labels are preserved in ``family_counts_`` and
+          ``family_perf_stats_``.
+
+    epsilon : float, default=0.05
+        Rashomon tolerance. A candidate model is retained in the Rashomon set
+        if its bootstrap loss is within ``(1 + epsilon) * best_loss``.
+
+    n_bootstraps : int, default=500
+        Number of bootstrap resamples used to estimate RID curves.
+
+    n_models_per_class : int, default=50
+        Candidate pool size requested per family and bootstrap before Rashomon
+        filtering.
+
+    vi_metrics : {"sub_mr", "loco", "coef"}, callable, or sequence of these, default=None
+        Feature-importance metrics to compute. If ``None``, uses all built-in
+        VI metrics: ``("sub_mr", "loco", "coef")``.
+
+        String aliases:
+        - ``"sub_mr"``: subtraction-based model reliance.
+        - ``"loco"``: leave-one-covariate-out importance.
+        - ``"coef"``: normalized absolute coefficients for linear models.
+
+        Callable aliases that normalize to the same canonical names:
+        - ``compute_model_reliance`` and ``vi_sub_mr`` -> ``"sub_mr"``
+        - ``compute_loco_importance`` and ``vi_loco`` -> ``"loco"``
+        - ``compute_coef_importance`` and ``vi_coef`` -> ``"coef"``
+
+        Custom callables are supported. The metric name is resolved by:
+        - ``callable.metric_name`` if present,
+        - else known callable aliases,
+        - else the callable ``__name__``.
+
+    performance_metrics : {"accuracy", "f1", "auprc"}, callable, or sequence of these, default=None
+        Per-model performance metrics summarized per family over Rashomon
+        members. If ``None``, uses all built-in performance metrics:
+        ``("accuracy", "f1", "auprc")``.
+
+        String aliases:
+        - ``"accuracy"``: classification accuracy.
+        - ``"f1"``: binary F1 for 2 classes, macro F1 otherwise.
+        - ``"auprc"``: average precision (macro for multiclass).
+
+        Callable aliases that normalize to canonical names:
+        - ``sklearn.metrics.accuracy_score`` and ``performance_accuracy``
+          -> ``"accuracy"``
+        - ``sklearn.metrics.f1_score`` and ``performance_f1`` -> ``"f1"``
+        - ``sklearn.metrics.average_precision_score`` and
+          ``performance_auprc`` -> ``"auprc"``
+
+        Custom callables follow the same naming rules as ``vi_metrics``.
+
+    family_balance_mode : {"unweighted", "weighted"}, default="unweighted"
+        Strategy for aggregating cross-family feature-importance samples.
+
+        - ``"unweighted"``: each Rashomon model contributes equally.
+        - ``"weighted"``: each family contributes equal total mass per
+          bootstrap (models are reweighted inversely by family Rashomon count).
+
+        If ``None``, this is normalized to ``"unweighted"``.
+
+    n_cdf_points : int, default=200
+        Number of points in the empirical CDF grid used for each metric's RID
+        curve.
+
+    n_jobs : int, default=1
+        Number of parallel jobs for bootstrap execution (passed to
+        :class:`joblib.Parallel`).
+
+    Attributes
+    ----------
+    metric_results_ : dict or None
+        Mapping ``metric_name -> (rid_cdfs, cdf_grid, raw_importances)``.
+        ``None`` if no bootstrap produced a non-empty Rashomon set.
+
+    family_counts_ : dict of str to int
+        Total number of Rashomon models selected for each family across valid
+        bootstraps.
+
+    family_perf_stats_ : dict or None
+        Nested mapping of family-level performance summary statistics for the
+        requested ``performance_metrics``. ``None`` when no valid bootstrap is
+        available.
+
+    n_valid_bootstraps_ : int
+        Number of bootstraps that produced at least one Rashomon model.
+
+    feature_names_ : list of str
+        Feature names derived from ``X.columns`` when available, otherwise
+        generated as ``x0, x1, ...``.
+
+    available_metrics_ : tuple of str
+        Canonical names of VI metrics available in ``metric_results_`` after
+        fit-time filtering.
+
+    Notes
+    -----
+    Metric callables are invoked by signature introspection. Any subset of the
+    following keyword arguments can be declared by custom metrics:
+    ``model, X, y, y_true, y_pred, y_prob, y_score, rng``.
+    """
 
     def __init__(
         self,
