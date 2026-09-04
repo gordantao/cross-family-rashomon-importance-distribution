@@ -2,11 +2,13 @@
 """Run Staellert direct target prediction tasks with feature selection.
 
 This script runs direct target prediction tasks on the Staellert control manifold
-and compares three top-k feature sets where possible:
+and compares five top-k feature sets where possible:
 1) Forward stepwise selection scored via random forest.
 2) Forward stepwise selection scored via logistic/linear regression.
-3) Single-family RID on a fully enumerated decision-tree Rashomon set
-   (classification tasks only).
+3) Single-family RID on a fully enumerated decision-tree Rashomon set.
+4) Cross-family RID with family_balance_mode='unweighted'.
+5) Cross-family RID with family_balance_mode='weighted'.
+Methods 3-5 are classification-only (they require predict_proba).
 
 Default tasks are those directly annotated in the paper-style dataset:
 - annotated_phase (classification)
@@ -23,13 +25,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from rid import FullyEnumeratedTreeClassifier, RashomonImportanceDistribution
+from rid import (
+    CrossFamilyRashomonImportanceDistribution,
+    ElasticNetClassifier,
+    FullyEnumeratedTreeClassifier,
+    LassoClassifier,
+    RashomonImportanceDistribution,
+    RidgeClassifier,
+)
 
 
 TASK_REGISTRY = {
@@ -68,8 +78,9 @@ def _parse_args() -> argparse.Namespace:
         description=(
             "Run direct target prediction tasks on Staellert data, comparing random-forest "
             "and logistic/linear-regression forward stepwise feature selection against "
-            "single-family RID on a fully enumerated decision-tree Rashomon set "
-            "(classification tasks only)."
+            "single-family RID on a fully enumerated decision-tree Rashomon set and "
+            "cross-family RID (both unweighted and weighted balance modes; "
+            "classification tasks only)."
         )
     )
     parser.add_argument(
@@ -533,6 +544,70 @@ def run_single_family_tree_rid(
     return top_features, pd.DataFrame(rows), perf_stats
 
 
+def _build_cross_family_model_configs() -> dict:
+    return {
+        "RandomForest": (RandomForestClassifier, {}),
+        "GradientBoosting": (GradientBoostingClassifier, {}),
+        "SVM": (SVC, {}),
+        "Lasso": (LassoClassifier, {}),
+        "ElasticNet": (ElasticNetClassifier, {}),
+        "Ridge": (RidgeClassifier, {}),
+    }
+
+
+def run_cross_family_rid(
+    X: pd.DataFrame,
+    y: pd.Series,
+    top_k: int,
+    rid_metric: str,
+    epsilon: float,
+    n_bootstraps: int,
+    n_models_per_class: int,
+    family_balance_mode: str,
+    n_jobs: int,
+) -> tuple[list[str], pd.DataFrame, dict]:
+    estimator = CrossFamilyRashomonImportanceDistribution(
+        model_configs=_build_cross_family_model_configs(),
+        epsilon=epsilon,
+        n_bootstraps=n_bootstraps,
+        n_models_per_class=n_models_per_class,
+        vi_metrics=(rid_metric,),
+        performance_metrics=("accuracy", "auprc"),
+        family_balance_mode=family_balance_mode,
+        n_jobs=n_jobs,
+    )
+    estimator.fit(X, y)
+
+    if estimator.metric_results_ is None:
+        raise RuntimeError(
+            f"Cross-family RID ({family_balance_mode}) returned no metric results; "
+            "no valid Rashomon bootstraps were found"
+        )
+
+    ranking = estimator.rank_features(rid_metric)
+    summary = estimator.metric_summary(rid_metric)
+    top_pairs = ranking[:top_k]
+    top_features = [feature for feature, _ in top_pairs]
+
+    rows = []
+    for rank, (feature, expected_importance) in enumerate(top_pairs, start=1):
+        rows.append(
+            {
+                "rank": rank,
+                "feature": feature,
+                "expected_importance": float(expected_importance),
+                "prob_positive": float(summary[feature]["prob_positive"]),
+            }
+        )
+
+    perf_summary = {
+        "family_counts": estimator.family_counts_,
+        "family_perf_stats": estimator.family_perf_stats_,
+        "n_valid_bootstraps": estimator.n_valid_bootstraps_,
+    }
+    return top_features, pd.DataFrame(rows), perf_summary
+
+
 def _build_comparison_table(method_feature_lists: dict[str, list[str]]) -> pd.DataFrame:
     ranks = {
         name: {feature: rank for rank, feature in enumerate(features, start=1)}
@@ -566,6 +641,16 @@ def _pairwise_overlap_counts(comparison: pd.DataFrame, method_names: list[str]) 
             )
     overlaps["overlap_all_methods"] = int(comparison["in_all_methods"].sum())
     return overlaps
+
+
+def _summarize_cross_family_perf(perf_summary: dict) -> dict:
+    family_perf_stats = perf_summary.get("family_perf_stats") or {}
+    accuracy_means = [stats["accuracy_mean"] for stats in family_perf_stats.values()]
+    auprc_means = [stats["auprc_mean"] for stats in family_perf_stats.values()]
+    return {
+        "accuracy_mean": float(np.mean(accuracy_means)) if accuracy_means else None,
+        "auprc_mean": float(np.mean(auprc_means)) if auprc_means else None,
+    }
 
 
 def _evaluate_feature_set(
@@ -678,8 +763,11 @@ def _run_single_task(
     }
 
     # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
+    # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
     rid_tree_features: list[str] = []
     rid_tree_perf: dict | None = None
+    cross_family_features: dict[str, list[str]] = {"unweighted": [], "weighted": []}
+    cross_family_perf: dict[str, dict | None] = {"unweighted": None, "weighted": None}
 
     if task == "classification":
         print(
@@ -698,6 +786,28 @@ def _run_single_task(
         )
         rid_tree_table.to_csv(task_output_dir / "rid_tree_top_features.csv", index=False)
         method_feature_lists["rid_tree"] = rid_tree_features
+
+        for balance_mode in ("unweighted", "weighted"):
+            print(
+                f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
+                f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
+                f"family_balance_mode={balance_mode}"
+            )
+            features, table, perf = run_cross_family_rid(
+                X=X,
+                y=y,
+                top_k=args.top_k,
+                rid_metric=args.rid_metric,
+                epsilon=args.rid_epsilon,
+                n_bootstraps=args.rid_n_bootstraps,
+                n_models_per_class=args.rid_n_models_pool,
+                family_balance_mode=balance_mode,
+                n_jobs=args.rid_n_jobs,
+            )
+            table.to_csv(task_output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
+            cross_family_features[balance_mode] = features
+            cross_family_perf[balance_mode] = perf
+            method_feature_lists[f"cross_family_{balance_mode}"] = features
     else:
         print("[rid] skipped: RID currently supports classification-style tasks only")
 
@@ -731,6 +841,16 @@ def _run_single_task(
             "top_features": rid_tree_features,
             "rashomon_perf_stats": rid_tree_perf,
         },
+        "cross_family_unweighted": {
+            "metric": args.rid_metric,
+            "top_features": cross_family_features["unweighted"],
+            "rashomon_perf_stats": cross_family_perf["unweighted"],
+        },
+        "cross_family_weighted": {
+            "metric": args.rid_metric,
+            "top_features": cross_family_features["weighted"],
+            "rashomon_perf_stats": cross_family_perf["weighted"],
+        },
         "overlap_counts": overlap_counts,
     }
 
@@ -739,10 +859,17 @@ def _run_single_task(
         json.dump(settings, handle, indent=2)
 
     print(f"[task] outputs saved in {task_output_dir}")
-    print(f"[task] stepwise_rf top-10:     {stepwise_rf_features[:10]}")
-    print(f"[task] stepwise_linear top-10: {stepwise_linear_features[:10]}")
+    print(f"[task] stepwise_rf top-10:           {stepwise_rf_features[:10]}")
+    print(f"[task] stepwise_linear top-10:       {stepwise_linear_features[:10]}")
     if rid_tree_features:
-        print(f"[task] rid_tree top-10:        {rid_tree_features[:10]}")
+        print(f"[task] rid_tree top-10:              {rid_tree_features[:10]}")
+    if cross_family_features["unweighted"]:
+        print(f"[task] cross_family_unweighted top-10: {cross_family_features['unweighted'][:10]}")
+    if cross_family_features["weighted"]:
+        print(f"[task] cross_family_weighted top-10:   {cross_family_features['weighted'][:10]}")
+
+    cross_family_unweighted_summary = _summarize_cross_family_perf(cross_family_perf["unweighted"] or {})
+    cross_family_weighted_summary = _summarize_cross_family_perf(cross_family_perf["weighted"] or {})
 
     row = {
         "task_name": task_name,
@@ -761,6 +888,10 @@ def _run_single_task(
         "rid_tree_accuracy_std": None if rid_tree_perf is None else rid_tree_perf.get("accuracy_std"),
         "rid_tree_auprc_mean": None if rid_tree_perf is None else rid_tree_perf.get("auprc_mean"),
         "rid_tree_auprc_std": None if rid_tree_perf is None else rid_tree_perf.get("auprc_std"),
+        "cross_family_unweighted_accuracy_mean": cross_family_unweighted_summary["accuracy_mean"],
+        "cross_family_unweighted_auprc_mean": cross_family_unweighted_summary["auprc_mean"],
+        "cross_family_weighted_accuracy_mean": cross_family_weighted_summary["accuracy_mean"],
+        "cross_family_weighted_auprc_mean": cross_family_weighted_summary["auprc_mean"],
     }
     row.update(overlap_counts)
     return row

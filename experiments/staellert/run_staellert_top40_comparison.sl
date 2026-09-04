@@ -51,11 +51,14 @@ $PYTHON_ENV --version
 # --- Run the top-k comparison analysis ---
 # Compares: (1) forward stepwise selection via random forest,
 #           (2) forward stepwise selection via logistic/linear regression,
-#           (3) single-family RID on a fully enumerated decision-tree Rashomon set
-#               (classification tasks only).
+#           (3) single-family RID on a fully enumerated decision-tree Rashomon set,
+#           (4) cross-family RID (family_balance_mode=unweighted),
+#           (5) cross-family RID (family_balance_mode=weighted).
+#           Methods 3-5 are classification-only (they require predict_proba).
 $PYTHON_ENV experiments/staellert/run_staellert_top40_comparison.py \
     --data-dir experiments/staellert/data/staellert_et_al \
     --output-dir experiments/staellert/results/top40_feature_comparison \
+    --tasks annotated_phase \
     --top-k 40 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
