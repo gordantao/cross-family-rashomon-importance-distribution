@@ -42,7 +42,7 @@ echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"
 
 # --- Use Python directly from your conda environment ---
-PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab/bin/python"
+PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab-falcon_cano/bin/python"
 
 echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
