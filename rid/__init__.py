@@ -21,6 +21,7 @@ from .core import (
 )
 from .models import (
     ElasticNetClassifier,
+    FullyEnumeratedTreeClassifier,
     GridCandidateTrainer,
     LassoClassifier,
     LinearClassifier,
@@ -35,6 +36,7 @@ from .models import (
 __all__ = [
     "CrossFamilyRashomonImportanceDistribution",
     "ElasticNetClassifier",
+    "FullyEnumeratedTreeClassifier",
     "GridCandidateTrainer",
     "LassoClassifier",
     "LinearClassifier",

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=top40-feature-comparison
-#SBATCH --output=top40-feature-comparison_%j.out
-#SBATCH --error=top40-feature-comparison_%j.err
+#SBATCH --job-name=rid-analysis
+#SBATCH --output=rid-analysis_%j.out
+#SBATCH --error=rid-analysis_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
@@ -12,7 +12,7 @@
 # -------------------------------------------------------
 # SLURM automatically sets:
 #   SLURM_CPUS_PER_TASK
-# which this Python script can use for parallel workers.
+# which your Python script can read for NUM_WORKERS.
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -22,14 +22,13 @@ echo "Job ID:        $SLURM_JOB_ID"
 echo "Node:          $(hostname)"
 echo "CPUs per task: $SLURM_CPUS_PER_TASK"
 echo "Memory:        $SLURM_MEM_PER_NODE MB"
-echo "Submit dir:    $SLURM_SUBMIT_DIR"
 echo "Start time:    $(date)"
 echo "========================================"
 
 # --- Clean module environment ---
 module purge
 
-# --- Change to the working directory ---
+# --- Change to the repo root (submit this job from the repo root) ---
 cd "$SLURM_SUBMIT_DIR"
 
 # --- Explicitly set thread counts to match SLURM allocation ---
@@ -48,13 +47,13 @@ PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab/bin/python"
 echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
-# --- Run the top-k comparison analysis ---
-$PYTHON_ENV run_falcon_cano_top40_comparison.py \
-    --data falcon_cano_featured.csv \
-    --output-dir results/top40_feature_comparison \
-    --top-k 40 \
-    --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
-    --rid-n-jobs "$SLURM_CPUS_PER_TASK"
+# --- Run the analysis ---
+$PYTHON_ENV experiments/falcon_cano/run_rashomon_falcon_cano.py \
+    --data experiments/falcon_cano/falcon_cano_featured.csv \
+    --output-dir experiments/falcon_cano/results \
+    --n-bootstraps 500 \
+    --epsilon 0.05 \
+    --n-models-pool 50 \
 
 echo "========================================"
 echo "End time: $(date)"

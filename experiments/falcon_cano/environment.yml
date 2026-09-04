@@ -1,0 +1,20 @@
+name: zikry_lab-falcon_cano
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - numpy>=1.26
+  - pandas>=2.1
+  - matplotlib>=3.8
+  - seaborn>=0.13
+  - scikit-learn>=1.4
+  - joblib>=1.3        # bundled with scikit-learn; explicit pin for parallel safety
+  - pip
+
+# Covers: run_rashomon_falcon_cano.py, run_falcon_cano_top40_comparison.py.
+# Both scripts import the shared `rid` package from the repo root at runtime
+# via a sys.path insert (see the top of each script) rather than an installed
+# package, so `rid` is not listed here as a dependency.
+# No notebook lives in this experiment folder, so ipython/ipykernel are
+# omitted; add them back if you create one.

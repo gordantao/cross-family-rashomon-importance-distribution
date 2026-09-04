@@ -77,9 +77,19 @@ Varma, M. V. S., Obach, R. S., Rotter, C. *et al.* “Physicochemical Space for 
 **Updated:** October 2025  
 **Purpose:** Research reference for interpretable ML on human oral bioavailability datasets.
 
+## Repository Layout
+
+- `rid/` — the shared `CrossFamilyRashomonImportanceDistribution` package used by every experiment below.
+- `docs/` — model write-up and diagrams for the cross-family RID methodology.
+- `experiments/falcon_cano/` — the bioavailability study (this README), driven by `run_rashomon_falcon_cano.py`.
+- `experiments/staellert/` — the Staellert single-cell manifold top-40 feature comparison, driven by `run_staellert_top40_comparison.py`.
+- `experiments/nonlinear_interaction_simulation/` — the synthetic simulation study that validates RID against known ground-truth DGPs, driven by `run_nonlinear_interaction_simulation.py`.
+
+Each experiment folder is self-contained (its own `data/`, `results/`, `analysis/`, and `environment.yml` as applicable) and imports the shared `rid` package from the repo root. The `environment.yml` at the repo root is the umbrella env covering all three experiments combined.
+
 ## RID Module
 
-The RID implementation now lives in the `rid` package rather than entirely inside `run_rashomon_falcon_cano.py`.
+The RID implementation lives in the `rid` package rather than entirely inside any one experiment script.
 The main entry points mirror a sklearn-style workflow: instantiate an estimator, call `fit(X, y)`, then inspect rankings or raw metric results.
 
 ```python
@@ -143,4 +153,4 @@ model_configs = {
 }
 ```
 
-`run_rashomon_falcon_cano.py` remains the reproducible CLI pipeline for the Falcon-Cano study, but it now delegates RID computation to the reusable package.
+`experiments/falcon_cano/run_rashomon_falcon_cano.py` remains the reproducible CLI pipeline for the Falcon-Cano study, but it now delegates RID computation to the reusable package.

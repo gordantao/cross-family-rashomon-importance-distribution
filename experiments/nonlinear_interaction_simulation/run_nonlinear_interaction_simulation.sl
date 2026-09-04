@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=rid-analysis
-#SBATCH --output=rid-analysis_%j.out
-#SBATCH --error=rid-analysis_%j.err
+#SBATCH --job-name=cross-rid-simulation
+#SBATCH --output=cross-rid-simulation_%j.out
+#SBATCH --error=cross-rid-simulation_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
@@ -22,6 +22,7 @@ echo "Job ID:        $SLURM_JOB_ID"
 echo "Node:          $(hostname)"
 echo "CPUs per task: $SLURM_CPUS_PER_TASK"
 echo "Memory:        $SLURM_MEM_PER_NODE MB"
+echo "Submit dir:    $SLURM_SUBMIT_DIR"
 echo "Start time:    $(date)"
 echo "========================================"
 
@@ -48,12 +49,12 @@ echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
 # --- Run the analysis ---
-$PYTHON_ENV script.py \
-    --data /users/g/t/gtao/rid/falcon_cano_featured.csv \
-    --output-dir results \
-    --n-bootstraps 500 \
-    --epsilon 0.05 \
-    --n-models-pool 50 \
+# Benchmarks ground-truth feature recovery across four methods per simulated cell:
+# (1) cross-family RID, (2) stepwise logistic regression, (3) stepwise random
+# forest, (4) single-family RID on a fully enumerated decision-tree Rashomon set.
+$PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation.py \
+	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation \
+	--num-workers "$SLURM_CPUS_PER_TASK"
 
 echo "========================================"
 echo "End time: $(date)"

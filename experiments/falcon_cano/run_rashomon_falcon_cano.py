@@ -14,7 +14,9 @@ Usage:
 import argparse
 import os
 import pickle
+import sys
 import time
+from pathlib import Path
 
 import matplotlib
 import pandas as pd
@@ -22,6 +24,8 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.svm import SVC
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from rid import (
     CrossFamilyRashomonImportanceDistribution,
@@ -312,14 +316,14 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="falcon_cano_featured.csv",
-        help="Path to the input CSV file (default: falcon_cano_featured.csv)",
+        default=str(Path(__file__).resolve().parent / "falcon_cano_featured.csv"),
+        help="Path to the input CSV file (default: <script dir>/falcon_cano_featured.csv)",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="results",
-        help="Directory for output figures and results (default: results/)",
+        default=str(Path(__file__).resolve().parent / "results"),
+        help="Directory for output figures and results (default: <script dir>/results)",
     )
     parser.add_argument(
         "--n-bootstraps",

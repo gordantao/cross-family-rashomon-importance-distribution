@@ -1,3 +1,8 @@
+# Shared umbrella environment covering all three experiments combined
+# (falcon_cano, staellert, nonlinear_interaction_simulation) plus every
+# analysis notebook in the repo. Use this for a single env that can run
+# everything; use experiments/<name>/environment.yml for a minimal env
+# scoped to just one experiment.
 name: zikry_lab
 channels:
   - conda-forge

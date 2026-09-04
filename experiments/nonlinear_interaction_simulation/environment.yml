@@ -1,0 +1,21 @@
+name: zikry_lab-nonlinear_interaction_simulation
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - numpy>=1.26
+  - pandas>=2.1
+  - matplotlib>=3.8
+  - seaborn>=0.13       # used by nonlinear_interaction_simulation.ipynb and analysis/nonlinear_interaction_results_analysis.ipynb
+  - scikit-learn>=1.4
+  - joblib>=1.3        # bundled with scikit-learn; explicit pin for parallel safety
+  - ipython>=8.0
+  - ipykernel>=6.0
+  - pip
+
+# Covers: run_nonlinear_interaction_simulation.py, nonlinear_interaction_simulation.ipynb,
+# and analysis/nonlinear_interaction_results_analysis.ipynb.
+# The script/notebooks import the shared `rid` package from the repo root at
+# runtime via a sys.path insert (see the top of the script) rather than an
+# installed package, so `rid` is not listed here as a dependency.

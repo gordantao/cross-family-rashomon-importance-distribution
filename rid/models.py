@@ -10,6 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.model_selection import ParameterGrid
 from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
 
 
 class LassoClassifier(LogisticRegression):
@@ -26,6 +27,15 @@ class RidgeClassifier(LogisticRegression):
 
 class LinearClassifier(LogisticRegression):
     """Unregularized LogisticRegression."""
+
+
+class FullyEnumeratedTreeClassifier(DecisionTreeClassifier):
+    """DecisionTreeClassifier whose Rashomon set is built by exhaustively
+    enumerating every point of a discretized hyperparameter grid, rather than
+    sampling it. Follows the single-family decision-tree treatment in the RID
+    literature (Donnelly, Katta, Rudin & Wu), approximating a full Rashomon
+    set of trees via grid enumeration instead of a specialized
+    branch-and-bound tree enumerator (e.g. TreeFARMS/GOSDT)."""
 
 
 @dataclass(frozen=True)
@@ -229,6 +239,24 @@ def _build_linear_estimator(model_kwargs):
     )
 
 
+def _build_decision_tree_estimator(config, random_state, model_kwargs):
+    if isinstance(config, Mapping):
+        return FullyEnumeratedTreeClassifier(
+            random_state=random_state,
+            **config,
+            **model_kwargs,
+        )
+
+    max_depth, min_samples_leaf, criterion = config
+    return FullyEnumeratedTreeClassifier(
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        criterion=criterion,
+        random_state=random_state,
+        **model_kwargs,
+    )
+
+
 TRAINER_REGISTRY = {
     LogisticRegression: GridCandidateTrainer(
         configs=[
@@ -289,6 +317,16 @@ TRAINER_REGISTRY = {
     ),
     LinearClassifier: SingleCandidateTrainer(
         build_estimator=_build_linear_estimator,
+    ),
+    FullyEnumeratedTreeClassifier: GridCandidateTrainer(
+        configs=[
+            (max_depth, min_samples_leaf, criterion)
+            for max_depth in [2, 3, 4, 5, 6]
+            for min_samples_leaf in [1, 5, 10, 20]
+            for criterion in ["gini", "entropy"]
+        ],
+        random_state_multiplier=9000,
+        build_estimator=_build_decision_tree_estimator,
     ),
 }
 

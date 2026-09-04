@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=cross-rid-simulation
-#SBATCH --output=cross-rid-simulation_%j.out
-#SBATCH --error=cross-rid-simulation_%j.err
+#SBATCH --job-name=falcon-cano-top40-comparison
+#SBATCH --output=falcon-cano-top40-comparison_%j.out
+#SBATCH --error=falcon-cano-top40-comparison_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
@@ -12,7 +12,7 @@
 # -------------------------------------------------------
 # SLURM automatically sets:
 #   SLURM_CPUS_PER_TASK
-# which your Python script can read for NUM_WORKERS.
+# which this Python script can use for parallel workers.
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -29,7 +29,7 @@ echo "========================================"
 # --- Clean module environment ---
 module purge
 
-# --- Change to the working directory ---
+# --- Change to the repo root (submit this job from the repo root) ---
 cd "$SLURM_SUBMIT_DIR"
 
 # --- Explicitly set thread counts to match SLURM allocation ---
@@ -48,10 +48,18 @@ PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab/bin/python"
 echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
-# --- Run the analysis ---
-$PYTHON_ENV run_nonlinear_interaction_simulation.py \
-	--output-dir results/nonlinear_interaction_simulation \
-	--num-workers "$SLURM_CPUS_PER_TASK"
+# --- Run the top-k comparison analysis ---
+# Compares: (1) forward stepwise selection via logistic regression,
+#           (2) forward stepwise selection via random forest,
+#           (3) single-family RID on a fully enumerated decision-tree Rashomon set.
+$PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
+    --data experiments/falcon_cano/falcon_cano_featured.csv \
+    --output-dir experiments/falcon_cano/results/top40_feature_comparison \
+    --top-k 40 \
+    --rid-n-bootstraps 500 \
+    --rid-n-models-pool 50 \
+    --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
+    --rid-n-jobs "$SLURM_CPUS_PER_TASK"
 
 echo "========================================"
 echo "End time: $(date)"

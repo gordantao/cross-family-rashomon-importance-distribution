@@ -3,7 +3,12 @@
 Cross-family RID simulation study runner (cluster-friendly).
 
 This script reproduces the cleaned nonlinear interaction notebook as a
-command-line workflow suitable for Slurm jobs.
+command-line workflow suitable for Slurm jobs, and benchmarks ground-truth
+feature recovery across four methods on each simulated dataset:
+1) Cross-family RID (the original benchmark).
+2) Forward stepwise selection scored via logistic regression.
+3) Forward stepwise selection scored via random forest.
+4) Single-family RID on a fully enumerated decision-tree Rashomon set.
 
 Usage:
     python run_nonlinear_interaction_simulation.py
@@ -15,19 +20,28 @@ import contextlib
 import io
 import json
 import os
+import sys
 import time
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.svm import SVC
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from rid import (
     CrossFamilyRashomonImportanceDistribution,
+    FullyEnumeratedTreeClassifier,
     LassoClassifier,
+    RashomonImportanceDistribution,
     RidgeClassifier,
     performance_accuracy,
     performance_auprc,
@@ -43,8 +57,13 @@ DEFAULT_BETA_GRID = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
 DEFAULT_NOISE_STD = 1.0
 DEFAULT_BASE_SEED = 20260514
 DEFAULT_EPSILON = 0.05
-DEFAULT_OUTPUT_DIR = "results/nonlinear_interaction_simulation"
+DEFAULT_OUTPUT_DIR = str(Path(__file__).resolve().parent / "results" / "nonlinear_interaction_simulation")
 DEFAULT_BALANCE_MODE = "unweighted"
+DEFAULT_STEPWISE_CV_SPLITS = 5
+DEFAULT_STEPWISE_LOGREG_C = 1.0
+DEFAULT_STEPWISE_RF_N_ESTIMATORS = 100
+DEFAULT_RANDOM_STATE = 42
+METHODS = ("cross_family_rid", "stepwise_logreg", "stepwise_rf", "rid_tree")
 
 RID_MODEL_CONFIGS = {
     "RF": {
@@ -510,6 +529,61 @@ def run_cross_family_rid(
     return ranked_features
 
 
+def _score_candidate_feature(feature, selected_features, X, y, model_cls, model_kwargs, cv, scoring):
+    feature_set = list(selected_features) + [feature]
+    estimator = model_cls(**model_kwargs)
+    scores = cross_val_score(
+        estimator, X[feature_set], y, cv=cv, scoring=scoring, n_jobs=1, error_score="raise"
+    )
+    return feature, float(np.mean(scores))
+
+
+def run_forward_stepwise_ranking(X, y, model_cls, model_kwargs, cv, scoring, n_jobs=1):
+    """Rank every feature via greedy forward selection (a full ranking, not just top-k)."""
+
+    selected_features = []
+    all_features = list(X.columns)
+
+    for _ in range(len(all_features)):
+        remaining = [feature for feature in all_features if feature not in selected_features]
+        scores = Parallel(n_jobs=n_jobs)(
+            delayed(_score_candidate_feature)(
+                feature, tuple(selected_features), X, y, model_cls, model_kwargs, cv, scoring
+            )
+            for feature in remaining
+        )
+        best_feature, _ = max(scores, key=lambda item: item[1])
+        selected_features.append(best_feature)
+
+    return selected_features
+
+
+def run_single_family_tree_rid(
+    X,
+    y,
+    *,
+    epsilon,
+    n_bootstraps,
+    n_models_pool,
+    n_jobs=1,
+):
+    estimator = RashomonImportanceDistribution(
+        epsilon=epsilon,
+        n_bootstraps=n_bootstraps,
+        n_models_pool=n_models_pool,
+        model_class=FullyEnumeratedTreeClassifier,
+        vi_metrics=(vi_sub_mr,),
+        performance_metrics=RID_PERFORMANCE_METRICS,
+        n_jobs=n_jobs,
+    )
+
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        estimator.fit(X, y)
+
+    ranked_features = [feature for feature, _ in estimator.rank_features(vi_sub_mr)]
+    return ranked_features
+
+
 def run_simulation_study(
     simulators,
     *,
@@ -522,9 +596,14 @@ def run_simulation_study(
     epsilon,
     base_seed,
     family_balance_mode,
+    stepwise_cv_splits,
+    stepwise_logreg_C,
+    stepwise_rf_n_estimators,
+    random_state,
     n_jobs=1,
 ):
     rows = []
+    snr_rows = []
     start = time.time()
 
     total_cells = len(simulators) * len(beta_grid) * n_repetitions
@@ -545,29 +624,70 @@ def run_simulation_study(
                 X = dataset[feature_columns]
                 y = dataset["Y"].astype(int)
                 ground_truth = tuple(dataset.attrs["relevant_features"])
+                snr_empirical = float(dataset.attrs["snr_empirical"])
 
-                ranked_features = run_cross_family_rid(
-                    X,
-                    y,
-                    n_bootstraps=n_bootstraps,
-                    n_models_per_class=n_models_per_class,
-                    epsilon=epsilon,
-                    family_balance_mode=family_balance_mode,
-                    n_jobs=n_jobs,
-                )
-
-                metric_row = compute_selection_metrics(ranked_features, ground_truth)
-                rows.append(
+                snr_rows.append(
                     {
                         "dgp": dgp_name,
                         "beta": float(beta),
                         "rep": rep,
-                        "snr_empirical": float(dataset.attrs["snr_empirical"]),
-                        "ground_truth": ", ".join(ground_truth),
-                        "ranked_top_k": ", ".join(ranked_features[: len(ground_truth)]),
-                        **metric_row,
+                        "snr_empirical": snr_empirical,
                     }
                 )
+
+                cv = StratifiedKFold(n_splits=stepwise_cv_splits, shuffle=True, random_state=random_state)
+                stepwise_scoring = "roc_auc"
+
+                method_rankings = {
+                    "cross_family_rid": run_cross_family_rid(
+                        X,
+                        y,
+                        n_bootstraps=n_bootstraps,
+                        n_models_per_class=n_models_per_class,
+                        epsilon=epsilon,
+                        family_balance_mode=family_balance_mode,
+                        n_jobs=n_jobs,
+                    ),
+                    "stepwise_logreg": run_forward_stepwise_ranking(
+                        X,
+                        y,
+                        LogisticRegression,
+                        {"C": stepwise_logreg_C, "max_iter": 100000, "random_state": random_state},
+                        cv,
+                        stepwise_scoring,
+                    ),
+                    "stepwise_rf": run_forward_stepwise_ranking(
+                        X,
+                        y,
+                        RandomForestClassifier,
+                        {"n_estimators": stepwise_rf_n_estimators, "random_state": random_state, "n_jobs": 1},
+                        cv,
+                        stepwise_scoring,
+                    ),
+                    "rid_tree": run_single_family_tree_rid(
+                        X,
+                        y,
+                        epsilon=epsilon,
+                        n_bootstraps=n_bootstraps,
+                        n_models_pool=n_models_per_class,
+                        n_jobs=n_jobs,
+                    ),
+                }
+
+                for method_name, ranked_features in method_rankings.items():
+                    metric_row = compute_selection_metrics(ranked_features, ground_truth)
+                    rows.append(
+                        {
+                            "dgp": dgp_name,
+                            "beta": float(beta),
+                            "rep": rep,
+                            "method": method_name,
+                            "snr_empirical": snr_empirical,
+                            "ground_truth": ", ".join(ground_truth),
+                            "ranked_top_k": ", ".join(ranked_features[: len(ground_truth)]),
+                            **metric_row,
+                        }
+                    )
 
                 completed += 1
                 if completed % max(1, n_repetitions) == 0:
@@ -578,12 +698,12 @@ def run_simulation_study(
                         f"elapsed={elapsed / 60.0:.1f}m"
                     )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.DataFrame(snr_rows)
 
 
 def build_metric_tables(study_results):
     grouped = (
-        study_results.groupby(["dgp", "beta"])[
+        study_results.groupby(["dgp", "beta", "method"])[
             [
                 "snr_empirical",
                 "precision_at_k",
@@ -599,7 +719,7 @@ def build_metric_tables(study_results):
     grouped.columns = ["_".join(col).strip("_") for col in grouped.columns.to_flat_index()]
 
     overall = (
-        study_results.groupby("dgp")
+        study_results.groupby(["dgp", "method"])
         [["precision_at_k", "recall_at_k", "ndcg_at_k", "exact_match", "mean_gt_rank"]]
         .mean()
         .reset_index()
@@ -610,6 +730,15 @@ def build_metric_tables(study_results):
         table[numeric_cols] = table[numeric_cols].round(3)
 
     return grouped, overall
+
+
+def build_snr_plot_table(snr_results):
+    return (
+        snr_results.groupby(["dgp", "beta"])["snr_empirical"]
+        .agg(["mean", "sem"])
+        .reset_index()
+        .sort_values(["dgp", "beta"])
+    )
 
 
 def save_snr_plot(snr_plot_table, output_path):
@@ -638,7 +767,11 @@ def save_snr_plot(snr_plot_table, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run cross-family RID simulation benchmark and save tables/plots."
+        description=(
+            "Benchmark ground-truth feature recovery across four methods (cross-family RID, "
+            "stepwise logistic regression, stepwise random forest, and single-family tree RID) "
+            "on simulated nonlinear-interaction datasets, and save tables/plots."
+        )
     )
     parser.add_argument(
         "--output-dir",
@@ -668,7 +801,7 @@ def parse_args():
         "--models-per-class",
         type=int,
         default=DEFAULT_MODELS_PER_CLASS,
-        help="RID models per class",
+        help="Candidate models per class/grid-point per bootstrap, shared by cross-family RID and single-family tree RID",
     )
     parser.add_argument(
         "--beta-grid",
@@ -702,6 +835,30 @@ def parse_args():
         help="Cross-family balance mode (for example: unweighted, weighted, count)",
     )
     parser.add_argument(
+        "--stepwise-cv-splits",
+        type=int,
+        default=DEFAULT_STEPWISE_CV_SPLITS,
+        help="CV folds for the forward-stepwise comparison methods (default: 5)",
+    )
+    parser.add_argument(
+        "--stepwise-logreg-C",
+        type=float,
+        default=DEFAULT_STEPWISE_LOGREG_C,
+        help="Inverse regularization strength for the stepwise logistic regression method (default: 1.0)",
+    )
+    parser.add_argument(
+        "--stepwise-rf-n-estimators",
+        type=int,
+        default=DEFAULT_STEPWISE_RF_N_ESTIMATORS,
+        help="Random forest trees for the stepwise random-forest method (default: 100)",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=DEFAULT_RANDOM_STATE,
+        help="Random state for stepwise CV folds and models (default: 42)",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=None,
@@ -727,12 +884,16 @@ def main():
     print(f"noise_std={args.noise_std}")
     print(f"epsilon={args.epsilon}")
     print(f"family_balance_mode={args.family_balance_mode}")
+    print(f"stepwise_cv_splits={args.stepwise_cv_splits}")
+    print(f"stepwise_logreg_C={args.stepwise_logreg_C}")
+    print(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
+    print(f"methods_compared={list(METHODS)}")
     print(f"n_jobs={n_jobs}")
     print("=" * 70)
 
     started = time.time()
 
-    study_results = run_simulation_study(
+    study_results, snr_results = run_simulation_study(
         SIMULATORS,
         beta_grid=args.beta_grid,
         sample_size=args.sample_size,
@@ -743,17 +904,15 @@ def main():
         epsilon=args.epsilon,
         base_seed=args.base_seed,
         family_balance_mode=args.family_balance_mode,
+        stepwise_cv_splits=args.stepwise_cv_splits,
+        stepwise_logreg_C=args.stepwise_logreg_C,
+        stepwise_rf_n_estimators=args.stepwise_rf_n_estimators,
+        random_state=args.random_state,
         n_jobs=n_jobs,
     )
 
     metric_table_by_dgp_beta, metric_table_by_dgp = build_metric_tables(study_results)
-
-    snr_plot_table = (
-        study_results.groupby(["dgp", "beta"])["snr_empirical"]
-        .agg(["mean", "sem"])
-        .reset_index()
-        .sort_values(["dgp", "beta"])
-    )
+    snr_plot_table = build_snr_plot_table(snr_results)
 
     study_settings = {
         "sample_size": args.sample_size,
@@ -764,8 +923,13 @@ def main():
         "noise_std": args.noise_std,
         "epsilon": args.epsilon,
         "family_balance_mode": args.family_balance_mode,
+        "stepwise_cv_splits": args.stepwise_cv_splits,
+        "stepwise_logreg_C": args.stepwise_logreg_C,
+        "stepwise_rf_n_estimators": args.stepwise_rf_n_estimators,
+        "random_state": args.random_state,
         "num_workers": n_jobs,
         "simulations_included": list(SIMULATORS.keys()),
+        "methods_compared": list(METHODS),
     }
 
     study_results_path = os.path.join(args.output_dir, "study_results.csv")
