@@ -51,7 +51,11 @@ $PYTHON_ENV --version
 # --- Run the top-k comparison analysis ---
 # Compares: (1) forward stepwise selection via logistic regression,
 #           (2) forward stepwise selection via random forest,
-#           (3) single-family RID on a fully enumerated decision-tree Rashomon set.
+#           (3) single-family RID on a fully enumerated decision-tree Rashomon set,
+#           (4) cross-family RID (family_balance_mode=unweighted),
+#           (5) cross-family RID (family_balance_mode=weighted).
+# Every method's selected features are scored with a common held-out CV
+# evaluator (logistic regression) for a fair, apples-to-apples comparison.
 $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --data experiments/falcon_cano/falcon_cano_featured.csv \
     --output-dir experiments/falcon_cano/results/top40_feature_comparison \

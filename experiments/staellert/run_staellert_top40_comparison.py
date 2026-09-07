@@ -10,6 +10,14 @@ and compares five top-k feature sets where possible:
 5) Cross-family RID with family_balance_mode='weighted'.
 Methods 3-5 are classification-only (they require predict_proba).
 
+Every method's selected top-k feature set is scored with the SAME held-out
+cross-validated evaluator (the task-appropriate linear model, proper k-fold
+CV) so all five methods are directly comparable. RID's own internal
+Rashomon-set performance stats (accuracy/AUPRC computed on the same bootstrap
+sample each model was fit on -- in-sample, not held-out) are recorded
+separately in run_settings.json for diagnostic purposes only; they are NOT
+comparable to the held-out CV scores and are not used to rank methods.
+
 Default tasks are those directly annotated in the paper-style dataset:
 - annotated_phase (classification)
 - annotated_age (regression)
@@ -680,6 +688,25 @@ def _evaluate_feature_set(
     }
 
 
+def run_common_evaluation(
+    X: pd.DataFrame,
+    y: pd.Series,
+    method_feature_lists: dict[str, list[str]],
+    model_cls,
+    model_kwargs: dict,
+    cv,
+    scoring: str,
+) -> dict[str, dict]:
+    """Evaluate every method's selected top-k features with the SAME held-out
+    CV evaluator, so methods are compared on equal footing regardless of which
+    model (if any) they used internally to select features."""
+
+    return {
+        name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+        for name, features in method_feature_lists.items()
+    }
+
+
 def _run_single_task(
     task_name: str,
     task_config: dict,
@@ -818,38 +845,57 @@ def _run_single_task(
     ).to_csv(task_output_dir / "top_feature_overlap.csv", index=False)
     overlap_counts = _pairwise_overlap_counts(comparison, list(method_feature_lists.keys()))
 
+    # --- Common held-out CV evaluation: every method's features scored the same way ---
+    # Reuses the task-appropriate linear model (LogisticRegression for classification,
+    # LinearRegression for regression) already built for stepwise_linear as the common
+    # evaluator, so every method -- including the RID-based ones, which previously had
+    # no held-out evaluation at all -- gets one directly comparable score.
+    common_eval = run_common_evaluation(
+        X, y, method_feature_lists, lin_model_cls, lin_model_kwargs, cv, stepwise_scoring
+    )
+
     settings = {
         "task_name": task_name,
         "task_config": task_config,
         "args": vars(args),
         "data_metadata": data_meta,
+        "common_evaluator": {
+            "model": lin_model_cls.__name__,
+            "model_kwargs": lin_model_kwargs,
+            "scoring": stepwise_scoring,
+            "note": (
+                "Every method's selected top-k features scored with this SAME held-out "
+                "CV evaluator for a fair, apples-to-apples comparison."
+            ),
+            "results": common_eval,
+        },
         "stepwise_rf": {
             "scoring": stepwise_scoring,
             "model_kwargs": rf_model_kwargs,
             "top_features": stepwise_rf_features,
-            "evaluation": stepwise_rf_eval,
+            "search_model_evaluation": stepwise_rf_eval,
         },
         "stepwise_linear": {
             "scoring": stepwise_scoring,
             "model": lin_model_cls.__name__,
             "model_kwargs": lin_model_kwargs,
             "top_features": stepwise_linear_features,
-            "evaluation": stepwise_linear_eval,
+            "search_model_evaluation": stepwise_linear_eval,
         },
         "rid_tree": {
             "metric": args.rid_metric,
             "top_features": rid_tree_features,
-            "rashomon_perf_stats": rid_tree_perf,
+            "rashomon_train_perf_stats": rid_tree_perf,
         },
         "cross_family_unweighted": {
             "metric": args.rid_metric,
             "top_features": cross_family_features["unweighted"],
-            "rashomon_perf_stats": cross_family_perf["unweighted"],
+            "rashomon_train_perf_stats": cross_family_perf["unweighted"],
         },
         "cross_family_weighted": {
             "metric": args.rid_metric,
             "top_features": cross_family_features["weighted"],
-            "rashomon_perf_stats": cross_family_perf["weighted"],
+            "rashomon_train_perf_stats": cross_family_perf["weighted"],
         },
         "overlap_counts": overlap_counts,
     }
@@ -859,17 +905,15 @@ def _run_single_task(
         json.dump(settings, handle, indent=2)
 
     print(f"[task] outputs saved in {task_output_dir}")
-    print(f"[task] stepwise_rf top-10:           {stepwise_rf_features[:10]}")
-    print(f"[task] stepwise_linear top-10:       {stepwise_linear_features[:10]}")
-    if rid_tree_features:
-        print(f"[task] rid_tree top-10:              {rid_tree_features[:10]}")
-    if cross_family_features["unweighted"]:
-        print(f"[task] cross_family_unweighted top-10: {cross_family_features['unweighted'][:10]}")
-    if cross_family_features["weighted"]:
-        print(f"[task] cross_family_weighted top-10:   {cross_family_features['weighted'][:10]}")
+    for name, features in method_feature_lists.items():
+        print(f"[task] {name} top-10: {features[:10]}")
+        print(
+            f"       held-out CV ({stepwise_scoring}): "
+            f"{common_eval[name]['cv_score_mean']:.4f} +- {common_eval[name]['cv_score_std']:.4f}"
+        )
 
-    cross_family_unweighted_summary = _summarize_cross_family_perf(cross_family_perf["unweighted"] or {})
-    cross_family_weighted_summary = _summarize_cross_family_perf(cross_family_perf["weighted"] or {})
+    cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"] or {})
+    cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"] or {})
 
     row = {
         "task_name": task_name,
@@ -878,21 +922,21 @@ def _run_single_task(
         "dataset_path": str(csv_path),
         "n_rows": data_meta["n_rows"],
         "n_features": data_meta["n_features_after_corr"],
-        "stepwise_scoring": stepwise_scoring,
-        "stepwise_rf_cv_score_mean": stepwise_rf_eval["cv_score_mean"],
-        "stepwise_rf_cv_score_std": stepwise_rf_eval["cv_score_std"],
-        "stepwise_linear_cv_score_mean": stepwise_linear_eval["cv_score_mean"],
-        "stepwise_linear_cv_score_std": stepwise_linear_eval["cv_score_std"],
-        "rid_tree_metric": None if rid_tree_perf is None else args.rid_metric,
-        "rid_tree_accuracy_mean": None if rid_tree_perf is None else rid_tree_perf.get("accuracy_mean"),
-        "rid_tree_accuracy_std": None if rid_tree_perf is None else rid_tree_perf.get("accuracy_std"),
-        "rid_tree_auprc_mean": None if rid_tree_perf is None else rid_tree_perf.get("auprc_mean"),
-        "rid_tree_auprc_std": None if rid_tree_perf is None else rid_tree_perf.get("auprc_std"),
-        "cross_family_unweighted_accuracy_mean": cross_family_unweighted_summary["accuracy_mean"],
-        "cross_family_unweighted_auprc_mean": cross_family_unweighted_summary["auprc_mean"],
-        "cross_family_weighted_accuracy_mean": cross_family_weighted_summary["accuracy_mean"],
-        "cross_family_weighted_auprc_mean": cross_family_weighted_summary["auprc_mean"],
+        "common_eval_scoring": stepwise_scoring,
     }
+    for name in method_feature_lists:
+        row[f"{name}_held_out_cv_score_mean"] = common_eval[name]["cv_score_mean"]
+        row[f"{name}_held_out_cv_score_std"] = common_eval[name]["cv_score_std"]
+    row.update(
+        {
+            "rid_tree_rashomon_train_accuracy_mean": None if rid_tree_perf is None else rid_tree_perf.get("accuracy_mean"),
+            "rid_tree_rashomon_train_auprc_mean": None if rid_tree_perf is None else rid_tree_perf.get("auprc_mean"),
+            "cross_family_unweighted_rashomon_train_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
+            "cross_family_unweighted_rashomon_train_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
+            "cross_family_weighted_rashomon_train_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],
+            "cross_family_weighted_rashomon_train_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
+        }
+    )
     row.update(overlap_counts)
     return row
 

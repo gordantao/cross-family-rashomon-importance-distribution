@@ -49,9 +49,10 @@ echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
 # --- Run the analysis ---
-# Benchmarks ground-truth feature recovery across four methods per simulated cell:
-# (1) cross-family RID, (2) stepwise logistic regression, (3) stepwise random
-# forest, (4) single-family RID on a fully enumerated decision-tree Rashomon set.
+# Benchmarks ground-truth feature recovery across five methods per simulated cell:
+# (1) cross-family RID (unweighted), (2) cross-family RID (weighted),
+# (3) stepwise logistic regression, (4) stepwise random forest,
+# (5) single-family RID on a fully enumerated decision-tree Rashomon set.
 $PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation.py \
 	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation \
 	--num-workers "$SLURM_CPUS_PER_TASK"

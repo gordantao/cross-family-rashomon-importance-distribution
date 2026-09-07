@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """Compare feature-selection methods for the Falcon-Cano bioavailability study.
 
-Compares three top-k feature sets on the Falcon-Cano oral-bioavailability
+Compares five top-k feature sets on the Falcon-Cano oral-bioavailability
 classification task (%F >= 50 vs. < 50):
 
 1) Forward stepwise selection scored via logistic-regression CV.
 2) Forward stepwise selection scored via random-forest CV.
 3) Single-family RID using a fully enumerated decision-tree Rashomon set
    (RashomonImportanceDistribution over FullyEnumeratedTreeClassifier).
+4) Cross-family RID with family_balance_mode='unweighted'.
+5) Cross-family RID with family_balance_mode='weighted'.
+
+Every method's selected top-k feature set is scored with the SAME held-out
+cross-validated evaluator (logistic regression, proper k-fold CV) so the five
+methods are directly comparable. RID's own internal Rashomon-set performance
+stats (accuracy/AUPRC computed on the same bootstrap sample each model was
+fit on -- in-sample, not held-out) are recorded separately in
+run_settings.json for diagnostic purposes only; they are NOT comparable to
+the held-out CV scores and are not used to rank methods.
 
 Usage:
     python run_falcon_cano_top40_comparison.py
@@ -25,14 +35,22 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rid import FullyEnumeratedTreeClassifier, RashomonImportanceDistribution  # noqa: E402
+from rid import (  # noqa: E402
+    CrossFamilyRashomonImportanceDistribution,
+    ElasticNetClassifier,
+    FullyEnumeratedTreeClassifier,
+    LassoClassifier,
+    RashomonImportanceDistribution,
+    RidgeClassifier,
+)
 from run_rashomon_falcon_cano import (  # noqa: E402
     remove_highly_correlated_features,
     resolve_num_workers,
@@ -45,7 +63,10 @@ def _parse_args() -> argparse.Namespace:
         description=(
             "Compare forward-stepwise feature selection (logistic regression and "
             "random forest) against single-family RID on a fully enumerated "
-            "decision-tree Rashomon set, for the Falcon-Cano bioavailability task."
+            "decision-tree Rashomon set and cross-family RID (both unweighted and "
+            "weighted balance modes), for the Falcon-Cano bioavailability task. "
+            "Every method's selected features are scored with a common held-out "
+            "CV evaluator for a fair comparison."
         )
     )
     parser.add_argument(
@@ -344,6 +365,99 @@ def run_single_family_tree_rid(
     return top_features, pd.DataFrame(rows), perf_stats
 
 
+def _build_cross_family_model_configs() -> dict:
+    return {
+        "RandomForest": (RandomForestClassifier, {}),
+        "GradientBoosting": (GradientBoostingClassifier, {}),
+        "SVM": (SVC, {}),
+        "Lasso": (LassoClassifier, {}),
+        "ElasticNet": (ElasticNetClassifier, {}),
+        "Ridge": (RidgeClassifier, {}),
+    }
+
+
+def run_cross_family_rid(
+    X: pd.DataFrame,
+    y: pd.Series,
+    top_k: int,
+    rid_metric: str,
+    epsilon: float,
+    n_bootstraps: int,
+    n_models_per_class: int,
+    family_balance_mode: str,
+    n_jobs: int,
+) -> tuple[list[str], pd.DataFrame, dict]:
+    estimator = CrossFamilyRashomonImportanceDistribution(
+        model_configs=_build_cross_family_model_configs(),
+        epsilon=epsilon,
+        n_bootstraps=n_bootstraps,
+        n_models_per_class=n_models_per_class,
+        vi_metrics=(rid_metric,),
+        performance_metrics=("accuracy", "auprc"),
+        family_balance_mode=family_balance_mode,
+        n_jobs=n_jobs,
+    )
+    estimator.fit(X, y)
+
+    if estimator.metric_results_ is None:
+        raise RuntimeError(
+            f"Cross-family RID ({family_balance_mode}) returned no metric results; "
+            "no valid Rashomon bootstraps were found"
+        )
+
+    ranking = estimator.rank_features(rid_metric)
+    summary = estimator.metric_summary(rid_metric)
+    top_pairs = ranking[:top_k]
+    top_features = [feature for feature, _ in top_pairs]
+
+    rows = []
+    for rank, (feature, expected_importance) in enumerate(top_pairs, start=1):
+        rows.append(
+            {
+                "rank": rank,
+                "feature": feature,
+                "expected_importance": float(expected_importance),
+                "prob_positive": float(summary[feature]["prob_positive"]),
+            }
+        )
+
+    perf_summary = {
+        "family_counts": estimator.family_counts_,
+        "family_perf_stats": estimator.family_perf_stats_,
+        "n_valid_bootstraps": estimator.n_valid_bootstraps_,
+    }
+    return top_features, pd.DataFrame(rows), perf_summary
+
+
+def _summarize_cross_family_perf(perf_summary: dict) -> dict:
+    family_perf_stats = perf_summary.get("family_perf_stats") or {}
+    accuracy_means = [stats["accuracy_mean"] for stats in family_perf_stats.values()]
+    auprc_means = [stats["auprc_mean"] for stats in family_perf_stats.values()]
+    return {
+        "accuracy_mean": float(np.mean(accuracy_means)) if accuracy_means else None,
+        "auprc_mean": float(np.mean(auprc_means)) if auprc_means else None,
+    }
+
+
+def run_common_evaluation(
+    X: pd.DataFrame,
+    y: pd.Series,
+    method_feature_lists: dict[str, list[str]],
+    model_cls,
+    model_kwargs: dict,
+    cv,
+    scoring: str,
+) -> dict[str, dict]:
+    """Evaluate every method's selected top-k features with the SAME held-out
+    CV evaluator, so methods are compared on equal footing regardless of which
+    model (if any) they used internally to select features."""
+
+    return {
+        name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+        for name, features in method_feature_lists.items()
+    }
+
+
 def _build_comparison_table(method_feature_lists: dict[str, list[str]]) -> pd.DataFrame:
     ranks = {
         name: {feature: rank for rank, feature in enumerate(features, start=1)}
@@ -477,11 +591,37 @@ def main() -> None:
     )
     rid_tree_table.to_csv(output_dir / "rid_tree_top_features.csv", index=False)
 
-    # --- Comparison across all three top-k feature sets ---
+    # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
+    cross_family_features: dict[str, list[str]] = {}
+    cross_family_perf: dict[str, dict] = {}
+    for balance_mode in ("unweighted", "weighted"):
+        print(
+            f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
+            f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
+            f"family_balance_mode={balance_mode}"
+        )
+        features, table, perf = run_cross_family_rid(
+            X=X,
+            y=y,
+            top_k=args.top_k,
+            rid_metric=args.rid_metric,
+            epsilon=args.rid_epsilon,
+            n_bootstraps=args.rid_n_bootstraps,
+            n_models_per_class=args.rid_n_models_pool,
+            family_balance_mode=balance_mode,
+            n_jobs=rid_n_jobs,
+        )
+        table.to_csv(output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
+        cross_family_features[balance_mode] = features
+        cross_family_perf[balance_mode] = perf
+
+    # --- Comparison across all five top-k feature sets ---
     method_feature_lists = {
         "stepwise_logreg": stepwise_logreg_features,
         "stepwise_rf": stepwise_rf_features,
         "rid_tree": rid_tree_features,
+        "cross_family_unweighted": cross_family_features["unweighted"],
+        "cross_family_weighted": cross_family_features["weighted"],
     }
     comparison = _build_comparison_table(method_feature_lists)
     comparison.sort_values(
@@ -490,26 +630,63 @@ def main() -> None:
     ).to_csv(output_dir / "top_feature_overlap.csv", index=False)
     overlap_counts = _pairwise_overlap_counts(comparison, list(method_feature_lists.keys()))
 
+    # --- Common held-out CV evaluation: every method's features scored the same way ---
+    common_model_kwargs = {
+        "penalty": "l2",
+        "C": args.stepwise_logreg_C,
+        "solver": "lbfgs",
+        "max_iter": 100000,
+        "random_state": args.random_state,
+    }
+    common_eval = run_common_evaluation(
+        X, y, method_feature_lists, LogisticRegression, common_model_kwargs, cv, args.stepwise_scoring
+    )
+
+    cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
+    cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"])
+
     settings = {
         "args": vars(args),
         "data_metadata": data_meta,
+        "common_evaluator": {
+            "model": "LogisticRegression",
+            "model_kwargs": common_model_kwargs,
+            "scoring": args.stepwise_scoring,
+            "note": (
+                "Every method's selected top-k features scored with this SAME held-out "
+                "CV evaluator for a fair, apples-to-apples comparison."
+            ),
+            "results": common_eval,
+        },
         "stepwise_logreg": {
             "scoring": args.stepwise_scoring,
             "model_kwargs": logreg_kwargs,
             "top_features": stepwise_logreg_features,
-            "evaluation": stepwise_logreg_eval,
+            "search_model_evaluation": stepwise_logreg_eval,
         },
         "stepwise_rf": {
             "scoring": args.stepwise_scoring,
             "model_kwargs": rf_kwargs,
             "top_features": stepwise_rf_features,
-            "evaluation": stepwise_rf_eval,
+            "search_model_evaluation": stepwise_rf_eval,
         },
         "rid_tree": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
             "top_features": rid_tree_features,
-            "rashomon_perf_stats": rid_tree_perf,
+            "rashomon_train_perf_stats": rid_tree_perf,
+        },
+        "cross_family_unweighted": {
+            "metric": args.rid_metric,
+            "epsilon": args.rid_epsilon,
+            "top_features": cross_family_features["unweighted"],
+            "rashomon_train_perf_stats": cross_family_perf["unweighted"],
+        },
+        "cross_family_weighted": {
+            "metric": args.rid_metric,
+            "epsilon": args.rid_epsilon,
+            "top_features": cross_family_features["weighted"],
+            "rashomon_train_perf_stats": cross_family_perf["weighted"],
         },
         "overlap_counts": overlap_counts,
     }
@@ -523,20 +700,22 @@ def main() -> None:
         "dataset_path": data_meta["dataset_path"],
         "n_rows": data_meta["n_rows"],
         "n_features": data_meta["n_features_after_corr"],
-        "stepwise_logreg_scoring": args.stepwise_scoring,
-        "stepwise_logreg_cv_score_mean": stepwise_logreg_eval["cv_score_mean"],
-        "stepwise_logreg_cv_score_std": stepwise_logreg_eval["cv_score_std"],
-        "stepwise_rf_scoring": args.stepwise_scoring,
-        "stepwise_rf_cv_score_mean": stepwise_rf_eval["cv_score_mean"],
-        "stepwise_rf_cv_score_std": stepwise_rf_eval["cv_score_std"],
-        "rid_tree_metric": args.rid_metric,
-        "rid_tree_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
-        "rid_tree_accuracy_std": rid_tree_perf.get("accuracy_std"),
-        "rid_tree_auprc_mean": rid_tree_perf.get("auprc_mean"),
-        "rid_tree_auprc_std": rid_tree_perf.get("auprc_std"),
-        "rid_tree_n_valid_bootstraps": rid_tree_perf.get("n_valid_bootstraps"),
-        **overlap_counts,
+        "common_eval_scoring": args.stepwise_scoring,
     }
+    for name in method_feature_lists:
+        overall_row[f"{name}_held_out_cv_score_mean"] = common_eval[name]["cv_score_mean"]
+        overall_row[f"{name}_held_out_cv_score_std"] = common_eval[name]["cv_score_std"]
+    overall_row.update(
+        {
+            "rid_tree_rashomon_train_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
+            "rid_tree_rashomon_train_auprc_mean": rid_tree_perf.get("auprc_mean"),
+            "cross_family_unweighted_rashomon_train_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
+            "cross_family_unweighted_rashomon_train_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
+            "cross_family_weighted_rashomon_train_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],
+            "cross_family_weighted_rashomon_train_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
+        }
+    )
+    overall_row.update(overlap_counts)
     overall_summary_path = output_dir / "overall_task_summary.csv"
     pd.DataFrame([overall_row]).to_csv(overall_summary_path, index=False)
 
@@ -549,9 +728,9 @@ def main() -> None:
 
     elapsed = time.time() - start_time
     print("=" * 70)
-    print(f"stepwise_logreg top-10: {stepwise_logreg_features[:10]}")
-    print(f"stepwise_rf top-10:     {stepwise_rf_features[:10]}")
-    print(f"rid_tree top-10:        {rid_tree_features[:10]}")
+    for name, features in method_feature_lists.items():
+        print(f"{name} top-10: {features[:10]}")
+        print(f"  held-out CV ({args.stepwise_scoring}): {common_eval[name]['cv_score_mean']:.4f} +- {common_eval[name]['cv_score_std']:.4f}")
     print(f"overlap counts: {overlap_counts}")
     print(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
     print(f"Results saved to: {output_dir}/")

@@ -4,11 +4,17 @@ Cross-family RID simulation study runner (cluster-friendly).
 
 This script reproduces the cleaned nonlinear interaction notebook as a
 command-line workflow suitable for Slurm jobs, and benchmarks ground-truth
-feature recovery across four methods on each simulated dataset:
-1) Cross-family RID (the original benchmark).
-2) Forward stepwise selection scored via logistic regression.
-3) Forward stepwise selection scored via random forest.
-4) Single-family RID on a fully enumerated decision-tree Rashomon set.
+feature recovery across five methods on each simulated dataset:
+1) Cross-family RID with family_balance_mode='unweighted'.
+2) Cross-family RID with family_balance_mode='weighted'.
+3) Forward stepwise selection scored via logistic regression.
+4) Forward stepwise selection scored via random forest.
+5) Single-family RID on a fully enumerated decision-tree Rashomon set.
+
+Ground-truth recovery (precision@k/recall@k/NDCG@k/exact-match vs. the known
+relevant features) is unaffected by RID's in-sample performance-metric
+caveat (see rid/core.py) since it never touches predictive performance --
+only ranking overlap with ground truth.
 
 Usage:
     python run_nonlinear_interaction_simulation.py
@@ -58,12 +64,11 @@ DEFAULT_NOISE_STD = 1.0
 DEFAULT_BASE_SEED = 20260514
 DEFAULT_EPSILON = 0.05
 DEFAULT_OUTPUT_DIR = str(Path(__file__).resolve().parent / "results" / "nonlinear_interaction_simulation")
-DEFAULT_BALANCE_MODE = "unweighted"
 DEFAULT_STEPWISE_CV_SPLITS = 5
 DEFAULT_STEPWISE_LOGREG_C = 1.0
 DEFAULT_STEPWISE_RF_N_ESTIMATORS = 100
 DEFAULT_RANDOM_STATE = 42
-METHODS = ("cross_family_rid", "stepwise_logreg", "stepwise_rf", "rid_tree")
+METHODS = ("cross_family_unweighted", "cross_family_weighted", "stepwise_logreg", "stepwise_rf", "rid_tree")
 
 RID_MODEL_CONFIGS = {
     "RF": {
@@ -595,7 +600,6 @@ def run_simulation_study(
     noise_std,
     epsilon,
     base_seed,
-    family_balance_mode,
     stepwise_cv_splits,
     stepwise_logreg_C,
     stepwise_rf_n_estimators,
@@ -639,13 +643,22 @@ def run_simulation_study(
                 stepwise_scoring = "roc_auc"
 
                 method_rankings = {
-                    "cross_family_rid": run_cross_family_rid(
+                    "cross_family_unweighted": run_cross_family_rid(
                         X,
                         y,
                         n_bootstraps=n_bootstraps,
                         n_models_per_class=n_models_per_class,
                         epsilon=epsilon,
-                        family_balance_mode=family_balance_mode,
+                        family_balance_mode="unweighted",
+                        n_jobs=n_jobs,
+                    ),
+                    "cross_family_weighted": run_cross_family_rid(
+                        X,
+                        y,
+                        n_bootstraps=n_bootstraps,
+                        n_models_per_class=n_models_per_class,
+                        epsilon=epsilon,
+                        family_balance_mode="weighted",
                         n_jobs=n_jobs,
                     ),
                     "stepwise_logreg": run_forward_stepwise_ranking(
@@ -768,8 +781,9 @@ def save_snr_plot(snr_plot_table, output_path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark ground-truth feature recovery across four methods (cross-family RID, "
-            "stepwise logistic regression, stepwise random forest, and single-family tree RID) "
+            "Benchmark ground-truth feature recovery across five methods (cross-family RID "
+            "unweighted, cross-family RID weighted, stepwise logistic regression, stepwise "
+            "random forest, and single-family tree RID) "
             "on simulated nonlinear-interaction datasets, and save tables/plots."
         )
     )
@@ -829,12 +843,6 @@ def parse_args():
         help="Rashomon epsilon",
     )
     parser.add_argument(
-        "--family-balance-mode",
-        type=str,
-        default=DEFAULT_BALANCE_MODE,
-        help="Cross-family balance mode (for example: unweighted, weighted, count)",
-    )
-    parser.add_argument(
         "--stepwise-cv-splits",
         type=int,
         default=DEFAULT_STEPWISE_CV_SPLITS,
@@ -883,7 +891,6 @@ def main():
     print(f"beta_grid={args.beta_grid}")
     print(f"noise_std={args.noise_std}")
     print(f"epsilon={args.epsilon}")
-    print(f"family_balance_mode={args.family_balance_mode}")
     print(f"stepwise_cv_splits={args.stepwise_cv_splits}")
     print(f"stepwise_logreg_C={args.stepwise_logreg_C}")
     print(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
@@ -903,7 +910,6 @@ def main():
         noise_std=args.noise_std,
         epsilon=args.epsilon,
         base_seed=args.base_seed,
-        family_balance_mode=args.family_balance_mode,
         stepwise_cv_splits=args.stepwise_cv_splits,
         stepwise_logreg_C=args.stepwise_logreg_C,
         stepwise_rf_n_estimators=args.stepwise_rf_n_estimators,
@@ -922,7 +928,6 @@ def main():
         "beta_grid": args.beta_grid,
         "noise_std": args.noise_std,
         "epsilon": args.epsilon,
-        "family_balance_mode": args.family_balance_mode,
         "stepwise_cv_splits": args.stepwise_cv_splits,
         "stepwise_logreg_C": args.stepwise_logreg_C,
         "stepwise_rf_n_estimators": args.stepwise_rf_n_estimators,
