@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """Run Staellert direct target prediction tasks with feature selection.
 
-This script runs direct target prediction tasks on the Staellert control manifold
-and compares five top-k feature sets where possible:
+This script is classification-only (regression-task support was removed --
+see TASK_REGISTRY) and compares five top-k feature sets:
 1) Forward stepwise selection scored via random forest.
-2) Forward stepwise selection scored via logistic/linear regression.
+2) Forward stepwise selection scored via logistic regression.
 3) Single-family RID on a fully enumerated decision-tree Rashomon set.
 4) Cross-family RID with family_balance_mode='unweighted'.
 5) Cross-family RID with family_balance_mode='weighted'.
-Methods 3-5 are classification-only (they require predict_proba).
 
 Every method's selected top-k feature set is scored with the SAME held-out
-cross-validated evaluator (the task-appropriate linear model, proper k-fold
-CV) so all five methods are directly comparable. RID's own internal
-Rashomon-set performance stats (accuracy/AUPRC computed on the same bootstrap
-sample each model was fit on -- in-sample, not held-out) are recorded
-separately in run_settings.json for diagnostic purposes only; they are NOT
-comparable to the held-out CV scores and are not used to rank methods.
+cross-validated evaluator (logistic regression, proper k-fold CV) so all five
+methods are directly comparable. RID's own internal Rashomon-set performance
+stats (accuracy/AUPRC computed on the same bootstrap sample each model was
+fit on -- in-sample, not held-out) are recorded separately in
+run_settings.json for diagnostic purposes only; they are NOT comparable to
+the held-out CV scores and are not used to rank methods.
 
-Default tasks are those directly annotated in the paper-style dataset:
-- annotated_phase (classification)
-- annotated_age (regression)
+Default task is the classification target directly annotated in the
+paper-style dataset: annotated_phase.
 """
 
 from __future__ import annotations
@@ -33,9 +31,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -56,20 +54,10 @@ TASK_REGISTRY = {
         "target_column": "annotated phase",
         "task": "classification",
     },
-    "annotated_age": {
-        "file": "control_manifold_allfeatures.csv",
-        "target_column": "annotated age",
-        "task": "regression",
-    },
     "phase": {
         "file": "control_manifold_allfeatures.csv",
         "target_column": "phase",
         "task": "classification",
-    },
-    "age": {
-        "file": "control_manifold_allfeatures.csv",
-        "target_column": "age",
-        "task": "regression",
     },
 }
 
@@ -84,11 +72,10 @@ KNOWN_TARGET_COLUMNS = {
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run direct target prediction tasks on Staellert data, comparing random-forest "
-            "and logistic/linear-regression forward stepwise feature selection against "
-            "single-family RID on a fully enumerated decision-tree Rashomon set and "
-            "cross-family RID (both unweighted and weighted balance modes; "
-            "classification tasks only)."
+            "Run classification-only direct target prediction tasks on Staellert data, "
+            "comparing random-forest and logistic-regression forward stepwise feature "
+            "selection against single-family RID on a fully enumerated decision-tree "
+            "Rashomon set and cross-family RID (both unweighted and weighted balance modes)."
         )
     )
     parser.add_argument(
@@ -100,10 +87,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tasks",
         type=str,
-        default="annotated_phase,annotated_age",
+        default="annotated_phase",
         help=(
             "Comma-separated task names. Use 'all' for all known tasks. "
-            "Default: annotated_phase,annotated_age"
+            "Default: annotated_phase"
         ),
     )
     parser.add_argument(
@@ -142,12 +129,6 @@ def _parse_args() -> argparse.Namespace:
             "sklearn scoring for classification stepwise CV. Defaults to roc_auc for "
             "binary and f1_macro for multiclass."
         ),
-    )
-    parser.add_argument(
-        "--stepwise-scoring-regression",
-        type=str,
-        default="neg_root_mean_squared_error",
-        help="sklearn scoring for regression stepwise CV (default: neg_root_mean_squared_error)",
     )
     parser.add_argument(
         "--stepwise-cv-splits",
@@ -305,7 +286,6 @@ def _remove_highly_correlated_features(
 def _prepare_task_dataset(
     csv_path: Path,
     target_column: str,
-    task: str,
     correlation_threshold: float,
     include_phate_features: bool,
 ) -> tuple[pd.DataFrame, pd.Series, dict]:
@@ -328,104 +308,63 @@ def _prepare_task_dataset(
     X = _sanitize_features(df[feature_cols])
 
     y_raw = df[target_column]
-    if task == "classification":
-        valid_rows = y_raw.notna()
-        y = y_raw.loc[valid_rows].astype(str)
-    else:
-        y = pd.to_numeric(y_raw, errors="coerce")
-        valid_rows = y.notna()
-        y = y.loc[valid_rows]
+    valid_rows = y_raw.notna()
+    y = y_raw.loc[valid_rows].astype(str)
 
     X = X.loc[valid_rows].copy()
 
     X_before_corr = X.shape[1]
     X, removed_corr = _remove_highly_correlated_features(X, correlation_threshold)
 
-    if task == "classification":
-        target_meta = {
-            "n_classes": int(y.nunique()),
-            "class_counts": y.value_counts().to_dict(),
-        }
-    else:
-        target_meta = {
-            "target_min": float(y.min()),
-            "target_max": float(y.max()),
-            "target_mean": float(y.mean()),
-            "target_std": float(y.std()),
-        }
-
     metadata = {
         "dataset_path": str(csv_path),
         "target_column": target_column,
-        "task": task,
+        "task": "classification",
         "n_rows": int(X.shape[0]),
         "n_features_before_corr": int(X_before_corr),
         "n_features_after_corr": int(X.shape[1]),
         "n_removed_corr": int(len(removed_corr)),
         "removed_corr_features": removed_corr,
-        **target_meta,
+        "n_classes": int(y.nunique()),
+        "class_counts": y.value_counts().to_dict(),
     }
     return X, y, metadata
 
 
-def _make_stepwise_cv_and_scoring(
-    args: argparse.Namespace,
-    task: str,
-    y: pd.Series,
-):
-    if task == "classification":
-        cv = StratifiedKFold(
-            n_splits=args.stepwise_cv_splits,
-            shuffle=True,
-            random_state=args.random_state,
-        )
-        if args.stepwise_scoring_classification:
-            scoring = args.stepwise_scoring_classification
-        else:
-            scoring = "roc_auc" if int(y.nunique()) == 2 else "f1_macro"
+def _make_stepwise_cv_and_scoring(args: argparse.Namespace, y: pd.Series):
+    cv = StratifiedKFold(
+        n_splits=args.stepwise_cv_splits,
+        shuffle=True,
+        random_state=args.random_state,
+    )
+    if args.stepwise_scoring_classification:
+        scoring = args.stepwise_scoring_classification
     else:
-        cv = KFold(
-            n_splits=args.stepwise_cv_splits,
-            shuffle=True,
-            random_state=args.random_state,
-        )
-        scoring = args.stepwise_scoring_regression
+        scoring = "roc_auc" if int(y.nunique()) == 2 else "f1_macro"
 
     return cv, scoring
 
 
-def _make_stepwise_rf_model(args: argparse.Namespace, task: str):
-    if task == "classification":
-        class_weight = None if str(args.stepwise_class_weight).lower() == "none" else args.stepwise_class_weight
-        return RandomForestClassifier, {
-            "n_estimators": args.stepwise_n_estimators,
-            "random_state": args.random_state,
-            "n_jobs": 1,
-            "max_depth": args.stepwise_max_depth,
-            "min_samples_leaf": args.stepwise_min_samples_leaf,
-            "class_weight": class_weight,
-        }
-
-    return RandomForestRegressor, {
+def _make_stepwise_rf_model(args: argparse.Namespace):
+    class_weight = None if str(args.stepwise_class_weight).lower() == "none" else args.stepwise_class_weight
+    return RandomForestClassifier, {
         "n_estimators": args.stepwise_n_estimators,
         "random_state": args.random_state,
         "n_jobs": 1,
         "max_depth": args.stepwise_max_depth,
         "min_samples_leaf": args.stepwise_min_samples_leaf,
+        "class_weight": class_weight,
     }
 
 
-def _make_stepwise_linear_model(args: argparse.Namespace, task: str):
-    if task == "classification":
-        class_weight = None if str(args.stepwise_class_weight).lower() == "none" else args.stepwise_class_weight
-        return LogisticRegression, {
-            "C": args.stepwise_logreg_C,
-            "max_iter": 100000,
-            "random_state": args.random_state,
-            "class_weight": class_weight,
-        }
-
-    return LinearRegression, {}
+def _make_stepwise_logreg_model(args: argparse.Namespace):
+    class_weight = None if str(args.stepwise_class_weight).lower() == "none" else args.stepwise_class_weight
+    return LogisticRegression, {
+        "C": args.stepwise_logreg_C,
+        "max_iter": 100000,
+        "random_state": args.random_state,
+        "class_weight": class_weight,
+    }
 
 
 def _score_candidate_feature(
@@ -728,7 +667,6 @@ def _run_single_task(
     X, y, data_meta = _prepare_task_dataset(
         csv_path=csv_path,
         target_column=target_column,
-        task=task,
         correlation_threshold=args.correlation_threshold,
         include_phate_features=args.include_phate_features,
     )
@@ -738,10 +676,10 @@ def _run_single_task(
         f"(removed_corr={data_meta['n_removed_corr']})"
     )
 
-    cv, stepwise_scoring = _make_stepwise_cv_and_scoring(args, task, y)
+    cv, stepwise_scoring = _make_stepwise_cv_and_scoring(args, y)
 
     # --- Method 1: forward stepwise selection via random forest ---
-    rf_model_cls, rf_model_kwargs = _make_stepwise_rf_model(args, task)
+    rf_model_cls, rf_model_kwargs = _make_stepwise_rf_model(args)
     print(
         f"[stepwise:rf] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
         f"n_estimators={args.stepwise_n_estimators}"
@@ -762,81 +700,75 @@ def _run_single_task(
     )
     stepwise_rf_history.to_csv(task_output_dir / "stepwise_rf_top_features.csv", index=False)
 
-    # --- Method 2: forward stepwise selection via logistic/linear regression ---
-    lin_model_cls, lin_model_kwargs = _make_stepwise_linear_model(args, task)
+    # --- Method 2: forward stepwise selection via logistic regression ---
+    logreg_model_cls, logreg_model_kwargs = _make_stepwise_logreg_model(args)
     print(
-        f"[stepwise:linear] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
-        f"model={lin_model_cls.__name__}"
+        f"[stepwise:logreg] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
+        f"model={logreg_model_cls.__name__}"
     )
-    stepwise_linear_features, stepwise_linear_history = run_forward_stepwise_selection(
+    stepwise_logreg_features, stepwise_logreg_history = run_forward_stepwise_selection(
         X=X,
         y=y,
         top_k=args.top_k,
-        model_cls=lin_model_cls,
-        model_kwargs=lin_model_kwargs,
+        model_cls=logreg_model_cls,
+        model_kwargs=logreg_model_kwargs,
         cv=cv,
         scoring=stepwise_scoring,
         n_jobs=args.stepwise_n_jobs,
     )
-    stepwise_linear_eval = _evaluate_feature_set(
-        X=X, y=y, features=stepwise_linear_features,
-        model_cls=lin_model_cls, model_kwargs=lin_model_kwargs, cv=cv, scoring=stepwise_scoring,
+    stepwise_logreg_eval = _evaluate_feature_set(
+        X=X, y=y, features=stepwise_logreg_features,
+        model_cls=logreg_model_cls, model_kwargs=logreg_model_kwargs, cv=cv, scoring=stepwise_scoring,
     )
-    stepwise_linear_history.to_csv(task_output_dir / "stepwise_linear_top_features.csv", index=False)
+    stepwise_logreg_history.to_csv(task_output_dir / "stepwise_logreg_top_features.csv", index=False)
 
     method_feature_lists = {
         "stepwise_rf": stepwise_rf_features,
-        "stepwise_linear": stepwise_linear_features,
+        "stepwise_logreg": stepwise_logreg_features,
     }
 
     # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
     # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
-    rid_tree_features: list[str] = []
-    rid_tree_perf: dict | None = None
-    cross_family_features: dict[str, list[str]] = {"unweighted": [], "weighted": []}
-    cross_family_perf: dict[str, dict | None] = {"unweighted": None, "weighted": None}
+    print(
+        f"[rid] metric={args.rid_metric} epsilon={args.rid_epsilon} "
+        f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
+    )
+    rid_tree_features, rid_tree_table, rid_tree_perf = run_single_family_tree_rid(
+        X=X,
+        y=y,
+        top_k=args.top_k,
+        rid_metric=args.rid_metric,
+        epsilon=args.rid_epsilon,
+        n_bootstraps=args.rid_n_bootstraps,
+        n_models_pool=args.rid_n_models_pool,
+        n_jobs=args.rid_n_jobs,
+    )
+    rid_tree_table.to_csv(task_output_dir / "rid_tree_top_features.csv", index=False)
+    method_feature_lists["rid_tree"] = rid_tree_features
 
-    if task == "classification":
+    cross_family_features: dict[str, list[str]] = {"unweighted": [], "weighted": []}
+    cross_family_perf: dict[str, dict] = {"unweighted": {}, "weighted": {}}
+    for balance_mode in ("unweighted", "weighted"):
         print(
-            f"[rid] metric={args.rid_metric} epsilon={args.rid_epsilon} "
-            f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
+            f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
+            f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
+            f"family_balance_mode={balance_mode}"
         )
-        rid_tree_features, rid_tree_table, rid_tree_perf = run_single_family_tree_rid(
+        features, table, perf = run_cross_family_rid(
             X=X,
             y=y,
             top_k=args.top_k,
             rid_metric=args.rid_metric,
             epsilon=args.rid_epsilon,
             n_bootstraps=args.rid_n_bootstraps,
-            n_models_pool=args.rid_n_models_pool,
+            n_models_per_class=args.rid_n_models_pool,
+            family_balance_mode=balance_mode,
             n_jobs=args.rid_n_jobs,
         )
-        rid_tree_table.to_csv(task_output_dir / "rid_tree_top_features.csv", index=False)
-        method_feature_lists["rid_tree"] = rid_tree_features
-
-        for balance_mode in ("unweighted", "weighted"):
-            print(
-                f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
-                f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
-                f"family_balance_mode={balance_mode}"
-            )
-            features, table, perf = run_cross_family_rid(
-                X=X,
-                y=y,
-                top_k=args.top_k,
-                rid_metric=args.rid_metric,
-                epsilon=args.rid_epsilon,
-                n_bootstraps=args.rid_n_bootstraps,
-                n_models_per_class=args.rid_n_models_pool,
-                family_balance_mode=balance_mode,
-                n_jobs=args.rid_n_jobs,
-            )
-            table.to_csv(task_output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
-            cross_family_features[balance_mode] = features
-            cross_family_perf[balance_mode] = perf
-            method_feature_lists[f"cross_family_{balance_mode}"] = features
-    else:
-        print("[rid] skipped: RID currently supports classification-style tasks only")
+        table.to_csv(task_output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
+        cross_family_features[balance_mode] = features
+        cross_family_perf[balance_mode] = perf
+        method_feature_lists[f"cross_family_{balance_mode}"] = features
 
     comparison = _build_comparison_table(method_feature_lists)
     comparison.sort_values(
@@ -846,12 +778,11 @@ def _run_single_task(
     overlap_counts = _pairwise_overlap_counts(comparison, list(method_feature_lists.keys()))
 
     # --- Common held-out CV evaluation: every method's features scored the same way ---
-    # Reuses the task-appropriate linear model (LogisticRegression for classification,
-    # LinearRegression for regression) already built for stepwise_linear as the common
-    # evaluator, so every method -- including the RID-based ones, which previously had
-    # no held-out evaluation at all -- gets one directly comparable score.
+    # Reuses the logistic regression model already built for stepwise_logreg as the
+    # common evaluator, so every method -- including the RID-based ones, which
+    # previously had no held-out evaluation at all -- gets one directly comparable score.
     common_eval = run_common_evaluation(
-        X, y, method_feature_lists, lin_model_cls, lin_model_kwargs, cv, stepwise_scoring
+        X, y, method_feature_lists, logreg_model_cls, logreg_model_kwargs, cv, stepwise_scoring
     )
 
     settings = {
@@ -860,8 +791,8 @@ def _run_single_task(
         "args": vars(args),
         "data_metadata": data_meta,
         "common_evaluator": {
-            "model": lin_model_cls.__name__,
-            "model_kwargs": lin_model_kwargs,
+            "model": logreg_model_cls.__name__,
+            "model_kwargs": logreg_model_kwargs,
             "scoring": stepwise_scoring,
             "note": (
                 "Every method's selected top-k features scored with this SAME held-out "
@@ -875,12 +806,11 @@ def _run_single_task(
             "top_features": stepwise_rf_features,
             "search_model_evaluation": stepwise_rf_eval,
         },
-        "stepwise_linear": {
+        "stepwise_logreg": {
             "scoring": stepwise_scoring,
-            "model": lin_model_cls.__name__,
-            "model_kwargs": lin_model_kwargs,
-            "top_features": stepwise_linear_features,
-            "search_model_evaluation": stepwise_linear_eval,
+            "model_kwargs": logreg_model_kwargs,
+            "top_features": stepwise_logreg_features,
+            "search_model_evaluation": stepwise_logreg_eval,
         },
         "rid_tree": {
             "metric": args.rid_metric,
@@ -912,8 +842,8 @@ def _run_single_task(
             f"{common_eval[name]['cv_score_mean']:.4f} +- {common_eval[name]['cv_score_std']:.4f}"
         )
 
-    cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"] or {})
-    cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"] or {})
+    cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
+    cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"])
 
     row = {
         "task_name": task_name,
@@ -929,8 +859,8 @@ def _run_single_task(
         row[f"{name}_held_out_cv_score_std"] = common_eval[name]["cv_score_std"]
     row.update(
         {
-            "rid_tree_rashomon_train_accuracy_mean": None if rid_tree_perf is None else rid_tree_perf.get("accuracy_mean"),
-            "rid_tree_rashomon_train_auprc_mean": None if rid_tree_perf is None else rid_tree_perf.get("auprc_mean"),
+            "rid_tree_rashomon_train_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
+            "rid_tree_rashomon_train_auprc_mean": rid_tree_perf.get("auprc_mean"),
             "cross_family_unweighted_rashomon_train_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
             "cross_family_unweighted_rashomon_train_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
             "cross_family_weighted_rashomon_train_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],

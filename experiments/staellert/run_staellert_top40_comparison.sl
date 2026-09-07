@@ -48,13 +48,12 @@ PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab-staellert/bin/python"
 echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
-# --- Run the top-k comparison analysis ---
+# --- Run the top-k comparison analysis (classification-only) ---
 # Compares: (1) forward stepwise selection via random forest,
-#           (2) forward stepwise selection via logistic/linear regression,
+#           (2) forward stepwise selection via logistic regression,
 #           (3) single-family RID on a fully enumerated decision-tree Rashomon set,
 #           (4) cross-family RID (family_balance_mode=unweighted),
 #           (5) cross-family RID (family_balance_mode=weighted).
-#           Methods 3-5 are classification-only (they require predict_proba).
 $PYTHON_ENV experiments/staellert/run_staellert_top40_comparison.py \
     --data-dir experiments/staellert/data/staellert_et_al \
     --output-dir experiments/staellert/results/top40_feature_comparison \
