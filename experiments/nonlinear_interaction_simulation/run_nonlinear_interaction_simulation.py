@@ -23,9 +23,11 @@ Usage:
 
 import argparse
 import contextlib
+import functools
 import io
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -145,6 +147,7 @@ def build_simulated_dataset(
     beta,
     snr_empirical,
     classification_cutoff,
+    equivalence_classes=None,
 ):
     features = features.reset_index(drop=True).copy()
     terms = terms.reset_index(drop=True).copy()
@@ -160,6 +163,11 @@ def build_simulated_dataset(
     dataset.attrs["beta"] = float(beta)
     dataset.attrs["snr_empirical"] = float(snr_empirical)
     dataset.attrs["classification_cutoff"] = float(classification_cutoff)
+    # Maps a "true driver" feature name to the tuple of features that are
+    # substitutable for it (itself plus any correlated duplicate/proxy
+    # features that aren't actually in the outcome equation). Empty for DGPs
+    # with no deliberate redundancy.
+    dataset.attrs["equivalence_classes"] = dict(equivalence_classes or {})
     return dataset
 
 
@@ -373,6 +381,118 @@ def simulate_friedman(n=1000, beta=1.0, noise_std=1.0, seed=42):
     )
 
 
+def _add_redundant_duplicate(features, rng, source_col, dup_col, redundancy_corr):
+    """Add a correlated duplicate of `source_col` that is NOT used in the
+    outcome equation -- a proxy feature that's statistically substitutable
+    for a true driver but isn't itself causally part of the DGP."""
+
+    dup_noise = rng.normal(0.0, 1.0, size=len(features))
+    features[dup_col] = (
+        redundancy_corr * features[source_col] + np.sqrt(1.0 - redundancy_corr**2) * dup_noise
+    )
+    return features
+
+
+def simulate_chen_redundant(n=1000, beta=1.0, noise_std=1.0, seed=42, redundancy_corr=0.95):
+    """Same DGP as simulate_chen, plus a correlated duplicate of the true
+    driver X1 (X1_dup) that the outcome equation never touches. Tests whether
+    a method correctly shares importance/credit across a redundant pair
+    instead of arbitrarily crediting only one."""
+
+    rng = np.random.default_rng(seed)
+    features = pd.DataFrame(
+        {f"X{i}": rng.normal(0.0, 1.0, size=n) for i in range(1, 11)}
+    )
+    features = _add_redundant_duplicate(features, rng, "X1", "X1_dup", redundancy_corr)
+
+    minus_2_sin_x1 = -2.0 * np.sin(features["X1"])
+    max_x2_0 = np.maximum(features["X2"], 0.0)
+    linear_x3 = features["X3"]
+    exp_minus_x4 = np.exp(-features["X4"])
+    signal = minus_2_sin_x1 + max_x2_0 + linear_x3 + exp_minus_x4
+
+    y, epsilon, latent_score, cutoff_value, snr_empirical = apply_beta_signal(
+        signal,
+        beta,
+        rng,
+        noise_std=noise_std,
+        cutoff="median",
+    )
+
+    terms = pd.DataFrame(
+        {
+            "minus_2_sin_x1": minus_2_sin_x1,
+            "max_x2_0": max_x2_0,
+            "linear_x3": linear_x3,
+            "exp_minus_x4": exp_minus_x4,
+            "signal": signal,
+            "latent_score": latent_score,
+        }
+    )
+
+    return build_simulated_dataset(
+        features,
+        terms,
+        y,
+        epsilon,
+        dgp_name=f"chen_redundant_r{round(redundancy_corr * 100):03d}",
+        relevant_features=("X1", "X2", "X3", "X4"),
+        beta=beta,
+        snr_empirical=snr_empirical,
+        classification_cutoff=cutoff_value,
+        equivalence_classes={"X1": ("X1", "X1_dup")},
+    )
+
+
+def simulate_friedman_redundant(n=1000, beta=1.0, noise_std=1.0, seed=42, redundancy_corr=0.95):
+    """Same DGP as simulate_friedman, plus a correlated duplicate of the true
+    driver X1 (X1_dup, X1 being part of the X1*X2 interaction term)."""
+
+    rng = np.random.default_rng(seed)
+    features = pd.DataFrame(
+        {f"X{i}": rng.uniform(0.0, 1.0, size=n) for i in range(1, 7)}
+    )
+    features = _add_redundant_duplicate(features, rng, "X1", "X1_dup", redundancy_corr)
+
+    interaction_x1_x2 = 10.0 * np.sin(np.pi * features["X1"] * features["X2"])
+    quadratic_x3 = 20.0 * (features["X3"] - 0.5) ** 2
+    linear_x4 = 10.0 * features["X4"]
+    linear_x5 = 5.0 * features["X5"]
+    signal = interaction_x1_x2 + quadratic_x3 + linear_x4 + linear_x5
+
+    y, epsilon, latent_score, cutoff_value, snr_empirical = apply_beta_signal(
+        signal,
+        beta,
+        rng,
+        noise_std=noise_std,
+        cutoff="median",
+    )
+
+    terms = pd.DataFrame(
+        {
+            "interaction_x1_x2": interaction_x1_x2,
+            "quadratic_x3": quadratic_x3,
+            "linear_x4": linear_x4,
+            "linear_x5": linear_x5,
+            "signal": signal,
+            "latent_score": latent_score,
+        }
+    )
+
+    return build_simulated_dataset(
+        features,
+        terms,
+        y,
+        epsilon,
+        dgp_name=f"friedman_redundant_r{round(redundancy_corr * 100):03d}",
+        relevant_features=("X1", "X2", "X3", "X4", "X5"),
+        beta=beta,
+        snr_empirical=snr_empirical,
+        classification_cutoff=cutoff_value,
+        equivalence_classes={"X1": ("X1", "X1_dup")},
+    )
+
+
 def sample_monk_features(n, rng):
     monk_domains = {
         "X1": np.array([1, 2, 3]),
@@ -476,11 +596,30 @@ SIMULATORS = {
     "custom_sin_log": simulate_custom_sin_log,
 }
 
+# Redundant-driver variants: not included in SIMULATORS by default (opt in via
+# --include-redundant-dgps) since they're a diagnostic addition, not part of
+# the standard ground-truth-recovery sweep. Each duplicates one true driver
+# (X1) as a correlated proxy feature at two redundancy strengths, to test
+# whether a method shares importance/credit across the redundant pair instead
+# of arbitrarily crediting only one (see compute_equivalence_recall and
+# compute_credit_split_ratios below).
+REDUNDANT_SIMULATORS = {
+    "chen_redundant_r095": functools.partial(simulate_chen_redundant, redundancy_corr=0.95),
+    "chen_redundant_r070": functools.partial(simulate_chen_redundant, redundancy_corr=0.70),
+    "friedman_redundant_r095": functools.partial(simulate_friedman_redundant, redundancy_corr=0.95),
+    "friedman_redundant_r070": functools.partial(simulate_friedman_redundant, redundancy_corr=0.70),
+}
+
 
 def feature_columns_from_dataset(dataset):
+    def sort_key(name):
+        match = re.match(r"X(\d+)", name)
+        numeric_part = int(match.group(1)) if match else 0
+        return (numeric_part, name)
+
     return sorted(
         [column for column in dataset.columns if column.startswith("X")],
-        key=lambda name: int(name[1:]),
+        key=sort_key,
     )
 
 
@@ -504,6 +643,53 @@ def compute_selection_metrics(ranked_features, ground_truth):
         "exact_match": int(set(top_k) == gt_set),
         "mean_gt_rank": mean_gt_rank,
     }
+
+
+def compute_equivalence_recall(ranked_features, ground_truth, equivalence_classes):
+    """Recall@k that credits a hit if the top-k contains EITHER the literal
+    ground-truth feature or any of its substitutable duplicates. Fair to
+    methods that pick a statistically-interchangeable proxy instead of the
+    "official" true-driver name. Returns None when there's no redundancy to
+    account for (equivalence_classes empty)."""
+
+    if not equivalence_classes:
+        return None
+
+    k = len(ground_truth)
+    top_k = set(ranked_features[:k])
+    hits = 0
+    for true_feature in ground_truth:
+        group = equivalence_classes.get(true_feature, (true_feature,))
+        if any(member in top_k for member in group):
+            hits += 1
+    return hits / len(ground_truth)
+
+
+def compute_credit_split_ratios(ranked_features, equivalence_classes):
+    """For each redundant pair, how evenly is importance "credit" shared
+    between its members? Uses inverse rank position (1/rank) as a
+    method-agnostic importance proxy, since it's the one quantity every
+    method here (RID or stepwise) produces via its full feature ranking.
+
+    Ratio near 1.0 = credit shared evenly across the redundant pair (RID's
+    expected behavior: several Rashomon-set models arbitrate the pair
+    differently, so both retain some importance). Ratio near 0.0 =
+    winner-take-all (a greedy/single-model method's expected behavior: pick
+    one, then the other adds no further marginal value and drops far down
+    the ranking)."""
+
+    if not equivalence_classes:
+        return {}
+
+    rank_lookup = {feature: idx + 1 for idx, feature in enumerate(ranked_features)}
+    ratios = {}
+    for true_feature, group in equivalence_classes.items():
+        importances = [1.0 / rank_lookup[member] for member in group if member in rank_lookup]
+        if len(importances) < 2:
+            ratios[true_feature] = None
+            continue
+        ratios[true_feature] = min(importances) / max(importances)
+    return ratios
 
 
 def run_cross_family_rid(
@@ -628,6 +814,7 @@ def run_simulation_study(
                 X = dataset[feature_columns]
                 y = dataset["Y"].astype(int)
                 ground_truth = tuple(dataset.attrs["relevant_features"])
+                equivalence_classes = dataset.attrs.get("equivalence_classes") or {}
                 snr_empirical = float(dataset.attrs["snr_empirical"])
 
                 snr_rows.append(
@@ -689,6 +876,14 @@ def run_simulation_study(
 
                 for method_name, ranked_features in method_rankings.items():
                     metric_row = compute_selection_metrics(ranked_features, ground_truth)
+
+                    equivalence_recall = compute_equivalence_recall(
+                        ranked_features, ground_truth, equivalence_classes
+                    )
+                    credit_split_ratios = compute_credit_split_ratios(ranked_features, equivalence_classes)
+                    valid_ratios = [v for v in credit_split_ratios.values() if v is not None]
+                    credit_split_ratio_mean = float(np.mean(valid_ratios)) if valid_ratios else None
+
                     rows.append(
                         {
                             "dgp": dgp_name,
@@ -699,6 +894,8 @@ def run_simulation_study(
                             "ground_truth": ", ".join(ground_truth),
                             "ranked_top_k": ", ".join(ranked_features[: len(ground_truth)]),
                             **metric_row,
+                            "equivalence_recall_at_k": equivalence_recall,
+                            "credit_split_ratio_mean": credit_split_ratio_mean,
                         }
                     )
 
@@ -724,6 +921,8 @@ def build_metric_tables(study_results):
                 "ndcg_at_k",
                 "exact_match",
                 "mean_gt_rank",
+                "equivalence_recall_at_k",
+                "credit_split_ratio_mean",
             ]
         ]
         .agg(["mean", "sem"])
@@ -733,7 +932,17 @@ def build_metric_tables(study_results):
 
     overall = (
         study_results.groupby(["dgp", "method"])
-        [["precision_at_k", "recall_at_k", "ndcg_at_k", "exact_match", "mean_gt_rank"]]
+        [
+            [
+                "precision_at_k",
+                "recall_at_k",
+                "ndcg_at_k",
+                "exact_match",
+                "mean_gt_rank",
+                "equivalence_recall_at_k",
+                "credit_split_ratio_mean",
+            ]
+        ]
         .mean()
         .reset_index()
     )
@@ -872,12 +1081,27 @@ def parse_args():
         default=None,
         help="Parallel workers (defaults to SLURM_CPUS_PER_TASK)",
     )
+    parser.add_argument(
+        "--include-redundant-dgps",
+        action="store_true",
+        default=False,
+        help=(
+            "Also run the redundant-driver DGP variants (REDUNDANT_SIMULATORS): "
+            "chen/friedman with a correlated duplicate of the true driver X1 at "
+            "redundancy_corr 0.95 and 0.70, on top of the standard DGPs. Diagnostic "
+            "addition, off by default (default: False)."
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     n_jobs = resolve_num_workers(args.num_workers)
+
+    simulators = dict(SIMULATORS)
+    if args.include_redundant_dgps:
+        simulators.update(REDUNDANT_SIMULATORS)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -895,13 +1119,15 @@ def main():
     print(f"stepwise_logreg_C={args.stepwise_logreg_C}")
     print(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
     print(f"methods_compared={list(METHODS)}")
+    print(f"include_redundant_dgps={args.include_redundant_dgps}")
+    print(f"simulations_included={list(simulators.keys())}")
     print(f"n_jobs={n_jobs}")
     print("=" * 70)
 
     started = time.time()
 
     study_results, snr_results = run_simulation_study(
-        SIMULATORS,
+        simulators,
         beta_grid=args.beta_grid,
         sample_size=args.sample_size,
         n_repetitions=args.repetitions,
@@ -933,7 +1159,8 @@ def main():
         "stepwise_rf_n_estimators": args.stepwise_rf_n_estimators,
         "random_state": args.random_state,
         "num_workers": n_jobs,
-        "simulations_included": list(SIMULATORS.keys()),
+        "include_redundant_dgps": args.include_redundant_dgps,
+        "simulations_included": list(simulators.keys()),
         "methods_compared": list(METHODS),
     }
 

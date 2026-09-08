@@ -19,6 +19,13 @@ fit on -- in-sample, not held-out) are recorded separately in
 run_settings.json for diagnostic purposes only; they are NOT comparable to
 the held-out CV scores and are not used to rank methods.
 
+Optional diagnostic (--inject-redundant-duplicate FEATURE): adds a
+correlated engineered duplicate of an existing real feature and reports each
+method's credit-split ratio for that pair (0 = winner-take-all, 1 = shared
+evenly). Needs no ground truth, since the duplicate is deliberately
+constructed to be substitutable -- unlike ground-truth precision/recall,
+this credit-sharing test works on real data. Off by default.
+
 Usage:
     python run_falcon_cano_top40_comparison.py
     sbatch run_falcon_cano_top40_comparison.sl
@@ -176,6 +183,24 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Random state for CV folds and the stepwise search models (default: 42)",
+    )
+    parser.add_argument(
+        "--inject-redundant-duplicate",
+        type=str,
+        default=None,
+        help=(
+            "Name of an existing feature to add a correlated engineered duplicate of "
+            "(e.g. SlogP_VSA2), to test whether each method shares importance credit "
+            "across the redundant pair or arbitrarily commits to one. No ground truth "
+            "needed -- the duplicate is deliberately constructed, so both members are "
+            "known to be substitutable by design. Off by default (default: None)."
+        ),
+    )
+    parser.add_argument(
+        "--redundancy-corr",
+        type=float,
+        default=0.95,
+        help="Correlation strength between the injected duplicate and its source feature (default: 0.95)",
     )
     return parser.parse_args()
 
@@ -481,6 +506,50 @@ def _build_comparison_table(method_feature_lists: dict[str, list[str]]) -> pd.Da
     return pd.DataFrame(rows)
 
 
+def inject_redundant_duplicate(
+    X: pd.DataFrame,
+    source_feature: str,
+    redundancy_corr: float,
+    random_state: int,
+) -> tuple[pd.DataFrame, str]:
+    """Add a correlated engineered duplicate of an existing real feature (not
+    a synthetic ground-truth driver -- source_feature is whatever real column
+    the caller chose). Requires no ground truth: the duplicate is
+    substitutable for source_feature by construction, so any credit-sharing
+    (or lack of it) a method exhibits between the two is directly
+    attributable to how it handles redundancy, not to unknown confounders."""
+
+    if source_feature not in X.columns:
+        raise ValueError(f"--inject-redundant-duplicate feature '{source_feature}' not found in X")
+
+    dup_name = f"{source_feature}_dup"
+    rng = np.random.default_rng(random_state)
+    dup_noise = rng.normal(0.0, X[source_feature].std(), size=len(X))
+    X = X.copy()
+    X[dup_name] = redundancy_corr * X[source_feature] + np.sqrt(1.0 - redundancy_corr**2) * dup_noise
+    return X, dup_name
+
+
+def compute_credit_split_ratio_top_k(ranked_top_k: list[str], pair: tuple[str, str]) -> float | None:
+    """Credit-split ratio using only each method's OWN top-k selection (the
+    top40 comparison scripts only ever rank the top-k, not the full feature
+    set, unlike the nonlinear simulation's full-ranking methods). Both pair
+    members present -> ratio via inverse rank-within-top-k (near 1 = shared
+    evenly). Exactly one present -> 0.0 (complete winner-take-all: the method
+    had a full top-k budget and still excluded the redundant twin entirely).
+    Neither present -> None (this pair wasn't relevant to this method's
+    selection at all)."""
+
+    positions = {feature: rank for rank, feature in enumerate(ranked_top_k, start=1)}
+    present = [positions[member] for member in pair if member in positions]
+    if len(present) == 0:
+        return None
+    if len(present) == 1:
+        return 0.0
+    importances = [1.0 / rank for rank in present]
+    return min(importances) / max(importances)
+
+
 def _pairwise_overlap_counts(comparison: pd.DataFrame, method_names: list[str]) -> dict:
     overlaps = {}
     for i, name_a in enumerate(method_names):
@@ -521,6 +590,17 @@ def main() -> None:
         f"features={data_meta['n_features_after_corr']} "
         f"(raw={data_meta['n_features_raw']})"
     )
+
+    redundant_pair = None
+    if args.inject_redundant_duplicate:
+        X, dup_name = inject_redundant_duplicate(
+            X, args.inject_redundant_duplicate, args.redundancy_corr, args.random_state
+        )
+        redundant_pair = (args.inject_redundant_duplicate, dup_name)
+        print(
+            f"[redundancy] injected '{dup_name}' as a correlated duplicate of "
+            f"'{args.inject_redundant_duplicate}' (corr={args.redundancy_corr})"
+        )
 
     cv = StratifiedKFold(
         n_splits=args.stepwise_cv_splits,
@@ -645,9 +725,22 @@ def main() -> None:
     cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
     cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"])
 
+    credit_split_ratios = None
+    if redundant_pair is not None:
+        credit_split_ratios = {
+            name: compute_credit_split_ratio_top_k(features, redundant_pair)
+            for name, features in method_feature_lists.items()
+        }
+        print(f"[redundancy] credit-split ratios for {redundant_pair}: {credit_split_ratios}")
+
     settings = {
         "args": vars(args),
         "data_metadata": data_meta,
+        "redundancy_diagnostic": (
+            None
+            if redundant_pair is None
+            else {"pair": redundant_pair, "redundancy_corr": args.redundancy_corr, "credit_split_ratios": credit_split_ratios}
+        ),
         "common_evaluator": {
             "model": "LogisticRegression",
             "model_kwargs": common_model_kwargs,
@@ -715,6 +808,9 @@ def main() -> None:
             "cross_family_weighted_rashomon_train_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
         }
     )
+    if credit_split_ratios is not None:
+        for name, ratio in credit_split_ratios.items():
+            overall_row[f"{name}_credit_split_ratio"] = ratio
     overall_row.update(overlap_counts)
     overall_summary_path = output_dir / "overall_task_summary.csv"
     pd.DataFrame([overall_row]).to_csv(overall_summary_path, index=False)

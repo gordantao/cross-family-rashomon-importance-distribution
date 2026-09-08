@@ -56,6 +56,10 @@ $PYTHON_ENV --version
 #           (5) cross-family RID (family_balance_mode=weighted).
 # Every method's selected features are scored with a common held-out CV
 # evaluator (logistic regression) for a fair, apples-to-apples comparison.
+# (--inject-redundant-duplicate is available as an opt-in diagnostic but is
+# NOT used here -- it changes the feature space for every method, which
+# would make this run's results incomparable to the standard benchmark. Run
+# it as a separate one-off invocation instead, e.g. via sbatch --wrap.)
 $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --data experiments/falcon_cano/falcon_cano_featured.csv \
     --output-dir experiments/falcon_cano/results/top40_feature_comparison \

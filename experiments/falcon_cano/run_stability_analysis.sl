@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=cross-rid-simulation
-#SBATCH --output=cross-rid-simulation_%j.out
-#SBATCH --error=cross-rid-simulation_%j.err
+#SBATCH --job-name=falcon-cano-stability
+#SBATCH --output=falcon-cano-stability_%j.out
+#SBATCH --error=falcon-cano-stability_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
 # -------------------------------------------------------
 # SLURM automatically sets:
 #   SLURM_CPUS_PER_TASK
-# which your Python script can read for NUM_WORKERS.
+# which this Python script can use for parallel workers.
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -29,7 +29,7 @@ echo "========================================"
 # --- Clean module environment ---
 module purge
 
-# --- Change to the working directory ---
+# --- Change to the repo root (submit this job from the repo root) ---
 cd "$SLURM_SUBMIT_DIR"
 
 # --- Explicitly set thread counts to match SLURM allocation ---
@@ -43,24 +43,22 @@ echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"
 
 # --- Use Python directly from your conda environment ---
-PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab-nonlinear_interaction_simulation/bin/python"
+PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab-falcon_cano/bin/python"
 
 echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
 # --- Run the analysis ---
-# Benchmarks ground-truth feature recovery across five methods per simulated cell:
-# (1) cross-family RID (unweighted), (2) cross-family RID (weighted),
-# (3) stepwise logistic regression, (4) stepwise random forest,
-# (5) single-family RID on a fully enumerated decision-tree Rashomon set.
-# --include-redundant-dgps adds 4 diagnostic DGPs (chen/friedman with a
-# correlated duplicate of the true driver X1 at redundancy_corr 0.95/0.70) on
-# top of the standard 6, testing whether methods share importance credit
-# across a redundant pair instead of arbitrarily crediting only one.
-$PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation.py \
-	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation \
-	--include-redundant-dgps \
-	--num-workers "$SLURM_CPUS_PER_TASK"
+# Tests whether RID's own P(phi>0)-derived ambiguity score predicts genuine
+# single-model instability under bootstrap resampling, on the real
+# Falcon-Cano bioavailability dataset (no ground truth needed -- unlike the
+# nonlinear simulation's redundancy/equivalence metrics).
+$PYTHON_ENV experiments/falcon_cano/run_stability_analysis.py \
+    --data experiments/falcon_cano/falcon_cano_featured.csv \
+    --families Lasso,FullyEnumeratedTree \
+    --n-repeats 30 \
+    --output-dir experiments/falcon_cano/results/stability_analysis \
+    --num-workers "$SLURM_CPUS_PER_TASK"
 
 echo "========================================"
 echo "End time: $(date)"
