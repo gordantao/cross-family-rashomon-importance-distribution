@@ -219,7 +219,7 @@ def save_metric_plots(estimator, output_dir, filename_prefix, title_prefix):
     if not estimator.metric_results_:
         return
 
-    for metric, (rid_cdfs, cdf_grid, raw_importances) in estimator.metric_results_.items():
+    for metric, (rid_cdfs, cdf_grid, raw_importances, _expected_importance) in estimator.metric_results_.items():
         top_features = [feature_name for feature_name, _ in estimator.rank_features(metric)[:5]]
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))

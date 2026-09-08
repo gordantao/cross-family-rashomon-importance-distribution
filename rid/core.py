@@ -292,16 +292,20 @@ def normalize_cross_family_balance_mode(family_balance_mode):
 
 
 def summarize_metric_result(metric_result):
-    """Compute per-feature expected importance and P(phi > 0)."""
+    """Compute per-feature expected importance and P(phi > 0).
 
-    rid_cdfs, cdf_grid, raw_importances = metric_result
+    ``expected_importance`` is a weighted mean when the metric result carries
+    per-model weights (cross-family ``weighted`` balance mode); it reduces to
+    a plain mean otherwise (single-family, or cross-family ``unweighted``).
+    """
+
+    rid_cdfs, cdf_grid, raw_importances, expected_importance = metric_result
     idx_zero = min(np.searchsorted(cdf_grid, 0), len(cdf_grid) - 1)
 
     summary = {}
     for feature_name in rid_cdfs:
-        values = raw_importances[feature_name]
         summary[feature_name] = {
-            "expected_importance": float(np.mean(values)) if values else 0.0,
+            "expected_importance": expected_importance[feature_name],
             "prob_positive": float(1 - rid_cdfs[feature_name][idx_zero]),
         }
     return summary
@@ -337,9 +341,24 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
 
     for metric in metrics:
         raw_importances = {feature_name: [] for feature_name in feature_names}
-        for boot_importances in per_bootstrap_importances:
+        raw_weights = {feature_name: [] for feature_name in feature_names}
+        for i, boot_importances in enumerate(per_bootstrap_importances):
+            boot_weights = per_bootstrap_weights[i] if per_bootstrap_weights is not None else None
             for feature_name in feature_names:
-                raw_importances[feature_name].extend(boot_importances[metric][feature_name])
+                values = boot_importances[metric][feature_name]
+                raw_importances[feature_name].extend(values)
+                raw_weights[feature_name].extend(
+                    boot_weights if boot_weights is not None else [1.0] * len(values)
+                )
+
+        expected_importance = {
+            feature_name: (
+                float(np.average(raw_importances[feature_name], weights=raw_weights[feature_name]))
+                if raw_importances[feature_name]
+                else 0.0
+            )
+            for feature_name in feature_names
+        }
 
         all_values = [value for values in raw_importances.values() for value in values]
         cdf_grid = np.linspace(np.min(all_values), np.max(all_values), n_cdf_points)
@@ -371,7 +390,7 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
         for feature_name in feature_names:
             rid_cdfs[feature_name] /= valid_count
 
-        metric_results[metric] = (rid_cdfs, cdf_grid, raw_importances)
+        metric_results[metric] = (rid_cdfs, cdf_grid, raw_importances, expected_importance)
 
     return metric_results
 
@@ -518,6 +537,13 @@ def _run_single_bootstrap_cross_family(
         family_models[name] = models
         family_losses[name] = losses
 
+    all_losses = np.concatenate(
+        [losses for losses in family_losses.values() if len(losses) > 0]
+    ) if any(len(losses) > 0 for losses in family_losses.values()) else np.array([])
+    if all_losses.size == 0:
+        return None, None, None, None
+    global_min_loss = np.min(all_losses)
+
     family_rashomon = {name: [] for name in model_configs}
     for name in model_configs:
         models = family_models[name]
@@ -525,8 +551,12 @@ def _run_single_bootstrap_cross_family(
         if len(losses) == 0:
             continue
 
-        family_min_loss = np.min(losses)
-        family_rashomon_mask = losses <= family_min_loss + epsilon
+        # Rashomon-set membership is judged against the best loss achieved by
+        # ANY family in this bootstrap, not each family's own best -- a family
+        # that can't get within epsilon of the pooled optimum shouldn't be
+        # propped up by comparing it only to itself. family_balance_mode only
+        # changes how already-admitted models are aggregated afterward.
+        family_rashomon_mask = losses <= global_min_loss + epsilon
         family_rashomon[name] = [model for model, keep in zip(models, family_rashomon_mask) if keep]
 
     non_empty_families = [name for name, models in family_rashomon.items() if models]
@@ -981,7 +1011,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
     Attributes
     ----------
     metric_results_ : dict or None
-        Mapping ``metric_name -> (rid_cdfs, cdf_grid, raw_importances)``.
+        Mapping ``metric_name -> (rid_cdfs, cdf_grid, raw_importances, expected_importance)``.
         ``None`` if no bootstrap produced a non-empty Rashomon set.
 
     family_counts_ : dict of str to int
