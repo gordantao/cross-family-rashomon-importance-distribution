@@ -54,7 +54,6 @@ from rid import (
     performance_accuracy,
     performance_auprc,
     performance_f1,
-    vi_sub_mr,
 )
 
 DEFAULT_SAMPLE_SIZE = 400
@@ -701,13 +700,14 @@ def run_cross_family_rid(
     epsilon,
     family_balance_mode,
     n_jobs=1,
+    rid_metric="sub_mr",
 ):
     estimator = CrossFamilyRashomonImportanceDistribution(
         model_configs=RID_MODEL_CONFIGS,
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
         n_models_per_class=n_models_per_class,
-        vi_metrics=(vi_sub_mr,),
+        vi_metrics=(rid_metric,),
         performance_metrics=RID_PERFORMANCE_METRICS,
         family_balance_mode=family_balance_mode,
         n_jobs=n_jobs,
@@ -716,7 +716,7 @@ def run_cross_family_rid(
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         estimator.fit(X, y)
 
-    ranked_features = [feature for feature, _ in estimator.rank_features(vi_sub_mr)]
+    ranked_features = [feature for feature, _ in estimator.rank_features(rid_metric)]
     return ranked_features
 
 
@@ -757,13 +757,14 @@ def run_single_family_tree_rid(
     n_bootstraps,
     n_models_pool,
     n_jobs=1,
+    rid_metric="sub_mr",
 ):
     estimator = RashomonImportanceDistribution(
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
         n_models_pool=n_models_pool,
         model_class=FullyEnumeratedTreeClassifier,
-        vi_metrics=(vi_sub_mr,),
+        vi_metrics=(rid_metric,),
         performance_metrics=RID_PERFORMANCE_METRICS,
         n_jobs=n_jobs,
     )
@@ -771,7 +772,7 @@ def run_single_family_tree_rid(
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         estimator.fit(X, y)
 
-    ranked_features = [feature for feature, _ in estimator.rank_features(vi_sub_mr)]
+    ranked_features = [feature for feature, _ in estimator.rank_features(rid_metric)]
     return ranked_features
 
 
@@ -791,6 +792,7 @@ def run_simulation_study(
     stepwise_rf_n_estimators,
     random_state,
     n_jobs=1,
+    rid_metric="sub_mr",
 ):
     rows = []
     snr_rows = []
@@ -838,6 +840,7 @@ def run_simulation_study(
                         epsilon=epsilon,
                         family_balance_mode="unweighted",
                         n_jobs=n_jobs,
+                        rid_metric=rid_metric,
                     ),
                     "cross_family_weighted": run_cross_family_rid(
                         X,
@@ -847,6 +850,7 @@ def run_simulation_study(
                         epsilon=epsilon,
                         family_balance_mode="weighted",
                         n_jobs=n_jobs,
+                        rid_metric=rid_metric,
                     ),
                     "stepwise_logreg": run_forward_stepwise_ranking(
                         X,
@@ -871,6 +875,7 @@ def run_simulation_study(
                         n_bootstraps=n_bootstraps,
                         n_models_pool=n_models_per_class,
                         n_jobs=n_jobs,
+                        rid_metric=rid_metric,
                     ),
                 }
 
@@ -1052,6 +1057,18 @@ def parse_args():
         help="Rashomon epsilon",
     )
     parser.add_argument(
+        "--rid-metric",
+        type=str,
+        default="sub_mr",
+        help=(
+            "RID variable-importance metric used by cross_family_unweighted, "
+            "cross_family_weighted, and rid_tree (default: sub_mr; also available: "
+            "loco, coef, iloco). DGP feature counts are tiny (6-11), so iloco's "
+            "O(features^2) pairwise cost is negligible here, unlike on the real "
+            "Falcon-Cano/Staellert datasets."
+        ),
+    )
+    parser.add_argument(
         "--stepwise-cv-splits",
         type=int,
         default=DEFAULT_STEPWISE_CV_SPLITS,
@@ -1115,6 +1132,7 @@ def main():
     print(f"beta_grid={args.beta_grid}")
     print(f"noise_std={args.noise_std}")
     print(f"epsilon={args.epsilon}")
+    print(f"rid_metric={args.rid_metric}")
     print(f"stepwise_cv_splits={args.stepwise_cv_splits}")
     print(f"stepwise_logreg_C={args.stepwise_logreg_C}")
     print(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
@@ -1141,6 +1159,7 @@ def main():
         stepwise_rf_n_estimators=args.stepwise_rf_n_estimators,
         random_state=args.random_state,
         n_jobs=n_jobs,
+        rid_metric=args.rid_metric,
     )
 
     metric_table_by_dgp_beta, metric_table_by_dgp = build_metric_tables(study_results)
@@ -1154,6 +1173,7 @@ def main():
         "beta_grid": args.beta_grid,
         "noise_std": args.noise_std,
         "epsilon": args.epsilon,
+        "rid_metric": args.rid_metric,
         "stepwise_cv_splits": args.stepwise_cv_splits,
         "stepwise_logreg_C": args.stepwise_logreg_C,
         "stepwise_rf_n_estimators": args.stepwise_rf_n_estimators,
