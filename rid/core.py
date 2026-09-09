@@ -14,7 +14,7 @@ from sklearn.utils import resample
 from .models import resolve_candidate_trainer, resolve_model_config, train_candidate_models
 
 
-VALID_VI_METRICS = ("sub_mr", "loco", "coef")
+VALID_VI_METRICS = ("sub_mr", "loco", "coef", "iloco")
 VALID_PERFORMANCE_METRICS = ("accuracy", "f1", "auprc")
 VALID_CROSS_FAMILY_BALANCE_MODES = ("unweighted", "weighted")
 
@@ -56,6 +56,112 @@ def compute_loco_importance(model, X, y):
     return importances
 
 
+def _eligible_interaction_pairs(X, correlation_threshold=0.8):
+    """Return (j, k) index pairs whose features are NOT highly correlated.
+
+    Near-duplicate features have an uninformative "interaction" by
+    construction (removing both is basically the same as removing either),
+    so skipping them keeps the O(M^2) pairwise sweep from being wasted on
+    pairs nobody cares about. Returns (eligible_pairs, n_total_pairs).
+    """
+
+    n_features = X.shape[1]
+    n_total_pairs = n_features * (n_features - 1) // 2
+    if n_features < 2:
+        return [], n_total_pairs
+
+    corr = np.corrcoef(X, rowvar=False)
+    eligible_pairs = [
+        (j, k)
+        for j in range(n_features)
+        for k in range(j + 1, n_features)
+        if not np.isnan(corr[j, k]) and abs(corr[j, k]) < correlation_threshold
+    ]
+    return eligible_pairs, n_total_pairs
+
+
+def compute_iloco_pairwise_importance(model, X, y, pairs):
+    """Compute iLOCO_{j,k} = delta_j + delta_k - delta_{j,k} for given pairs.
+
+    Ablation-based (zero the column(s) on the ALREADY-FITTED model and
+    re-measure log-loss), matching compute_loco_importance's no-refit style,
+    rather than the original iLOCO paper's refit-per-subset approach --
+    consistent with how this codebase already computes loco, and far cheaper.
+    Single-feature deltas are computed once and reused across every pair
+    instead of being recomputed per pair.
+    """
+
+    e_orig = log_loss(y, model.predict_proba(X))
+
+    single_delta = {}
+
+    def _delta_for(indices):
+        key = tuple(sorted(indices))
+        if key in single_delta:
+            return single_delta[key]
+        X_ablated = X.copy()
+        for idx in indices:
+            X_ablated[:, idx] = 0.0
+        delta = log_loss(y, model.predict_proba(X_ablated)) - e_orig
+        single_delta[key] = delta
+        return delta
+
+    iloco_by_pair = {}
+    for j, k in pairs:
+        delta_j = _delta_for((j,))
+        delta_k = _delta_for((k,))
+        delta_jk = _delta_for((j, k))
+        iloco_by_pair[(j, k)] = delta_j + delta_k - delta_jk
+
+    return iloco_by_pair
+
+
+def describe_iloco_eligible_pairs(X, correlation_threshold=0.8):
+    """Diagnostic helper: (n_eligible_pairs, n_total_pairs) for a feature matrix.
+
+    Meant to be called ONCE by a caller inspecting a dataset/metric config
+    (e.g. before kicking off a full RID run), not from inside the per-model,
+    per-bootstrap hot path that compute_iloco_importance runs in -- that path
+    can execute this tens of thousands of times per run, so it stays silent.
+    """
+
+    eligible_pairs, n_total_pairs = _eligible_interaction_pairs(X, correlation_threshold)
+    return len(eligible_pairs), n_total_pairs
+
+
+def compute_iloco_importance(model, X, y, correlation_threshold=0.8, reduction="sum_abs"):
+    """Per-feature interaction-importance summary derived from pairwise iLOCO.
+
+    Reduces the pairwise iLOCO_{j,k} matrix to one value per feature (sum, by
+    default, of |iLOCO_{j,k}| over every partner k the feature was eligible
+    to pair with) so it slots into the same per-feature VI-metric shape as
+    sub_mr/loco (_coerce_importance_values expects exactly n_features values)
+    rather than requiring a separate pairwise aggregation path. This is a
+    summary of "how much does this feature's contribution move as part of
+    2-way interactions", not the interaction detail itself -- the full
+    pairwise dict is available via compute_iloco_pairwise_importance for
+    anyone who wants the per-pair detail, and eligible/total pair counts via
+    describe_iloco_eligible_pairs.
+
+    Returns just the per-feature importance array (n_features,), matching the
+    convention used by compute_model_reliance/compute_loco_importance -- this
+    function is called once per Rashomon-set model per bootstrap, so it does
+    not print or return diagnostics on every call.
+    """
+
+    n_features = X.shape[1]
+    eligible_pairs, _ = _eligible_interaction_pairs(X, correlation_threshold)
+    iloco_by_pair = compute_iloco_pairwise_importance(model, X, y, eligible_pairs)
+
+    importances = np.zeros(n_features)
+    for (j, k), value in iloco_by_pair.items():
+        magnitude = abs(value) if reduction == "sum_abs" else value
+        importances[j] += magnitude
+        importances[k] += magnitude
+
+    return importances
+
+
 def compute_coef_importance(model):
     """Return normalized absolute coefficients for linear models."""
 
@@ -82,6 +188,12 @@ def vi_coef(model, X, y=None, rng=None):
     """Return normalized coefficient importance for linear models."""
 
     return compute_coef_importance(model)
+
+
+def vi_iloco(model, X, y, rng=None):
+    """Return per-feature interaction-importance summary (pairwise iLOCO)."""
+
+    return compute_iloco_importance(model, X, y)
 
 
 def performance_accuracy(model, X, y, y_pred=None, y_prob=None):
@@ -121,6 +233,7 @@ DEFAULT_VI_METRIC_FUNCTIONS = {
     "sub_mr": vi_sub_mr,
     "loco": vi_loco,
     "coef": vi_coef,
+    "iloco": vi_iloco,
 }
 DEFAULT_PERFORMANCE_METRIC_FUNCTIONS = {
     "accuracy": performance_accuracy,
@@ -132,9 +245,11 @@ CALLABLE_METRIC_ALIASES = {
     compute_model_reliance: "sub_mr",
     compute_loco_importance: "loco",
     compute_coef_importance: "coef",
+    compute_iloco_importance: "iloco",
     vi_sub_mr: "sub_mr",
     vi_loco: "loco",
     vi_coef: "coef",
+    vi_iloco: "iloco",
     accuracy_score: "accuracy",
     f1_score: "f1",
     average_precision_score: "auprc",
