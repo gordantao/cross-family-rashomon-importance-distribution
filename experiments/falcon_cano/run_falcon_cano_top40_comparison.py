@@ -464,21 +464,53 @@ def _summarize_cross_family_perf(perf_summary: dict) -> dict:
     }
 
 
-def run_common_evaluation(
+def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dict]]:
+    """Three fixed evaluators spanning distinct inductive biases, so a feature
+    set's held-out score isn't an artifact of one model's blind spots (e.g. a
+    linear-only evaluator can't reward features whose signal is nonlinear or
+    interaction-only -- exactly the kind of signal cross-family RID exists to
+    surface). logreg = additive/linear, random_forest = axis-aligned
+    interactions via bagging, svm_rbf = smooth nonlinear margin via a kernel:
+    three genuinely different mechanisms rather than three flavors of tree.
+    """
+
+    return [
+        (
+            "logreg",
+            LogisticRegression,
+            {"penalty": "l2", "C": 1.0, "solver": "lbfgs", "max_iter": 100000, "random_state": random_state},
+        ),
+        (
+            "random_forest",
+            RandomForestClassifier,
+            {"n_estimators": 300, "min_samples_leaf": 1, "random_state": random_state, "n_jobs": 1},
+        ),
+        (
+            "svm_rbf",
+            SVC,
+            {"kernel": "rbf", "C": 1.0, "gamma": "scale", "random_state": random_state},
+        ),
+    ]
+
+
+def run_common_evaluation_panel(
     X: pd.DataFrame,
     y: pd.Series,
     method_feature_lists: dict[str, list[str]],
-    model_cls,
-    model_kwargs: dict,
+    evaluators: list[tuple[str, type, dict]],
     cv,
     scoring: str,
-) -> dict[str, dict]:
-    """Evaluate every method's selected top-k features with the SAME held-out
-    CV evaluator, so methods are compared on equal footing regardless of which
-    model (if any) they used internally to select features."""
+) -> dict[str, dict[str, dict]]:
+    """Evaluate every method's selected top-k features under every evaluator
+    in the panel, so methods are compared on equal footing regardless of which
+    model (if any) they used internally to select features, and regardless of
+    any single evaluator's own inductive bias."""
 
     return {
-        name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+        name: {
+            evaluator_name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+            for evaluator_name, model_cls, model_kwargs in evaluators
+        }
         for name, features in method_feature_lists.items()
     }
 
@@ -710,16 +742,11 @@ def main() -> None:
     ).to_csv(output_dir / "top_feature_overlap.csv", index=False)
     overlap_counts = _pairwise_overlap_counts(comparison, list(method_feature_lists.keys()))
 
-    # --- Common held-out CV evaluation: every method's features scored the same way ---
-    common_model_kwargs = {
-        "penalty": "l2",
-        "C": args.stepwise_logreg_C,
-        "solver": "lbfgs",
-        "max_iter": 100000,
-        "random_state": args.random_state,
-    }
-    common_eval = run_common_evaluation(
-        X, y, method_feature_lists, LogisticRegression, common_model_kwargs, cv, args.stepwise_scoring
+    # --- Common held-out CV evaluation: every method's features scored the same way,
+    # under a panel of evaluators spanning different inductive biases ---
+    evaluator_panel = build_common_evaluator_panel(args.random_state)
+    common_eval = run_common_evaluation_panel(
+        X, y, method_feature_lists, evaluator_panel, cv, args.stepwise_scoring
     )
 
     cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
@@ -741,13 +768,16 @@ def main() -> None:
             if redundant_pair is None
             else {"pair": redundant_pair, "redundancy_corr": args.redundancy_corr, "credit_split_ratios": credit_split_ratios}
         ),
-        "common_evaluator": {
-            "model": "LogisticRegression",
-            "model_kwargs": common_model_kwargs,
+        "common_evaluators": {
+            "panel": {
+                evaluator_name: {"model": model_cls.__name__, "model_kwargs": model_kwargs}
+                for evaluator_name, model_cls, model_kwargs in evaluator_panel
+            },
             "scoring": args.stepwise_scoring,
             "note": (
-                "Every method's selected top-k features scored with this SAME held-out "
-                "CV evaluator for a fair, apples-to-apples comparison."
+                "Every method's selected top-k features scored under every evaluator in "
+                "this panel (spanning linear, bagged-tree, and kernel-margin inductive "
+                "biases), so no method's score is an artifact of one evaluator's blind spot."
             ),
             "results": common_eval,
         },
@@ -796,8 +826,13 @@ def main() -> None:
         "common_eval_scoring": args.stepwise_scoring,
     }
     for name in method_feature_lists:
-        overall_row[f"{name}_held_out_cv_score_mean"] = common_eval[name]["cv_score_mean"]
-        overall_row[f"{name}_held_out_cv_score_std"] = common_eval[name]["cv_score_std"]
+        per_evaluator_means = []
+        for evaluator_name, _, _ in evaluator_panel:
+            evaluator_result = common_eval[name][evaluator_name]
+            overall_row[f"{name}_held_out_cv_score_mean__{evaluator_name}"] = evaluator_result["cv_score_mean"]
+            overall_row[f"{name}_held_out_cv_score_std__{evaluator_name}"] = evaluator_result["cv_score_std"]
+            per_evaluator_means.append(evaluator_result["cv_score_mean"])
+        overall_row[f"{name}_held_out_cv_score_mean_avg"] = float(np.mean(per_evaluator_means))
     overall_row.update(
         {
             "rid_tree_rashomon_train_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
@@ -826,7 +861,12 @@ def main() -> None:
     print("=" * 70)
     for name, features in method_feature_lists.items():
         print(f"{name} top-10: {features[:10]}")
-        print(f"  held-out CV ({args.stepwise_scoring}): {common_eval[name]['cv_score_mean']:.4f} +- {common_eval[name]['cv_score_std']:.4f}")
+        for evaluator_name, _, _ in evaluator_panel:
+            evaluator_result = common_eval[name][evaluator_name]
+            print(
+                f"  held-out CV [{evaluator_name}] ({args.stepwise_scoring}): "
+                f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
+            )
     print(f"overlap counts: {overlap_counts}")
     print(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
     print(f"Results saved to: {output_dir}/")
