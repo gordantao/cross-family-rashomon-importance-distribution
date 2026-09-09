@@ -182,8 +182,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rid-metric",
         type=str,
-        default="sub_mr",
-        help="RID variable-importance metric (default: sub_mr)",
+        default="iloco",
+        help=(
+            "RID variable-importance metric (default: iloco -- ablation-based pairwise "
+            "interaction importance; use sub_mr for the older, cheaper permutation-based "
+            "metric). Cost scales ~O(features^2) per model: ~6s/model at this pipeline's "
+            "current 0.8-correlation-threshold feature count (~138 features); do not pair "
+            "with --correlation-threshold auto without re-checking cost, since auto keeps "
+            "more features (~177) and roughly doubles this per-model cost."
+        ),
     )
     parser.add_argument(
         "--rid-epsilon",
