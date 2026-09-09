@@ -9,6 +9,7 @@ dependencies:
   - matplotlib>=3.8
   - scikit-learn>=1.4
   - joblib>=1.3        # bundled with scikit-learn; explicit pin for parallel safety
+  - kneed>=0.8          # Kneedle elbow detection for --correlation-threshold auto
   - ipython>=8.0        # used by analysis/top40_feature_comparison_results_analysis.ipynb
   - ipykernel>=6.0
   - pip

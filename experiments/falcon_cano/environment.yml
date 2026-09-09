@@ -10,7 +10,17 @@ dependencies:
   - seaborn>=0.13
   - scikit-learn>=1.4
   - joblib>=1.3        # bundled with scikit-learn; explicit pin for parallel safety
+  - kneed>=0.8          # Kneedle elbow detection for --correlation-threshold auto
   - pip
+  - pip:
+      # Leakage-aware splitting (https://datasail.readthedocs.io/en/latest/): clusters
+      # structurally similar compounds so near-identical analogs (e.g. this dataset's
+      # congeneric "-pril"/"-azole"/"-cef" families -- see DataSAIL relevance research)
+      # don't land on both sides of a train/test split. PyPI ships the "lite" build
+      # under the name `datasail`; the full conda build is named `datasail` on conda
+      # and `datasail-lite` there is the lightweight one -- opposite of PyPI's naming,
+      # so installing via pip here avoids the channel/name mismatch.
+      - datasail
 
 # Covers: run_rashomon_falcon_cano.py, run_falcon_cano_top40_comparison.py.
 # Both scripts import the shared `rid` package from the repo root at runtime

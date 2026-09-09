@@ -101,11 +101,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--correlation-threshold",
-        type=float,
+        type=_correlation_threshold_arg,
         default=0.8,
         help=(
             "Remove highly correlated descriptors above this absolute threshold. "
-            "Set to a value <= 0 to disable (default: 0.8)."
+            "Set to a value <= 0 to disable, or 'auto' to pick the Kneedle elbow "
+            "point dynamically from this run's data (default: 0.8)."
         ),
     )
     parser.add_argument(
@@ -283,10 +284,76 @@ def _remove_highly_correlated_features(
     return X, removed_sorted
 
 
+_AUTO_CORRELATION_THRESHOLD_SWEEP = np.round(np.arange(0.50, 0.991, 0.01), 3)
+
+
+def _correlation_threshold_arg(value: str):
+    """argparse type: accepts a float, or the literal 'auto' for elbow detection."""
+
+    if value == "auto":
+        return "auto"
+    return float(value)
+
+
+def sweep_correlation_thresholds(X: pd.DataFrame, thresholds: np.ndarray) -> pd.DataFrame:
+    """Sweep correlation threshold vs. surviving feature count, reusing the
+    actual _remove_highly_correlated_features algorithm at each threshold (so
+    the sweep can never drift from what filtering really does)."""
+
+    rows = []
+    for t in thresholds:
+        X_t, removed_t = _remove_highly_correlated_features(X, correlation_threshold=float(t))
+        rows.append({"threshold": float(t), "n_features_remaining": X_t.shape[1], "n_removed": len(removed_t)})
+    return pd.DataFrame(rows)
+
+
+def find_correlation_elbow(sweep_df: pd.DataFrame) -> float:
+    """Kneedle elbow point, falling back to max-distance-from-chord if `kneed`
+    is unavailable."""
+
+    x = sweep_df["threshold"].to_numpy()
+    y = sweep_df["n_features_remaining"].to_numpy()
+    try:
+        from kneed import KneeLocator
+
+        kl = KneeLocator(x, y, curve="convex", direction="increasing")
+        if kl.knee is not None:
+            return float(kl.knee)
+    except ImportError:
+        pass
+
+    x_norm = (x - x.min()) / (x.max() - x.min())
+    y_norm = (y - y.min()) / (y.max() - y.min())
+    p1 = np.array([x_norm[0], y_norm[0]])
+    p2 = np.array([x_norm[-1], y_norm[-1]])
+    line_unit = (p2 - p1) / np.linalg.norm(p2 - p1)
+    distances = []
+    for xi, yi in zip(x_norm, y_norm):
+        p = np.array([xi, yi]) - p1
+        proj = np.dot(p, line_unit) * line_unit
+        distances.append(np.linalg.norm(p - proj))
+    return float(x[int(np.argmax(distances))])
+
+
+def _resolve_correlation_threshold(X: pd.DataFrame, correlation_threshold) -> tuple[float, dict]:
+    """Resolve a fixed threshold as-is, or pick the Kneedle elbow point from
+    this run's own data when correlation_threshold == 'auto'."""
+
+    if correlation_threshold != "auto":
+        threshold = float(correlation_threshold)
+        return threshold, {"mode": "fixed", "value": threshold}
+
+    sweep_df = sweep_correlation_thresholds(X, _AUTO_CORRELATION_THRESHOLD_SWEEP)
+    elbow = find_correlation_elbow(sweep_df)
+    n_at_elbow = int(sweep_df.loc[sweep_df["threshold"].sub(elbow).abs().idxmin(), "n_features_remaining"])
+    print(f"[correlation-threshold=auto] elbow={elbow:.3f} -> {n_at_elbow} features (from {X.shape[1]} raw)")
+    return elbow, {"mode": "auto", "value": elbow, "n_features_at_elbow": n_at_elbow, "n_features_raw": int(X.shape[1])}
+
+
 def _prepare_task_dataset(
     csv_path: Path,
     target_column: str,
-    correlation_threshold: float,
+    correlation_threshold,
     include_phate_features: bool,
 ) -> tuple[pd.DataFrame, pd.Series, dict]:
     if not csv_path.exists():
@@ -314,7 +381,8 @@ def _prepare_task_dataset(
     X = X.loc[valid_rows].copy()
 
     X_before_corr = X.shape[1]
-    X, removed_corr = _remove_highly_correlated_features(X, correlation_threshold)
+    resolved_threshold, threshold_info = _resolve_correlation_threshold(X, correlation_threshold)
+    X, removed_corr = _remove_highly_correlated_features(X, resolved_threshold)
 
     metadata = {
         "dataset_path": str(csv_path),
@@ -325,6 +393,7 @@ def _prepare_task_dataset(
         "n_features_after_corr": int(X.shape[1]),
         "n_removed_corr": int(len(removed_corr)),
         "removed_corr_features": removed_corr,
+        "correlation_threshold_info": threshold_info,
         "n_classes": int(y.nunique()),
         "class_counts": y.value_counts().to_dict(),
     }

@@ -49,7 +49,9 @@ from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "analysis"))
 
+from correlation_threshold_sweep import find_elbow, sweep_thresholds  # noqa: E402
 from rid import (  # noqa: E402
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -63,6 +65,31 @@ from run_rashomon_falcon_cano import (  # noqa: E402
     resolve_num_workers,
     select_curated_descriptors,
 )
+
+_AUTO_CORRELATION_THRESHOLD_SWEEP = np.round(np.arange(0.50, 0.991, 0.01), 3)
+
+
+def _correlation_threshold_arg(value: str):
+    """argparse type: accepts a float, or the literal 'auto' for elbow detection."""
+
+    if value == "auto":
+        return "auto"
+    return float(value)
+
+
+def _resolve_correlation_threshold(X: pd.DataFrame, correlation_threshold) -> tuple[float, dict]:
+    """Resolve a fixed threshold as-is, or pick the Kneedle elbow point from this
+    run's own data when correlation_threshold == 'auto'."""
+
+    if correlation_threshold != "auto":
+        threshold = float(correlation_threshold)
+        return threshold, {"mode": "fixed", "value": threshold}
+
+    sweep_df = sweep_thresholds(X, _AUTO_CORRELATION_THRESHOLD_SWEEP)
+    elbow = find_elbow(sweep_df)
+    n_at_elbow = int(sweep_df.loc[sweep_df["threshold"].sub(elbow).abs().idxmin(), "n_features_remaining"])
+    print(f"[correlation-threshold=auto] elbow={elbow:.3f} -> {n_at_elbow} features (from {X.shape[1]} raw)")
+    return elbow, {"mode": "auto", "value": elbow, "n_features_at_elbow": n_at_elbow, "n_features_raw": int(X.shape[1])}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -96,9 +123,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--correlation-threshold",
-        type=float,
+        type=_correlation_threshold_arg,
         default=0.8,
-        help="Remove highly correlated descriptors above this absolute threshold (default: 0.8)",
+        help=(
+            "Remove highly correlated descriptors above this absolute threshold, or "
+            "'auto' to pick the Kneedle elbow point dynamically from this run's data "
+            "(default: 0.8)"
+        ),
     )
     parser.add_argument(
         "--use-curated-descriptors",
@@ -225,7 +256,8 @@ def _prepare_dataset(
         X = select_curated_descriptors(X)
     n_features_curated = X.shape[1]
 
-    X = remove_highly_correlated_features(X, correlation_threshold=correlation_threshold)
+    resolved_threshold, threshold_info = _resolve_correlation_threshold(X, correlation_threshold)
+    X = remove_highly_correlated_features(X, correlation_threshold=resolved_threshold)
 
     metadata = {
         "dataset_path": str(data_path),
@@ -235,6 +267,7 @@ def _prepare_dataset(
         "n_features_after_curation": int(n_features_curated),
         "n_features_after_corr": int(X.shape[1]),
         "class_counts": y.value_counts().to_dict(),
+        "correlation_threshold_info": threshold_info,
     }
     return X, y, metadata
 
