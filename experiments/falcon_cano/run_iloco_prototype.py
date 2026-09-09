@@ -40,7 +40,9 @@ def _select_top_k_features(df: pd.DataFrame, target_col: str, top_k: int, existi
             return available[:top_k]
 
     print("[select] no usable existing top-k list found; falling back to univariate |corr| with target")
-    feature_cols = [c for c in df.columns if c != target_col]
+    feature_cols = [
+        c for c in df.columns if c != target_col and not c.startswith("Unnamed:")
+    ]
     corrs = df[feature_cols].corrwith(df[target_col]).abs().sort_values(ascending=False)
     return corrs.head(top_k).index.tolist()
 
