@@ -49,7 +49,6 @@ from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "analysis"))
 
 from correlation_threshold_sweep import find_elbow, sweep_thresholds  # noqa: E402
 from rid import (  # noqa: E402
