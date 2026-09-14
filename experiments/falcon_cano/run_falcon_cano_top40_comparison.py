@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from correlation_threshold_sweep import find_elbow, sweep_thresholds  # noqa: E402
+from feature_count_selection import select_k, sweep_feature_counts  # noqa: E402
 from rid import (  # noqa: E402
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -74,6 +75,14 @@ def _correlation_threshold_arg(value: str):
     if value == "auto":
         return "auto"
     return float(value)
+
+
+def _top_k_arg(value: str):
+    """argparse type: accepts an int, or the literal 'auto' for BIC/AIC selection."""
+
+    if value == "auto":
+        return "auto"
+    return int(value)
 
 
 def _resolve_correlation_threshold(X: pd.DataFrame, correlation_threshold) -> tuple[float, dict]:
@@ -116,9 +125,30 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--top-k",
-        type=int,
+        type=_top_k_arg,
         default=40,
-        help="Number of top features to select from each method (default: 40)",
+        help=(
+            "Number of top features to select from each method, or 'auto' to pick a "
+            "per-method count via deviance-based BIC/AIC (see feature_count_selection.py) "
+            "instead of a fixed number (default: 40)"
+        ),
+    )
+    parser.add_argument(
+        "--top-k-max-sweep",
+        type=int,
+        default=100,
+        help=(
+            "Ceiling on how many features to rank/sweep when --top-k=auto -- the AIC/BIC "
+            "curve is computed over k=1..this value, and the chosen k can't exceed it. "
+            "Ignored when --top-k is a fixed integer (default: 100)"
+        ),
+    )
+    parser.add_argument(
+        "--k-selection-criterion",
+        type=str,
+        choices=["bic", "aic"],
+        default="bic",
+        help="Which information criterion selects k when --top-k=auto (default: bic)",
     )
     parser.add_argument(
         "--correlation-threshold",
@@ -644,6 +674,9 @@ def main() -> None:
     print(f"  data:                  {args.data}")
     print(f"  output_dir:            {output_dir}")
     print(f"  top_k:                 {args.top_k}")
+    if args.top_k == "auto":
+        print(f"  top_k_max_sweep:       {args.top_k_max_sweep}")
+        print(f"  k_selection_criterion: {args.k_selection_criterion}")
     print(f"  correlation_threshold: {args.correlation_threshold}")
     print(f"  use_curated_descriptors: {args.use_curated_descriptors}")
     print(f"  rid_n_jobs:            {rid_n_jobs}")
@@ -679,6 +712,29 @@ def main() -> None:
         random_state=args.random_state,
     )
 
+    evaluator_panel = build_common_evaluator_panel(args.random_state)
+    auto_k_selection = args.top_k == "auto"
+    selection_top_k = args.top_k_max_sweep if auto_k_selection else args.top_k
+    k_selection_results: dict[str, dict] = {}
+
+    def resolve_feature_count(method_name: str, ranked_features: list[str]) -> list[str]:
+        """When --top-k=auto, sweep k=1..top_k_max_sweep along this method's own
+        ranking and truncate to the BIC/AIC-selected consensus k. Otherwise a
+        no-op (ranked_features is already exactly args.top_k long)."""
+
+        if not auto_k_selection:
+            return ranked_features
+        sweep_df = sweep_feature_counts(X, y, ranked_features, evaluator_panel, args.top_k_max_sweep)
+        selection = select_k(sweep_df, criterion=args.k_selection_criterion)
+        selection["sweep"] = sweep_df.to_dict(orient="records")
+        k_selection_results[method_name] = selection
+        chosen_k = selection["consensus_k"]
+        print(
+            f"[top-k=auto] {method_name}: chosen k={chosen_k} via {args.k_selection_criterion} "
+            f"(per-evaluator: { {k: v['best_k'] for k, v in selection['per_evaluator'].items()} })"
+        )
+        return ranked_features[:chosen_k]
+
     # --- Method 1: forward stepwise selection via logistic regression ---
     logreg_kwargs = {
         "penalty": "l2",
@@ -690,17 +746,20 @@ def main() -> None:
     stepwise_logreg_features, stepwise_logreg_history = run_forward_stepwise_selection(
         X=X,
         y=y,
-        top_k=args.top_k,
+        top_k=selection_top_k,
         model_cls=LogisticRegression,
         model_kwargs=logreg_kwargs,
         cv=cv,
         scoring=args.stepwise_scoring,
         n_jobs=args.stepwise_n_jobs,
     )
+    stepwise_logreg_features = resolve_feature_count("stepwise_logreg", stepwise_logreg_features)
     stepwise_logreg_eval = _evaluate_feature_set(
         X, y, stepwise_logreg_features, LogisticRegression, logreg_kwargs, cv, args.stepwise_scoring
     )
-    stepwise_logreg_history.to_csv(output_dir / "stepwise_logreg_top_features.csv", index=False)
+    stepwise_logreg_history.head(len(stepwise_logreg_features)).to_csv(
+        output_dir / "stepwise_logreg_top_features.csv", index=False
+    )
 
     # --- Method 2: forward stepwise selection via random forest ---
     rf_kwargs = {
@@ -713,17 +772,20 @@ def main() -> None:
     stepwise_rf_features, stepwise_rf_history = run_forward_stepwise_selection(
         X=X,
         y=y,
-        top_k=args.top_k,
+        top_k=selection_top_k,
         model_cls=RandomForestClassifier,
         model_kwargs=rf_kwargs,
         cv=cv,
         scoring=args.stepwise_scoring,
         n_jobs=args.stepwise_n_jobs,
     )
+    stepwise_rf_features = resolve_feature_count("stepwise_rf", stepwise_rf_features)
     stepwise_rf_eval = _evaluate_feature_set(
         X, y, stepwise_rf_features, RandomForestClassifier, rf_kwargs, cv, args.stepwise_scoring
     )
-    stepwise_rf_history.to_csv(output_dir / "stepwise_rf_top_features.csv", index=False)
+    stepwise_rf_history.head(len(stepwise_rf_features)).to_csv(
+        output_dir / "stepwise_rf_top_features.csv", index=False
+    )
 
     # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
     print(
@@ -733,14 +795,15 @@ def main() -> None:
     rid_tree_features, rid_tree_table, rid_tree_perf = run_single_family_tree_rid(
         X=X,
         y=y,
-        top_k=args.top_k,
+        top_k=selection_top_k,
         rid_metric=args.rid_metric,
         epsilon=args.rid_epsilon,
         n_bootstraps=args.rid_n_bootstraps,
         n_models_pool=args.rid_n_models_pool,
         n_jobs=rid_n_jobs,
     )
-    rid_tree_table.to_csv(output_dir / "rid_tree_top_features.csv", index=False)
+    rid_tree_features = resolve_feature_count("rid_tree", rid_tree_features)
+    rid_tree_table.head(len(rid_tree_features)).to_csv(output_dir / "rid_tree_top_features.csv", index=False)
 
     # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
     cross_family_features: dict[str, list[str]] = {}
@@ -754,7 +817,7 @@ def main() -> None:
         features, table, perf = run_cross_family_rid(
             X=X,
             y=y,
-            top_k=args.top_k,
+            top_k=selection_top_k,
             rid_metric=args.rid_metric,
             epsilon=args.rid_epsilon,
             n_bootstraps=args.rid_n_bootstraps,
@@ -762,7 +825,10 @@ def main() -> None:
             family_balance_mode=balance_mode,
             n_jobs=rid_n_jobs,
         )
-        table.to_csv(output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
+        features = resolve_feature_count(f"cross_family_{balance_mode}", features)
+        table.head(len(features)).to_csv(
+            output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False
+        )
         cross_family_features[balance_mode] = features
         cross_family_perf[balance_mode] = perf
 
@@ -806,6 +872,15 @@ def main() -> None:
             None
             if redundant_pair is None
             else {"pair": redundant_pair, "redundancy_corr": args.redundancy_corr, "credit_split_ratios": credit_split_ratios}
+        ),
+        "k_selection": (
+            None
+            if not auto_k_selection
+            else {
+                "criterion": args.k_selection_criterion,
+                "top_k_max_sweep": args.top_k_max_sweep,
+                "per_method": k_selection_results,
+            }
         ),
         "common_evaluators": {
             "panel": {
@@ -872,6 +947,7 @@ def main() -> None:
             overall_row[f"{name}_held_out_cv_score_std__{evaluator_name}"] = evaluator_result["cv_score_std"]
             per_evaluator_means.append(evaluator_result["cv_score_mean"])
         overall_row[f"{name}_held_out_cv_score_mean_avg"] = float(np.mean(per_evaluator_means))
+        overall_row[f"{name}_n_features_selected"] = len(method_feature_lists[name])
     overall_row.update(
         {
             "rid_tree_rashomon_train_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
