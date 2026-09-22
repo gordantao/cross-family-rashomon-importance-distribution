@@ -211,14 +211,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rid-metric",
         type=str,
-        default="iloco",
+        default="sub_mr",
         help=(
-            "RID variable-importance metric (default: iloco -- ablation-based pairwise "
-            "interaction importance; use sub_mr for the older, cheaper permutation-based "
-            "metric). Cost scales ~O(features^2) per model: ~6s/model at this pipeline's "
-            "current 0.8-correlation-threshold feature count (~138 features); do not pair "
-            "with --correlation-threshold auto without re-checking cost, since auto keeps "
-            "more features (~177) and roughly doubles this per-model cost."
+            "RID variable-importance metric (default: sub_mr -- permutation-based model "
+            "reliance). iloco (ablation-based pairwise interaction importance) is available "
+            "as an explicit opt-in, but is not a general-purpose replacement for sub_mr: its "
+            "sum(|iLOCO|) reduction is structurally blind to additive main effects (see "
+            "docs/findings_summary.md §9), which measurably hurt ground-truth recovery on "
+            "9/10 synthetic DGPs (docs/datasail_dgp_iloco_extended_results.md §3) and "
+            "timed out at 48h on the full-scale real dataset. Cost scales ~O(features^2) per "
+            "model if you do opt in: ~6s/model at this pipeline's current "
+            "0.8-correlation-threshold feature count (~138 features); do not pair with "
+            "--correlation-threshold auto without re-checking cost, since auto keeps more "
+            "features (~177) and roughly doubles this per-model cost."
         ),
     )
     parser.add_argument(
