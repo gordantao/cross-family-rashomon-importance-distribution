@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from correlation_threshold_sweep import find_elbow, sweep_thresholds  # noqa: E402
-from feature_count_selection import select_k, sweep_feature_counts  # noqa: E402
+from feature_count_selection import select_k_by_cv_gain, select_k_by_prob_positive  # noqa: E402
 from rid import (  # noqa: E402
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -78,7 +78,7 @@ def _correlation_threshold_arg(value: str):
 
 
 def _top_k_arg(value: str):
-    """argparse type: accepts an int, or the literal 'auto' for BIC/AIC selection."""
+    """argparse type: accepts an int, or the literal 'auto' for elbow-based selection."""
 
     if value == "auto":
         return "auto"
@@ -129,8 +129,9 @@ def _parse_args() -> argparse.Namespace:
         default=40,
         help=(
             "Number of top features to select from each method, or 'auto' to pick a "
-            "per-method count via deviance-based BIC/AIC (see feature_count_selection.py) "
-            "instead of a fixed number (default: 40)"
+            "per-method count via elbow detection on that method's own native signal "
+            "curve (see feature_count_selection.py) instead of a fixed number "
+            "(default: 40)"
         ),
     )
     parser.add_argument(
@@ -138,17 +139,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help=(
-            "Ceiling on how many features to rank/sweep when --top-k=auto -- the AIC/BIC "
-            "curve is computed over k=1..this value, and the chosen k can't exceed it. "
-            "Ignored when --top-k is a fixed integer (default: 100)"
+            "Ceiling on how many features to rank when --top-k=auto -- each method's "
+            "signal curve (prob_positive for RID methods, held-out CV gain for stepwise "
+            "methods) is computed over rank=1..this value, and the chosen k can't exceed "
+            "it. Ignored when --top-k is a fixed integer (default: 100)"
         ),
-    )
-    parser.add_argument(
-        "--k-selection-criterion",
-        type=str,
-        choices=["bic", "aic"],
-        default="bic",
-        help="Which information criterion selects k when --top-k=auto (default: bic)",
     )
     parser.add_argument(
         "--correlation-threshold",
@@ -681,7 +676,6 @@ def main() -> None:
     print(f"  top_k:                 {args.top_k}")
     if args.top_k == "auto":
         print(f"  top_k_max_sweep:       {args.top_k_max_sweep}")
-        print(f"  k_selection_criterion: {args.k_selection_criterion}")
     print(f"  correlation_threshold: {args.correlation_threshold}")
     print(f"  use_curated_descriptors: {args.use_curated_descriptors}")
     print(f"  rid_n_jobs:            {rid_n_jobs}")
@@ -717,26 +711,39 @@ def main() -> None:
         random_state=args.random_state,
     )
 
-    evaluator_panel = build_common_evaluator_panel(args.random_state)
     auto_k_selection = args.top_k == "auto"
     selection_top_k = args.top_k_max_sweep if auto_k_selection else args.top_k
     k_selection_results: dict[str, dict] = {}
 
-    def resolve_feature_count(method_name: str, ranked_features: list[str]) -> list[str]:
-        """When --top-k=auto, sweep k=1..top_k_max_sweep along this method's own
-        ranking and truncate to the BIC/AIC-selected consensus k. Otherwise a
+    def resolve_feature_count(
+        method_name: str,
+        ranked_features: list[str],
+        signal_values: list[float],
+        signal_kind: str,
+    ) -> list[str]:
+        """When --top-k=auto, elbow-detect this method's own native signal curve
+        (prob_positive for RID methods, held-out CV gain for stepwise methods)
+        over rank=1..top_k_max_sweep and truncate to the elbow rank. Otherwise a
         no-op (ranked_features is already exactly args.top_k long)."""
 
         if not auto_k_selection:
             return ranked_features
-        sweep_df = sweep_feature_counts(X, y, ranked_features, evaluator_panel, args.top_k_max_sweep)
-        selection = select_k(sweep_df, criterion=args.k_selection_criterion)
-        selection["sweep"] = sweep_df.to_dict(orient="records")
+        if signal_kind == "prob_positive":
+            selection = select_k_by_prob_positive(signal_values)
+        elif signal_kind == "cv_gain":
+            selection = select_k_by_cv_gain(signal_values)
+        else:
+            raise ValueError(f"Unknown signal_kind '{signal_kind}'")
+        selection["signal_kind"] = signal_kind
+        selection["curve"] = {
+            "rank": list(range(1, len(signal_values) + 1)),
+            "value": [float(v) for v in signal_values],
+        }
         k_selection_results[method_name] = selection
-        chosen_k = selection["consensus_k"]
+        chosen_k = selection["k"]
         print(
-            f"[top-k=auto] {method_name}: chosen k={chosen_k} via {args.k_selection_criterion} "
-            f"(per-evaluator: { {k: v['best_k'] for k, v in selection['per_evaluator'].items()} })"
+            f"[top-k=auto] {method_name}: chosen k={chosen_k} via {selection['criterion']}"
+            f"{' (at ceiling)' if selection['at_ceiling'] else ''}"
         )
         return ranked_features[:chosen_k]
 
@@ -758,7 +765,12 @@ def main() -> None:
         scoring=args.stepwise_scoring,
         n_jobs=args.stepwise_n_jobs,
     )
-    stepwise_logreg_features = resolve_feature_count("stepwise_logreg", stepwise_logreg_features)
+    stepwise_logreg_features = resolve_feature_count(
+        "stepwise_logreg",
+        stepwise_logreg_features,
+        stepwise_logreg_history["cv_score_mean"].tolist(),
+        "cv_gain",
+    )
     stepwise_logreg_eval = _evaluate_feature_set(
         X, y, stepwise_logreg_features, LogisticRegression, logreg_kwargs, cv, args.stepwise_scoring
     )
@@ -784,7 +796,12 @@ def main() -> None:
         scoring=args.stepwise_scoring,
         n_jobs=args.stepwise_n_jobs,
     )
-    stepwise_rf_features = resolve_feature_count("stepwise_rf", stepwise_rf_features)
+    stepwise_rf_features = resolve_feature_count(
+        "stepwise_rf",
+        stepwise_rf_features,
+        stepwise_rf_history["cv_score_mean"].tolist(),
+        "cv_gain",
+    )
     stepwise_rf_eval = _evaluate_feature_set(
         X, y, stepwise_rf_features, RandomForestClassifier, rf_kwargs, cv, args.stepwise_scoring
     )
@@ -807,7 +824,9 @@ def main() -> None:
         n_models_pool=args.rid_n_models_pool,
         n_jobs=rid_n_jobs,
     )
-    rid_tree_features = resolve_feature_count("rid_tree", rid_tree_features)
+    rid_tree_features = resolve_feature_count(
+        "rid_tree", rid_tree_features, rid_tree_table["prob_positive"].tolist(), "prob_positive"
+    )
     rid_tree_table.head(len(rid_tree_features)).to_csv(output_dir / "rid_tree_top_features.csv", index=False)
 
     # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
@@ -830,7 +849,9 @@ def main() -> None:
             family_balance_mode=balance_mode,
             n_jobs=rid_n_jobs,
         )
-        features = resolve_feature_count(f"cross_family_{balance_mode}", features)
+        features = resolve_feature_count(
+            f"cross_family_{balance_mode}", features, table["prob_positive"].tolist(), "prob_positive"
+        )
         table.head(len(features)).to_csv(
             output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False
         )
@@ -882,7 +903,6 @@ def main() -> None:
             None
             if not auto_k_selection
             else {
-                "criterion": args.k_selection_criterion,
                 "top_k_max_sweep": args.top_k_max_sweep,
                 "per_method": k_selection_results,
             }

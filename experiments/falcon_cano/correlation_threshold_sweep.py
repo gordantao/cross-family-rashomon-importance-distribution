@@ -23,6 +23,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from elbow_selection import find_elbow as _find_elbow_point  # noqa: E402
+
 DATA_PATH = Path(__file__).resolve().parent / "falcon_cano_featured.csv"
 OUTPUT_DIR = Path(__file__).resolve().parent / "results" / "correlation_threshold_sweep"
 
@@ -62,33 +64,15 @@ def sweep_thresholds(X: pd.DataFrame, thresholds: np.ndarray) -> pd.DataFrame:
 
 
 def find_elbow(sweep_df: pd.DataFrame) -> float:
-    x = sweep_df["threshold"].to_numpy()
-    y = sweep_df["n_features_remaining"].to_numpy()
-    try:
-        from kneed import KneeLocator
-
-        kl = KneeLocator(x, y, curve="convex", direction="increasing")
-        if kl.knee is not None:
-            return float(kl.knee)
-    except ImportError:
-        pass
-
-    # Fallback: max perpendicular distance from the chord connecting the
-    # first and last point, on axes normalized to [0, 1].
-    x_norm = (x - x.min()) / (x.max() - x.min())
-    y_norm = (y - y.min()) / (y.max() - y.min())
-    p1 = np.array([x_norm[0], y_norm[0]])
-    p2 = np.array([x_norm[-1], y_norm[-1]])
-    line_vec = p2 - p1
-    line_len = np.linalg.norm(line_vec)
-    line_unit = line_vec / line_len
-    distances = []
-    for xi, yi in zip(x_norm, y_norm):
-        p = np.array([xi, yi]) - p1
-        proj_len = np.dot(p, line_unit)
-        proj = proj_len * line_unit
-        distances.append(np.linalg.norm(p - proj))
-    return float(x[int(np.argmax(distances))])
+    elbow = _find_elbow_point(
+        sweep_df["threshold"].to_numpy(),
+        sweep_df["n_features_remaining"].to_numpy(),
+        curve="convex",
+        direction="increasing",
+    )
+    if elbow is None:
+        raise RuntimeError("No elbow found in the correlation-threshold sweep curve")
+    return elbow
 
 
 def plot_sweep(sweep_df: pd.DataFrame, elbow: float, output_path: Path) -> None:
