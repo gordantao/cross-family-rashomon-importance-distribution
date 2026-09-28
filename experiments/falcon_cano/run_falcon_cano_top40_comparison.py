@@ -26,6 +26,16 @@ evenly). Needs no ground truth, since the duplicate is deliberately
 constructed to be substitutable -- unlike ground-truth precision/recall,
 this credit-sharing test works on real data. Off by default.
 
+--rid-selection mrmr (default: marginal) greedily reorders RID's own
+importance ranking to trade off importance against redundancy with
+already-picked features (mrmr_selection.py), instead of RID's plain
+importance sort. RID's raw ranking deliberately doesn't penalize redundancy
+(two substitutable features can both look important across the Rashomon
+set -- see --inject-redundant-duplicate above), which is correct for
+characterizing importance but is a real handicap in a matched-k predictive
+comparison against stepwise selection, which gets redundancy-avoidance for
+free from its own greedy CV-scored search. Off (marginal) by default.
+
 Usage:
     python run_falcon_cano_top40_comparison.py
     sbatch run_falcon_cano_top40_comparison.sl
@@ -52,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from correlation_threshold_sweep import find_elbow, sweep_thresholds  # noqa: E402
 from feature_count_selection import select_k_by_cv_gain, select_k_by_prob_positive  # noqa: E402
+from mrmr_selection import reorder_by_mrmr  # noqa: E402
 from rid import (  # noqa: E402
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -220,6 +231,32 @@ def _parse_args() -> argparse.Namespace:
             "--correlation-threshold auto without re-checking cost, since auto keeps more "
             "features (~177) and roughly doubles this per-model cost."
         ),
+    )
+    parser.add_argument(
+        "--rid-selection",
+        type=str,
+        choices=["marginal", "mrmr"],
+        default="marginal",
+        help=(
+            "How RID-based methods (rid_tree, cross_family_unweighted, "
+            "cross_family_weighted) order their ranked features. 'marginal' (default) "
+            "uses RID's own expected_importance ranking as-is -- two substitutable "
+            "features can both rank highly, since RID deliberately characterizes "
+            "importance across the whole Rashomon set rather than penalizing "
+            "redundancy. 'mrmr' greedily reorders that same ranking (mrmr_selection.py) "
+            "to trade off importance against redundancy with already-picked features, "
+            "for a fairer matched-k predictive comparison against stepwise selection, "
+            "which gets this for free from its own greedy CV-scored search. Under "
+            "--top-k=auto, 'mrmr' elbow-detects a held-out CV-gain curve instead of "
+            "prob_positive, since mrmr's reordering breaks the plain "
+            "sorted-by-importance assumption prob_positive-elbow relies on."
+        ),
+    )
+    parser.add_argument(
+        "--mrmr-lambda",
+        type=float,
+        default=1.0,
+        help="Redundancy penalty weight for --rid-selection=mrmr (default: 1.0)",
     )
     parser.add_argument(
         "--rid-epsilon",
@@ -409,6 +446,39 @@ def _evaluate_feature_set(
         "cv_score_std": float(np.std(scores)),
         "n_features": len(features),
     }
+
+
+def _compute_incremental_cv_curve(
+    X: pd.DataFrame,
+    y: pd.Series,
+    ranked_features: list[str],
+    model_cls,
+    model_kwargs: dict,
+    cv,
+    scoring: str,
+) -> list[float]:
+    """Held-out CV score after adding each successive feature along an
+    already-fixed ranking. Unlike run_forward_stepwise_selection's own
+    history, this doesn't search over candidate features at each step -- the
+    order was already decided elsewhere (e.g. by reorder_by_mrmr) -- so it's
+    one CV fit per rank instead of one per (rank x remaining candidate).
+    Used only to elbow-detect how many ranks are worth keeping when a
+    method's ranking isn't a plain importance sort anymore."""
+
+    scores = []
+    for k in range(1, len(ranked_features) + 1):
+        estimator = model_cls(**model_kwargs)
+        cv_scores = cross_val_score(
+            estimator,
+            X[ranked_features[:k]],
+            y,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=1,
+            error_score="raise",
+        )
+        scores.append(float(np.mean(cv_scores)))
+    return scores
 
 
 def run_single_family_tree_rid(
@@ -676,6 +746,9 @@ def main() -> None:
     print(f"  top_k:                 {args.top_k}")
     if args.top_k == "auto":
         print(f"  top_k_max_sweep:       {args.top_k_max_sweep}")
+    print(f"  rid_selection:         {args.rid_selection}")
+    if args.rid_selection == "mrmr":
+        print(f"  mrmr_lambda:           {args.mrmr_lambda}")
     print(f"  correlation_threshold: {args.correlation_threshold}")
     print(f"  use_curated_descriptors: {args.use_curated_descriptors}")
     print(f"  rid_n_jobs:            {rid_n_jobs}")
@@ -715,6 +788,9 @@ def main() -> None:
     selection_top_k = args.top_k_max_sweep if auto_k_selection else args.top_k
     k_selection_results: dict[str, dict] = {}
 
+    use_mrmr = args.rid_selection == "mrmr"
+    corr_matrix = X.corr().abs() if use_mrmr else None
+
     def resolve_feature_count(
         method_name: str,
         ranked_features: list[str],
@@ -746,6 +822,44 @@ def main() -> None:
             f"{' (at ceiling)' if selection['at_ceiling'] else ''}"
         )
         return ranked_features[:chosen_k]
+
+    def resolve_rid_feature_count(
+        method_name: str, features: list[str], table: pd.DataFrame
+    ) -> tuple[list[str], pd.DataFrame]:
+        """Applies --rid-selection=mrmr reordering (if enabled) to a RID
+        method's ranking, then resolves k the same way resolve_feature_count
+        does, but using whichever native signal curve matches the CURRENT
+        ordering: prob_positive for the untouched marginal ranking, held-out
+        CV gain for the mrmr reordering (mrmr breaks the sorted-by-importance
+        assumption prob_positive-elbow relies on)."""
+
+        if use_mrmr:
+            importance_map = dict(zip(table["feature"], table["expected_importance"]))
+            prob_positive_map = dict(zip(table["feature"], table["prob_positive"]))
+            reordered = reorder_by_mrmr(importance_map, corr_matrix, args.mrmr_lambda)
+            table = pd.DataFrame(
+                {
+                    "rank": range(1, len(reordered) + 1),
+                    "feature": reordered,
+                    "expected_importance": [importance_map[f] for f in reordered],
+                    "prob_positive": [prob_positive_map[f] for f in reordered],
+                }
+            )
+            features = reordered
+            signal_values = (
+                _compute_incremental_cv_curve(
+                    X, y, features, LogisticRegression, logreg_kwargs, cv, args.stepwise_scoring
+                )
+                if auto_k_selection
+                else None
+            )
+            signal_kind = "cv_gain"
+        else:
+            signal_values = table["prob_positive"].tolist()
+            signal_kind = "prob_positive"
+
+        features = resolve_feature_count(method_name, features, signal_values, signal_kind)
+        return features, table.head(len(features))
 
     # --- Method 1: forward stepwise selection via logistic regression ---
     logreg_kwargs = {
@@ -824,10 +938,8 @@ def main() -> None:
         n_models_pool=args.rid_n_models_pool,
         n_jobs=rid_n_jobs,
     )
-    rid_tree_features = resolve_feature_count(
-        "rid_tree", rid_tree_features, rid_tree_table["prob_positive"].tolist(), "prob_positive"
-    )
-    rid_tree_table.head(len(rid_tree_features)).to_csv(output_dir / "rid_tree_top_features.csv", index=False)
+    rid_tree_features, rid_tree_table = resolve_rid_feature_count("rid_tree", rid_tree_features, rid_tree_table)
+    rid_tree_table.to_csv(output_dir / "rid_tree_top_features.csv", index=False)
 
     # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
     cross_family_features: dict[str, list[str]] = {}
@@ -849,12 +961,8 @@ def main() -> None:
             family_balance_mode=balance_mode,
             n_jobs=rid_n_jobs,
         )
-        features = resolve_feature_count(
-            f"cross_family_{balance_mode}", features, table["prob_positive"].tolist(), "prob_positive"
-        )
-        table.head(len(features)).to_csv(
-            output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False
-        )
+        features, table = resolve_rid_feature_count(f"cross_family_{balance_mode}", features, table)
+        table.to_csv(output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
         cross_family_features[balance_mode] = features
         cross_family_perf[balance_mode] = perf
 
