@@ -12,11 +12,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
 
 from .models import resolve_candidate_trainer, resolve_model_config, train_candidate_models
+from .truvarimp import resolve_default_search_space, run_joint_truvarimp
 
 
 VALID_VI_METRICS = ("sub_mr", "loco", "coef", "iloco")
 VALID_PERFORMANCE_METRICS = ("accuracy", "f1", "auprc")
 VALID_CROSS_FAMILY_BALANCE_MODES = ("unweighted", "weighted")
+VALID_CANDIDATE_SEARCH_MODES = ("grid", "truvarimp_joint")
 
 
 def compute_model_reliance(model, X, y, metric="sub_mr", rng=None):
@@ -406,6 +408,19 @@ def normalize_cross_family_balance_mode(family_balance_mode):
     return family_balance_mode
 
 
+def normalize_candidate_search(candidate_search):
+    """Normalize and validate the cross-family candidate-search strategy."""
+
+    if candidate_search is None:
+        return "grid"
+    if candidate_search not in VALID_CANDIDATE_SEARCH_MODES:
+        raise ValueError(
+            f"Unknown candidate_search '{candidate_search}'. "
+            f"Supported modes: {VALID_CANDIDATE_SEARCH_MODES}"
+        )
+    return candidate_search
+
+
 def summarize_metric_result(metric_result):
     """Compute per-feature expected importance and P(phi > 0).
 
@@ -639,18 +654,26 @@ def _run_single_bootstrap_cross_family(
     vi_metric_specs,
     performance_metric_specs,
     family_balance_mode,
+    candidate_search="grid",
+    search_spaces=None,
+    truvarimp_config=None,
 ):
     rng = np.random.default_rng(seed=b)
     X_boot, y_boot = resample(X_scaled, y, random_state=b)
 
-    family_models = {}
-    family_losses = {}
-    for name, (trainer, kwargs) in model_configs.items():
-        models, losses = train_candidate_models(
-            trainer, X_boot, y_boot, n_models_per_class, b, kwargs
+    if candidate_search == "truvarimp_joint":
+        family_models, family_losses = run_joint_truvarimp(
+            model_configs, search_spaces or {}, X_boot, y_boot, b, epsilon, truvarimp_config
         )
-        family_models[name] = models
-        family_losses[name] = losses
+    else:
+        family_models = {}
+        family_losses = {}
+        for name, (trainer, kwargs) in model_configs.items():
+            models, losses = train_candidate_models(
+                trainer, X_boot, y_boot, n_models_per_class, b, kwargs
+            )
+            family_models[name] = models
+            family_losses[name] = losses
 
     all_losses = np.concatenate(
         [losses for losses in family_losses.values() if len(losses) > 0]
@@ -860,28 +883,67 @@ def compute_rid_cross_family(
     family_balance_mode="unweighted",
     n_cdf_points=200,
     n_jobs=1,
+    candidate_search="grid",
+    truvarimp_config=None,
 ):
-    """Compute cross-family RID and return metric results, family counts, and family performance."""
+    """Compute cross-family RID and return metric results, family counts, and family performance.
+
+    ``candidate_search`` selects how each bootstrap populates its candidate
+    pool before Rashomon filtering:
+
+    - ``"grid"`` (default): exhaustively refit every point of each family's
+      discretized hyperparameter grid, as before.
+    - ``"truvarimp_joint"``: CASH-style joint active search (TruVaRImp,
+      arXiv:2603.15321) over a continuous per-family hyperparameter space,
+      adaptively spending a shared evaluation budget on whichever family's
+      candidate looks most likely to be near the (bootstrap-implicit)
+      Rashomon threshold -- see ``rid.truvarimp`` for the algorithm and
+      ``rid.truvarimp.DEFAULT_CONTINUOUS_SEARCH_SPACES_BY_NAME`` for the
+      built-in per-family search spaces this falls back to. Every evaluated
+      candidate is still fit for real and scored by exact training log-loss;
+      only the search policy differs. A family's config mapping can override
+      the default search space with a ``"truvarimp_search_space"`` key
+      (a :class:`rid.truvarimp.ContinuousSearchSpace`). ``n_models_per_class``
+      is ignored in this mode -- use ``truvarimp_config`` (overrides for
+      ``rid.truvarimp.DEFAULT_TRUVARIMP_CONFIG``, notably ``total_budget``,
+      the shared evaluation budget across all families) instead.
+    """
 
     vi_metric_specs = normalize_vi_metrics(vi_metrics)
     performance_metric_specs = normalize_performance_metrics(performance_metrics)
     vi_metric_names = tuple(metric_name for metric_name, _ in vi_metric_specs)
     performance_metric_names = tuple(metric_name for metric_name, _ in performance_metric_specs)
     family_balance_mode = normalize_cross_family_balance_mode(family_balance_mode)
+    candidate_search = normalize_candidate_search(candidate_search)
 
     X_values, y_values, feature_names = _prepare_inputs(X, y)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_values)
 
     resolved_model_configs = {}
+    search_spaces = {}
     for name, model_config in model_configs.items():
-        _, trainer, model_kwargs = resolve_model_config(model_config)
+        model_class, trainer, model_kwargs = resolve_model_config(model_config)
         resolved_model_configs[name] = (trainer, model_kwargs)
+        if candidate_search == "truvarimp_joint":
+            explicit_space = (
+                model_config.get("truvarimp_search_space")
+                if isinstance(model_config, Mapping)
+                else None
+            )
+            search_spaces[name] = explicit_space or resolve_default_search_space(model_class)
+            if search_spaces[name] is None:
+                print(
+                    f"  Note: family '{name}' ({getattr(model_class, '__name__', model_class)}) has no "
+                    "continuous search space for truvarimp_joint; falling back to a single fixed "
+                    "evaluation via its own trainer for this family."
+                )
 
     family_names = list(resolved_model_configs.keys())
     print(
         f"Cross-family RID (per-family Rashomon): {family_names}, {len(feature_names)} features, "
-        f"B={n_bootstraps}, pool={n_models_per_class}/class, epsilon={epsilon}, n_jobs={n_jobs}, "
+        f"B={n_bootstraps}, candidate_search={candidate_search}, "
+        f"pool={n_models_per_class}/class, epsilon={epsilon}, n_jobs={n_jobs}, "
         f"metrics={vi_metric_names}, performance_metrics={performance_metric_names}, "
         f"family_balance_mode={family_balance_mode}"
     )
@@ -898,6 +960,9 @@ def compute_rid_cross_family(
             vi_metric_specs,
             performance_metric_specs,
             family_balance_mode,
+            candidate_search,
+            search_spaces,
+            truvarimp_config,
         )
         for b in range(n_bootstraps)
     )
@@ -1167,6 +1232,8 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         family_balance_mode="unweighted",
         n_cdf_points=200,
         n_jobs=1,
+        candidate_search="grid",
+        truvarimp_config=None,
     ):
         self.model_configs = model_configs
         self.epsilon = epsilon
@@ -1177,6 +1244,8 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         self.family_balance_mode = family_balance_mode
         self.n_cdf_points = n_cdf_points
         self.n_jobs = n_jobs
+        self.candidate_search = candidate_search
+        self.truvarimp_config = truvarimp_config
 
     def fit(self, X, y):
         (
@@ -1196,6 +1265,8 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             family_balance_mode=self.family_balance_mode,
             n_cdf_points=self.n_cdf_points,
             n_jobs=self.n_jobs,
+            candidate_search=self.candidate_search,
+            truvarimp_config=self.truvarimp_config,
         )
         _, _, self.feature_names_ = _prepare_inputs(X, y)
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()
