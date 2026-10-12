@@ -12,7 +12,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
 
 from .models import resolve_candidate_trainer, resolve_model_config, train_candidate_models
-from .truvarimp import resolve_default_search_space, run_joint_truvarimp
+from .truvarimp import (
+    DEFAULT_TRUVARIMP_CONFIG,
+    resolve_default_search_space,
+    run_joint_truvarimp,
+)
 
 
 VALID_VI_METRICS = ("sub_mr", "loco", "coef", "iloco")
@@ -406,6 +410,20 @@ def normalize_cross_family_balance_mode(family_balance_mode):
             f"Supported modes: {VALID_CROSS_FAMILY_BALANCE_MODES}"
         )
     return family_balance_mode
+
+
+def _declared_search_grid(model_config):
+    """Return the custom search grid a model config declares, if any.
+
+    Mirrors the shapes ``resolve_model_config`` accepts, so callers can tell
+    whether an override exists without re-resolving the whole config.
+    """
+
+    if isinstance(model_config, Mapping):
+        return model_config.get("search_grid")
+    if isinstance(model_config, (tuple, list)):
+        return model_config[2] if len(model_config) >= 3 else None
+    return None
 
 
 def normalize_candidate_search(candidate_search):
@@ -906,7 +924,11 @@ def compute_rid_cross_family(
       (a :class:`rid.truvarimp.ContinuousSearchSpace`). ``n_models_per_class``
       is ignored in this mode -- use ``truvarimp_config`` (overrides for
       ``rid.truvarimp.DEFAULT_TRUVARIMP_CONFIG``, notably ``total_budget``,
-      the shared evaluation budget across all families) instead.
+      the shared per-bootstrap fit budget across all families) instead. A
+      family's ``search_grid`` override applies to ``"grid"`` only; constrain
+      the joint search with ``"truvarimp_search_space"`` instead, and note
+      that any hyperparameter the family pins through its model kwargs is held
+      fixed rather than searched.
     """
 
     vi_metric_specs = normalize_vi_metrics(vi_metrics)
@@ -938,12 +960,24 @@ def compute_rid_cross_family(
                     "continuous search space for truvarimp_joint; falling back to a single fixed "
                     "evaluation via its own trainer for this family."
                 )
+            elif _declared_search_grid(model_config) is not None:
+                print(
+                    f"  Note: family '{name}' declares a custom search_grid, which only the "
+                    "'grid' candidate_search uses; truvarimp_joint searches its continuous "
+                    "space instead. Pass 'truvarimp_search_space' in a mapping config to "
+                    "constrain the joint search."
+                )
 
     family_names = list(resolved_model_configs.keys())
+    pool_description = (
+        f"budget={(truvarimp_config or {}).get('total_budget', DEFAULT_TRUVARIMP_CONFIG['total_budget'])} fits/bootstrap"
+        if candidate_search == "truvarimp_joint"
+        else f"pool={n_models_per_class}/class"
+    )
     print(
         f"Cross-family RID (per-family Rashomon): {family_names}, {len(feature_names)} features, "
         f"B={n_bootstraps}, candidate_search={candidate_search}, "
-        f"pool={n_models_per_class}/class, epsilon={epsilon}, n_jobs={n_jobs}, "
+        f"{pool_description}, epsilon={epsilon}, n_jobs={n_jobs}, "
         f"metrics={vi_metric_names}, performance_metrics={performance_metric_names}, "
         f"family_balance_mode={family_balance_mode}"
     )
