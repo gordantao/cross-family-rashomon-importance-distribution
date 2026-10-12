@@ -265,7 +265,7 @@ TRAINER_REGISTRY = {
     LogisticRegression: GridCandidateTrainer(
         configs=[
             (C, penalty)
-            for C in np.logspace(-3, 3, 7)
+            for C in np.logspace(-4, 4, 9)
             for penalty in ["l1", "l2", "elasticnet"]
         ],
         random_state_multiplier=1000,
@@ -274,8 +274,8 @@ TRAINER_REGISTRY = {
     RandomForestClassifier: GridCandidateTrainer(
         configs=[
             (n_estimators, max_depth, max_features)
-            for n_estimators in [100, 200]
-            for max_depth in [5, 10, None]
+            for n_estimators in [100, 200, 400]
+            for max_depth in [5, 10, 20, None]
             for max_features in ["sqrt", "log2"]
         ],
         random_state_multiplier=3000,
@@ -284,8 +284,8 @@ TRAINER_REGISTRY = {
     GradientBoostingClassifier: GridCandidateTrainer(
         configs=[
             (n_estimators, learning_rate, max_depth)
-            for n_estimators in [100, 200]
-            for learning_rate in [0.05, 0.1, 0.2]
+            for n_estimators in [100, 200, 300]
+            for learning_rate in [0.02, 0.05, 0.1, 0.2]
             for max_depth in [2, 3, 4]
         ],
         random_state_multiplier=4000,
@@ -294,28 +294,28 @@ TRAINER_REGISTRY = {
     SVC: GridCandidateTrainer(
         configs=[
             (C, gamma)
-            for C in [0.1, 1, 10, 100]
-            for gamma in [0.001, 0.01, 0.1, 1, 10]
+            for C in [0.01, 0.1, 1, 10, 100, 1000]
+            for gamma in [0.0001, 0.001, 0.01, 0.1, 1, 10]
         ],
         random_state_multiplier=5000,
         build_estimator=_build_svc_estimator,
     ),
     LassoClassifier: GridCandidateTrainer(
-        configs=list(np.logspace(-4, 2, 9)),
+        configs=list(np.logspace(-5, 3, 13)),
         random_state_multiplier=6000,
         build_estimator=_build_lasso_estimator,
     ),
     ElasticNetClassifier: GridCandidateTrainer(
         configs=[
             (C, l1_ratio)
-            for C in np.logspace(-3, 2, 5)
-            for l1_ratio in [0.1, 0.5, 0.9]
+            for C in np.logspace(-4, 3, 6)
+            for l1_ratio in [0.1, 0.3, 0.5, 0.7, 0.9]
         ],
         random_state_multiplier=7000,
         build_estimator=_build_elastic_net_estimator,
     ),
     RidgeClassifier: GridCandidateTrainer(
-        configs=list(np.logspace(-4, 3, 8)),
+        configs=list(np.logspace(-5, 4, 12)),
         random_state_multiplier=8000,
         build_estimator=_build_ridge_estimator,
     ),
@@ -323,11 +323,20 @@ TRAINER_REGISTRY = {
         build_estimator=_build_linear_estimator,
     ),
     FullyEnumeratedTreeClassifier: GridCandidateTrainer(
+        # max_depth deliberately stays within [2, 6] -- including max_depth=None
+        # (or pushing depth meaningfully higher) let trees memorize their
+        # bootstrap sample in earlier experiments, degenerating the Rashomon
+        # set into just the most overfit trees. min_samples_leaf and criterion
+        # are the two axes safe to widen for more grid diversity: this family's
+        # refits are deterministic CART (no bagging/subsampling), so every
+        # fit at a given grid point returns the same tree regardless of
+        # random_state -- distinct grid points are the only real source of
+        # diversity in this family's Rashomon set, unlike RandomForest.
         configs=[
             (max_depth, min_samples_leaf, criterion)
             for max_depth in [2, 3, 4, 5, 6]
-            for min_samples_leaf in [1, 5, 10, 20]
-            for criterion in ["gini", "entropy"]
+            for min_samples_leaf in [1, 2, 5, 10, 20, 50]
+            for criterion in ["gini", "entropy", "log_loss"]
         ],
         random_state_multiplier=9000,
         build_estimator=_build_decision_tree_estimator,

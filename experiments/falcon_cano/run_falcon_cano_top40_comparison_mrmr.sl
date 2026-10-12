@@ -70,7 +70,7 @@ $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --mrmr-lambda 1.0 \
     --rid-metric sub_mr \
     --rid-n-bootstraps 500 \
-    --rid-n-models-pool 50 \
+    --rid-n-models-pool 100 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
 

@@ -65,7 +65,7 @@ $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --output-dir experiments/falcon_cano/results/top40_feature_comparison \
     --top-k 40 \
     --rid-n-bootstraps 500 \
-    --rid-n-models-pool 50 \
+    --rid-n-models-pool 100 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
 

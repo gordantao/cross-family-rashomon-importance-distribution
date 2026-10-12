@@ -53,7 +53,7 @@ $PYTHON_ENV experiments/falcon_cano/run_rashomon_falcon_cano.py \
     --output-dir experiments/falcon_cano/results \
     --n-bootstraps 500 \
     --epsilon 0.05 \
-    --n-models-pool 50 \
+    --n-models-pool 100 \
 
 echo "========================================"
 echo "End time: $(date)"

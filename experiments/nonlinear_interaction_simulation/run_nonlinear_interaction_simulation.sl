@@ -60,6 +60,8 @@ $PYTHON_ENV --version
 $PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation.py \
 	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation \
 	--include-redundant-dgps \
+	--bootstraps 500 \
+	--models-per-class 100 \
 	--num-workers "$SLURM_CPUS_PER_TASK"
 
 echo "========================================"

@@ -71,42 +71,30 @@ DEFAULT_STEPWISE_RF_N_ESTIMATORS = 100
 DEFAULT_RANDOM_STATE = 42
 METHODS = ("cross_family_unweighted", "cross_family_weighted", "stepwise_logreg", "stepwise_rf", "rid_tree")
 
+# No per-family search_grid overrides here: every family now inherits its
+# grid straight from rid.models.TRAINER_REGISTRY, standardizing this
+# experiment's search space on the same grids Falcon-Cano and Staellert use
+# rather than its own, much smaller, bespoke ones.
 RID_MODEL_CONFIGS = {
     "RF": {
         "model": RandomForestClassifier,
         "kwargs": {"min_samples_leaf": 2},
-        "search_grid": {
-            "n_estimators": [100, 200],
-            "max_depth": [4, None],
-            "max_features": ["sqrt"],
-        },
     },
     "GBM": {
         "model": GradientBoostingClassifier,
         "kwargs": {},
-        "search_grid": {
-            "n_estimators": [100, 200],
-            "learning_rate": [0.05, 0.1],
-            "max_depth": [2, 3],
-        },
     },
     "SVM": {
         "model": SVC,
         "kwargs": {},
-        "search_grid": {
-            "C": [0.5, 2.0],
-            "gamma": ["scale", "auto"],
-        },
     },
     "Lasso": {
         "model": LassoClassifier,
         "kwargs": {},
-        "search_grid": {"C": [0.1, 1.0, 10.0]},
     },
     "Ridge": {
         "model": RidgeClassifier,
         "kwargs": {},
-        "search_grid": {"C": [0.1, 1.0, 10.0]},
     },
 }
 
