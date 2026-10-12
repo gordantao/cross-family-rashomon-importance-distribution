@@ -38,6 +38,8 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 from sklearn.metrics import log_loss
 
+from .models import GridCandidateTrainer
+
 
 # ---------------------------------------------------------------------------
 # Search-space specification
@@ -175,9 +177,43 @@ def _round_integer_like(name, value):
     return value
 
 
+def drop_pinned_dimensions(search_space, model_kwargs):
+    """Remove search dimensions the caller already pinned via ``model_kwargs``.
+
+    A family declared as ``(RandomForestClassifier, {"max_depth": 5})`` is
+    asking for that value, so searching ``max_depth`` anyway would silently
+    override it (the grid path lets ``model_kwargs`` win, or raises on the
+    duplicate keyword -- it never discards the caller's value). Dropping the
+    dimension honors the pin AND keeps the GP from carrying a constant,
+    uninformative input column. Returns ``(search_space, pinned_names)``.
+    """
+
+    if not model_kwargs:
+        return search_space, ()
+
+    pinned = tuple(name for name in search_space.dimensions if name in model_kwargs)
+    if not pinned:
+        return search_space, ()
+
+    remaining = {
+        name: dim for name, dim in search_space.dimensions.items() if name not in model_kwargs
+    }
+    return ContinuousSearchSpace(remaining), pinned
+
+
 # ---------------------------------------------------------------------------
 # Per-(sub)family active-search state
 # ---------------------------------------------------------------------------
+
+
+# Minimum number of observations before a converged kernel is reused as the
+# starting point for the next MLE (see _refit_gp).
+_WARM_START_MIN_OBSERVATIONS = 8
+
+# Per-bootstrap stride for derived model random_states. Must exceed any
+# plausible per-bootstrap evaluation budget so that bootstrap b's seeds cannot
+# overlap bootstrap b+1's.
+_RANDOM_STATE_STRIDE = 100003
 
 
 class _FamilySearchState:
@@ -208,6 +244,7 @@ class _FamilySearchState:
         )
 
         self.evaluated_idx = []
+        self._evaluated_set = set()  # O(1) membership for the acquisition filter
         self.evaluated_y = []
         self.models = []
         self.losses = []
@@ -216,7 +253,7 @@ class _FamilySearchState:
         # Uninformed prior: huge variance until the GP has at least one observation.
         self.sigma2 = np.full(self.n_candidates, 1e6)
         self._k_star_star_all = None
-        self._K_full = None
+        self._K_post_full = None
 
         self.U = set(range(self.n_candidates))
         self.M = set(range(self.n_candidates))
@@ -241,7 +278,13 @@ class _FamilySearchState:
         # converged kernel instead of the original prior every time -- the
         # optimum barely moves when one point is added to a few dozen, so
         # this saves most of the L-BFGS iterations on every subsequent fit.
-        self.gp.kernel = self.gp.kernel_
+        # Only once there are enough observations for the MLE to be meaningful:
+        # with n_restarts_optimizer=0 every later fit starts from wherever the
+        # previous one landed, and a 2-or-3-point MLE routinely pins
+        # length_scale/noise_level to a bound, which would then persist for the
+        # rest of the bootstrap.
+        if len(y_obs) >= _WARM_START_MIN_OBSERVATIONS:
+            self.gp.kernel = self.gp.kernel_
         self.mu, sigma = self.gp.predict(self._X_gp, return_std=True)
         self.sigma2 = sigma**2
         self._precompute_lookahead_tables(X_obs)
@@ -254,6 +297,26 @@ class _FamilySearchState:
         2016, Appendix B: the reduction a hypothetical new observation at
         lambda gives at every other point lambda' can be written purely in
         terms of the current kernel and the already-observed points).
+
+        Two scale details matter here, because both tables are consumed
+        alongside ``self.sigma2`` in :meth:`best_candidate_and_score`:
+
+        1. The tables must hold *posterior* covariance, not prior covariance.
+           The look-ahead reduction at lambda' from observing lambda is
+           ``k_post(lambda', lambda)^2 / k_post(lambda, lambda)``; using the
+           prior ``k(lambda', lambda)`` instead would claim a reduction even
+           where the current observations have already removed the covariance,
+           and would not respect ``reduction <= sigma2(lambda')``.
+        2. ``self.gp`` is fit with ``normalize_y=True``, so the posterior
+           variance sklearn returns from ``predict`` is rescaled by
+           ``_y_train_std ** 2`` while ``kernel_`` still lives in normalized-y
+           units. Both tables are therefore rescaled by the same factor, so
+           that ``sigma2 - K_post**2 / k_star_star`` subtracts like-for-like.
+           (Without this, with log-loss spreads well below 1, the kernel-scale
+           ratio exceeds the loss-scale variance by orders of magnitude, every
+           look-ahead variance clamps to zero, the acquisition score becomes
+           constant across candidates, and argmax degenerates to "first
+           candidate".)
         """
 
         kernel = self.gp.kernel_
@@ -263,28 +326,40 @@ class _FamilySearchState:
         except np.linalg.LinAlgError:
             K_inv = np.linalg.pinv(K_obs)
 
-        K_cross_all = kernel(X_obs, self._X_gp)  # (n_obs, n_candidates)
-        quad = np.sum(K_cross_all * (K_inv @ K_cross_all), axis=0)  # (n_candidates,)
-        diag_all = kernel.diag(self._X_gp)
-        # k_star_star_all[i] = posterior variance AT i given only the current
-        # observations -- i.e. what the "new" observation noise-free variance
-        # would be if i were observed next.
-        self._k_star_star_all = np.maximum(diag_all - quad, 1e-12)
-        self._K_full = kernel(self._X_gp)  # (n_candidates, n_candidates), symmetric
+        y_scale = float(np.asarray(getattr(self.gp, "_y_train_std", 1.0)).ravel()[0])
+        y_var_scale = y_scale**2
 
-    def evaluate(self, idx, X_boot, y_boot, b, seed_offset):
+        K_cross_all = kernel(X_obs, self._X_gp)  # (n_obs, n_candidates)
+        K_inv_cross = K_inv @ K_cross_all  # (n_obs, n_candidates)
+        quad = np.sum(K_cross_all * K_inv_cross, axis=0)  # (n_candidates,)
+        diag_all = kernel.diag(self._X_gp)
+        # k_star_star_all[i] = posterior predictive variance AT i given only the
+        # current observations -- i.e. the variance of the hypothetical new
+        # observation if i were evaluated next.
+        self._k_star_star_all = np.maximum(diag_all - quad, 1e-12) * y_var_scale
+        # Posterior covariance between every pair of candidates, in the same
+        # y units as self.sigma2 (see the docstring's point 2).
+        self._K_post_full = (kernel(self._X_gp) - K_cross_all.T @ K_inv_cross) * y_var_scale
+
+    def evaluate(self, idx, X_boot, y_boot, b, seed_offset, refit=True):
         config = dict(self.candidate_configs[idx])
-        random_state = b * 97 + seed_offset
+        random_state = b * _RANDOM_STATE_STRIDE + seed_offset
         model = self.build_estimator(config, random_state, {})
         model.fit(X_boot, y_boot)
         loss = log_loss(y_boot, model.predict_proba(X_boot))
 
         self.evaluated_idx.append(idx)
+        self._evaluated_set.add(idx)
         self.evaluated_y.append(loss)
         self.models.append(model)
         self.losses.append(loss)
         self.U.discard(idx)
-        self._refit_gp()
+        # ``refit=False`` lets a caller batch several evaluations (e.g. the
+        # random warm-up draws, none of which steer the next pick) and refit
+        # the GP once at the end instead of once per fit -- each refit costs an
+        # MLE plus an O(n_candidates^2) kernel build.
+        if refit:
+            self._refit_gp()
         return loss
 
     def confidence_interval(self, beta_sqrt):
@@ -333,15 +408,15 @@ class _FamilySearchState:
         (n_candidates x (|U|+|M|)) score surface is a handful of array ops.
         """
 
-        unclassified = [idx for idx in (self.U | self.M) if idx not in self.evaluated_idx]
+        unclassified = sorted((self.U | self.M) - self._evaluated_set)
         if not unclassified:
             return None, -np.inf
         if self._k_star_star_all is None:
             return unclassified[0], 0.0
 
         cand_arr = np.array(unclassified, dtype=int)
-        U_arr = np.array(list(self.U), dtype=int)
-        M_arr = np.array(list(self.M), dtype=int)
+        U_arr = np.array(sorted(self.U), dtype=int)
+        M_arr = np.array(sorted(self.M), dtype=int)
         k_ss = self._k_star_star_all[cand_arr]  # (n_cand,)
 
         def delta_before(idx_arr, power):
@@ -353,7 +428,11 @@ class _FamilySearchState:
         def delta_after(idx_arr, power):
             if idx_arr.size == 0:
                 return np.zeros(len(cand_arr))
-            K_cross = self._K_full[np.ix_(cand_arr, idx_arr)]  # (n_cand, n_idx)
+            # Posterior cross-covariance, already in self.sigma2's units -- see
+            # _precompute_lookahead_tables. The clamp at 0 is numerical safety
+            # only: Cauchy-Schwarz guarantees K_post**2 / k_star_star <=
+            # sigma2, so a correctly scaled look-ahead variance is >= 0.
+            K_cross = self._K_post_full[np.ix_(cand_arr, idx_arr)]  # (n_cand, n_idx)
             sigma2_lookahead = np.maximum(
                 self.sigma2[idx_arr][None, :] - (K_cross**2) / k_ss[:, None], 0.0
             )
@@ -382,6 +461,13 @@ DEFAULT_TRUVARIMP_CONFIG = {
     "r": 0.1,
     "delta_bar": 0.0,
     "n_warmup_per_subfamily": 10,
+    # Share of total_budget held back from the active loop and spent at the end
+    # fitting the configurations the search concluded are *inside* the Rashomon
+    # threshold (set L), best-predicted first. Without this the returned pool
+    # would contain only configurations the policy was uncertain about -- the
+    # acquisition deliberately avoids spending fits where it is already
+    # confident, which is exactly where the Rashomon members are.
+    "harvest_fraction": 0.2,
 }
 
 
@@ -395,10 +481,12 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         ``model_configs`` argument.
     search_spaces : dict[str, ContinuousSearchSpace]
         Continuous search space per family name. Families missing an entry
-        (or whose trainer has no ``build_estimator``, e.g. a hand-written
-        custom trainer) fall back to a single fixed evaluation using that
-        family's own ``train`` method, so every family still contributes at
-        least one real observation to the shared threshold.
+        (or whose trainer is not a ``GridCandidateTrainer``, e.g. a
+        ``SingleCandidateTrainer`` or a hand-written custom trainer) fall back
+        to a single fixed evaluation using that family's own ``train`` method,
+        so every family still contributes at least one real observation to the
+        shared threshold. Dimensions the family already pins through its model
+        kwargs are dropped from its space rather than searched over.
     X_boot, y_boot : ndarray
         The bootstrap resample to fit candidates on.
     b : int
@@ -408,7 +496,10 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         an absolute additive tolerance on log-loss (``eps_rel=0, eps_abs=epsilon``
         in the paper's ``h = c_min*(1+eps_rel) + eps_abs`` notation).
     config : dict, optional
-        Overrides for ``DEFAULT_TRUVARIMP_CONFIG``.
+        Overrides for ``DEFAULT_TRUVARIMP_CONFIG``. ``total_budget`` bounds the
+        TOTAL number of real model fits across all families (warm-up, active
+        search, and harvest alike); ``harvest_fraction`` is the share of it
+        reserved for the closing harvest phase.
 
     Returns
     -------
@@ -434,15 +525,32 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
     family_of_state = {}
     for family_name, (trainer, model_kwargs) in resolved_model_configs.items():
         search_space = search_spaces.get(family_name)
-        build_estimator = getattr(trainer, "build_estimator", None)
+        # Only a GridCandidateTrainer's build_estimator takes the
+        # (config, random_state, model_kwargs) signature this module calls.
+        # SingleCandidateTrainer's takes model_kwargs alone, and a custom
+        # trainer may expose an attribute of that name with any signature at
+        # all -- those must take the .train() fallback, not a TypeError.
+        build_estimator = (
+            trainer.build_estimator if isinstance(trainer, GridCandidateTrainer) else None
+        )
 
         if search_space is not None and build_estimator is not None:
+            search_space, pinned = drop_pinned_dimensions(search_space, model_kwargs)
+            if pinned:
+                print(
+                    f"  Note: family '{family_name}' pins {list(pinned)} via its model kwargs; "
+                    "those dimensions are held fixed rather than searched."
+                )
             log_flags = {
                 name: dim.log
                 for name, dim in search_space.continuous_dimensions().items()
             }
             for fixed_values, continuous_names in split_categorical_subspaces(search_space):
-                n_cand = cfg["n_candidates_per_subfamily"]
+                # With no continuous axis left, every draw would produce the
+                # identical config, so one candidate fully describes the
+                # sub-family; sampling n_candidates_per_subfamily duplicates
+                # would just burn budget refitting the same hyperparameters.
+                n_cand = cfg["n_candidates_per_subfamily"] if continuous_names else 1
                 samples = {
                     name: search_space.dimensions[name].sample(rng, n_cand)
                     for name in continuous_names
@@ -476,32 +584,41 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
             states.append(state)
             family_of_state[family_name] = family_name
 
+    searchable = [s for s in states if not isinstance(s, _FallbackFamilyState)]
+    budget = max(int(cfg["total_budget"]), 0)
+    harvest_budget = min(int(round(budget * float(cfg["harvest_fraction"]))), budget)
+    search_budget = budget - harvest_budget
+    total_evaluations = 0
+
     # --- warm-start: a handful of random evaluations per searchable sub-family ---
-    for state in states:
-        if isinstance(state, _FallbackFamilyState):
-            continue
-        n_warmup = min(cfg["n_warmup_per_subfamily"], state.n_candidates)
+    # Clamped against the remaining budget: without the clamp, enough families
+    # (or categorical splits) would push the real fit count past total_budget
+    # before the active loop ever ran.
+    for state in searchable:
+        remaining = search_budget - total_evaluations
+        if remaining <= 0:
+            break
+        n_warmup = min(cfg["n_warmup_per_subfamily"], state.n_candidates, remaining)
         warm_idx = rng.choice(state.n_candidates, size=n_warmup, replace=False)
         for seed_offset, idx in enumerate(warm_idx):
-            state.evaluate(int(idx), X_boot, y_boot, b, seed_offset)
-
-    searchable = [s for s in states if not isinstance(s, _FallbackFamilyState)]
-    total_evaluations = sum(len(s.evaluated_idx) for s in searchable)
-    budget = cfg["total_budget"]
+            # Random draws don't steer each other, so refit the GP once at the
+            # end of the batch instead of after every fit.
+            state.evaluate(
+                int(idx),
+                X_boot,
+                y_boot,
+                b,
+                seed_offset,
+                refit=(seed_offset == n_warmup - 1),
+            )
+        total_evaluations += n_warmup
 
     # --- active-learning loop (Algorithm 1, generalized across sub-families) ---
-    while total_evaluations < budget and any(s.U or s.M for s in searchable):
-        c_min_pes = min(
-            (min(state.mu[i] + beta_sqrt * np.sqrt(state.sigma2[i]) for i in state.M) for state in searchable if state.M),
-            default=None,
-        )
-        if c_min_pes is None:
+    while total_evaluations < search_budget and any(s.U or s.M for s in searchable):
+        thresholds = _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon)
+        if thresholds is None:
             break
-        h_pes = c_min_pes * (1 + eps_rel) + epsilon
-        h_opt = min(
-            (min(state.mu[i] - beta_sqrt * np.sqrt(state.sigma2[i]) for i in state.M) for state in searchable if state.M),
-            default=c_min_pes,
-        ) * (1 + eps_rel) + epsilon
+        c_min_pes, h_pes, h_opt = thresholds
 
         for state in searchable:
             state.update_partition(h_opt, h_pes, c_min_pes, beta_sqrt)
@@ -522,6 +639,16 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         best_state.evaluate(best_idx, X_boot, y_boot, b, seed_offset=len(best_state.evaluated_idx))
         total_evaluations += 1
 
+    # --- harvest: actually fit the configurations the search believes are IN
+    # the Rashomon set. The acquisition above spends its budget where the GP is
+    # uncertain, i.e. near the threshold, so without this step set L is pure
+    # bookkeeping and the returned pool is a boundary-biased sample that omits
+    # the confidently-good configurations the Rashomon filter downstream exists
+    # to collect.
+    _harvest_predicted_rashomon(
+        searchable, X_boot, y_boot, b, beta_sqrt, eps_rel, epsilon, harvest_budget
+    )
+
     # --- collapse sub-family states back into the caller's family keys ---
     family_models = {name: [] for name in resolved_model_configs}
     family_losses = {name: [] for name in resolved_model_configs}
@@ -532,6 +659,75 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
 
     family_losses = {name: np.array(values) for name, values in family_losses.items()}
     return family_models, family_losses
+
+
+def _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon):
+    """Compute the thresholds that couple the families: (c_min_pes, h_pes, h_opt).
+
+    Returns ``None`` when no family has a non-empty potential-minimizer set M,
+    i.e. there is nothing left to anchor the shared threshold to.
+    """
+
+    with_m = [state for state in searchable if state.M]
+    if not with_m:
+        return None
+
+    c_min_pes = min(
+        min(state.mu[i] + beta_sqrt * np.sqrt(state.sigma2[i]) for i in state.M)
+        for state in with_m
+    )
+    c_min_opt = min(
+        min(state.mu[i] - beta_sqrt * np.sqrt(state.sigma2[i]) for i in state.M)
+        for state in with_m
+    )
+    h_pes = c_min_pes * (1 + eps_rel) + epsilon
+    h_opt = c_min_opt * (1 + eps_rel) + epsilon
+    return c_min_pes, h_pes, h_opt
+
+
+def _harvest_predicted_rashomon(
+    searchable, X_boot, y_boot, b, beta_sqrt, eps_rel, epsilon, harvest_budget
+):
+    """Spend the reserved budget fitting the best *predicted* configurations.
+
+    Prefers candidates the final partition placed in L (confidently within the
+    Rashomon threshold); when L is empty everywhere -- the common case, since a
+    pooled threshold set by the strongest family classifies most candidates
+    into H -- falls back to the globally lowest predicted loss, which is the
+    same thing the exact filter in ``rid/core.py`` is looking for. These fits
+    are terminal, so the GP is not refit afterwards.
+    """
+
+    if harvest_budget <= 0 or not searchable:
+        return 0
+
+    thresholds = _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon)
+    if thresholds is not None:
+        c_min_pes, h_pes, h_opt = thresholds
+        for state in searchable:
+            state.update_partition(h_opt, h_pes, c_min_pes, beta_sqrt)
+
+    preferred = []
+    fallback = []
+    for state in searchable:
+        unevaluated = set(range(state.n_candidates)) - state._evaluated_set
+        for idx in sorted(unevaluated):
+            entry = (float(state.mu[idx]), state.name, idx, state)
+            if idx in state.L:
+                preferred.append(entry)
+            else:
+                fallback.append(entry)
+
+    queue = preferred if preferred else fallback
+    queue.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+
+    evaluated = 0
+    for _, _, idx, state in queue[:harvest_budget]:
+        state.evaluate(
+            idx, X_boot, y_boot, b, seed_offset=len(state.evaluated_idx), refit=False
+        )
+        evaluated += 1
+    return evaluated
 
 
 class _FallbackFamilyState:

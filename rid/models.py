@@ -87,12 +87,16 @@ def _normalize_search_grid(search_grid):
 
 def _build_logistic_estimator(config, random_state, model_kwargs):
     if isinstance(config, Mapping):
-        return LogisticRegression(
-            random_state=random_state,
-            max_iter=100000,
-            **config,
-            **model_kwargs,
-        )
+        kwargs = {"max_iter": 100000, **config, **model_kwargs}
+        # Mirror the tuple branch's solver/l1_ratio handling: a mapping config
+        # that only names {"C", "penalty"} (e.g. one sampled by
+        # rid.truvarimp's continuous search space) would otherwise inherit
+        # sklearn's default lbfgs solver, which rejects every penalty except
+        # "l2"/None, and would omit the l1_ratio that "elasticnet" requires.
+        kwargs.setdefault("solver", "saga")
+        if kwargs.get("penalty") == "elasticnet":
+            kwargs.setdefault("l1_ratio", 0.5)
+        return LogisticRegression(random_state=random_state, **kwargs)
 
     C, penalty = config
     kwargs = {
