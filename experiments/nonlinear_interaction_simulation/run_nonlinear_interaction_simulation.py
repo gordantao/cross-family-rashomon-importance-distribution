@@ -104,6 +104,12 @@ RID_PERFORMANCE_METRICS = (
     performance_auprc,
 )
 
+# Three evaluators spanning distinct inductive biases (additive/linear, bagged
+# axis-aligned interactions, smooth kernel margin), so a method's top-k set
+# isn't rewarded/penalized by one model's blind spots -- same panel used by
+# the Falcon-Cano/Staellert top-k comparison scripts' build_common_evaluator_panel.
+COMMON_EVALUATOR_NAMES = ("logreg", "random_forest", "svm_rbf")
+
 
 def resolve_num_workers(cli_override=None):
     """Determine number of workers from Slurm env first, then CLI."""
@@ -764,6 +770,65 @@ def run_single_family_tree_rid(
     return ranked_features
 
 
+def build_common_evaluator_panel(random_state):
+    """Three fixed evaluators spanning distinct inductive biases, so a
+    feature set's held-out score isn't an artifact of one model's blind spots
+    -- identical panel to the Falcon-Cano/Staellert top-k comparison scripts'
+    build_common_evaluator_panel, so predictive-accuracy numbers from this
+    simulation stay comparable to those real-data studies."""
+
+    return [
+        (
+            "logreg",
+            LogisticRegression,
+            {"penalty": "l2", "C": 1.0, "solver": "lbfgs", "max_iter": 100000, "random_state": random_state},
+        ),
+        (
+            "random_forest",
+            RandomForestClassifier,
+            {"n_estimators": 300, "min_samples_leaf": 1, "random_state": random_state, "n_jobs": 1},
+        ),
+        (
+            "svm_rbf",
+            SVC,
+            {"kernel": "rbf", "C": 1.0, "gamma": "scale", "random_state": random_state},
+        ),
+    ]
+
+
+def _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring):
+    estimator = model_cls(**model_kwargs)
+    scores = cross_val_score(
+        estimator,
+        X[features],
+        y,
+        cv=cv,
+        scoring=scoring,
+        n_jobs=1,
+        error_score="raise",
+    )
+    return {
+        "scoring": scoring,
+        "cv_score_mean": float(np.mean(scores)),
+        "cv_score_std": float(np.std(scores)),
+        "n_features": len(features),
+    }
+
+
+def run_common_evaluation_panel(X, y, method_feature_lists, evaluators, cv, scoring):
+    """Evaluate every method's selected top-k features under every evaluator
+    in the panel, so methods are compared on equal footing regardless of which
+    model (if any) they used internally to select features."""
+
+    return {
+        name: {
+            evaluator_name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+            for evaluator_name, model_cls, model_kwargs in evaluators
+        }
+        for name, features in method_feature_lists.items()
+    }
+
+
 def run_simulation_study(
     simulators,
     *,
@@ -785,6 +850,8 @@ def run_simulation_study(
     rows = []
     snr_rows = []
     start = time.time()
+
+    evaluator_panel = build_common_evaluator_panel(random_state)
 
     total_cells = len(simulators) * len(beta_grid) * n_repetitions
     completed = 0
@@ -867,6 +934,14 @@ def run_simulation_study(
                     ),
                 }
 
+                method_feature_lists = {
+                    method_name: ranked_features[: len(ground_truth)]
+                    for method_name, ranked_features in method_rankings.items()
+                }
+                common_eval = run_common_evaluation_panel(
+                    X, y, method_feature_lists, evaluator_panel, cv, stepwise_scoring
+                )
+
                 for method_name, ranked_features in method_rankings.items():
                     metric_row = compute_selection_metrics(ranked_features, ground_truth)
 
@@ -876,6 +951,16 @@ def run_simulation_study(
                     credit_split_ratios = compute_credit_split_ratios(ranked_features, equivalence_classes)
                     valid_ratios = [v for v in credit_split_ratios.values() if v is not None]
                     credit_split_ratio_mean = float(np.mean(valid_ratios)) if valid_ratios else None
+
+                    method_eval = common_eval[method_name]
+                    held_out_scores = {
+                        f"held_out_cv_score_{stat}__{evaluator_name}": method_eval[evaluator_name][f"cv_score_{stat}"]
+                        for evaluator_name in COMMON_EVALUATOR_NAMES
+                        for stat in ("mean", "std")
+                    }
+                    held_out_scores["held_out_cv_score_mean_avg"] = float(
+                        np.mean([method_eval[name]["cv_score_mean"] for name in COMMON_EVALUATOR_NAMES])
+                    )
 
                     rows.append(
                         {
@@ -889,6 +974,7 @@ def run_simulation_study(
                             **metric_row,
                             "equivalence_recall_at_k": equivalence_recall,
                             "credit_split_ratio_mean": credit_split_ratio_mean,
+                            **held_out_scores,
                         }
                     )
 
@@ -904,6 +990,13 @@ def run_simulation_study(
     return pd.DataFrame(rows), pd.DataFrame(snr_rows)
 
 
+HELD_OUT_SCORE_COLUMNS = [
+    f"held_out_cv_score_{stat}__{evaluator_name}"
+    for evaluator_name in COMMON_EVALUATOR_NAMES
+    for stat in ("mean", "std")
+] + ["held_out_cv_score_mean_avg"]
+
+
 def build_metric_tables(study_results):
     grouped = (
         study_results.groupby(["dgp", "beta", "method"])[
@@ -916,6 +1009,7 @@ def build_metric_tables(study_results):
                 "mean_gt_rank",
                 "equivalence_recall_at_k",
                 "credit_split_ratio_mean",
+                *HELD_OUT_SCORE_COLUMNS,
             ]
         ]
         .agg(["mean", "sem"])
@@ -934,6 +1028,7 @@ def build_metric_tables(study_results):
                 "mean_gt_rank",
                 "equivalence_recall_at_k",
                 "credit_split_ratio_mean",
+                *HELD_OUT_SCORE_COLUMNS,
             ]
         ]
         .mean()
