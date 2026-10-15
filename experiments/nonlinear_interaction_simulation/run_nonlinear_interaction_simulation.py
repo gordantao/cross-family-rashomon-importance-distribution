@@ -861,6 +861,21 @@ def run_common_evaluation_panel(X, y, method_feature_lists, evaluators, cv, scor
     }
 
 
+def build_held_out_scores(method_eval):
+    """Flatten one method's ``run_common_evaluation_panel`` entry into the
+    ``HELD_OUT_SCORE_COLUMNS`` fields of a study_results row."""
+
+    held_out_scores = {
+        f"held_out_cv_score_{stat}__{evaluator_name}": method_eval[evaluator_name][f"cv_score_{stat}"]
+        for evaluator_name in COMMON_EVALUATOR_NAMES
+        for stat in ("mean", "std")
+    }
+    held_out_scores["held_out_cv_score_mean_avg"] = float(
+        np.mean([method_eval[name]["cv_score_mean"] for name in COMMON_EVALUATOR_NAMES])
+    )
+    return held_out_scores
+
+
 def run_simulation_study(
     simulators,
     *,
@@ -986,16 +1001,6 @@ def run_simulation_study(
                     valid_ratios = [v for v in credit_split_ratios.values() if v is not None]
                     credit_split_ratio_mean = float(np.mean(valid_ratios)) if valid_ratios else None
 
-                    method_eval = common_eval[method_name]
-                    held_out_scores = {
-                        f"held_out_cv_score_{stat}__{evaluator_name}": method_eval[evaluator_name][f"cv_score_{stat}"]
-                        for evaluator_name in COMMON_EVALUATOR_NAMES
-                        for stat in ("mean", "std")
-                    }
-                    held_out_scores["held_out_cv_score_mean_avg"] = float(
-                        np.mean([method_eval[name]["cv_score_mean"] for name in COMMON_EVALUATOR_NAMES])
-                    )
-
                     rows.append(
                         {
                             "dgp": dgp_name,
@@ -1008,7 +1013,7 @@ def run_simulation_study(
                             **metric_row,
                             "equivalence_recall_at_k": equivalence_recall,
                             "credit_split_ratio_mean": credit_split_ratio_mean,
-                            **held_out_scores,
+                            **build_held_out_scores(common_eval[method_name]),
                         }
                     )
 

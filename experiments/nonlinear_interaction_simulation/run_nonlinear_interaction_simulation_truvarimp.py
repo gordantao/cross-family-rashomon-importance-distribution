@@ -103,6 +103,8 @@ def run_simulation_study_truvarimp(
     snr_rows = []
     start = time.time()
 
+    evaluator_panel = base.build_common_evaluator_panel(random_state)
+
     total_cells = len(simulators) * len(beta_grid) * n_repetitions
     completed = 0
 
@@ -194,6 +196,14 @@ def run_simulation_study_truvarimp(
                     method_runners, cell_label
                 )
 
+                method_feature_lists = {
+                    method_name: ranked_features[: len(ground_truth)]
+                    for method_name, ranked_features in method_rankings.items()
+                }
+                common_eval = base.run_common_evaluation_panel(
+                    X, y, method_feature_lists, evaluator_panel, cv, stepwise_scoring
+                )
+
                 for method_name, ranked_features in method_rankings.items():
                     metric_row = base.compute_selection_metrics(ranked_features, ground_truth)
 
@@ -220,6 +230,7 @@ def run_simulation_study_truvarimp(
                             **metric_row,
                             "equivalence_recall_at_k": equivalence_recall,
                             "credit_split_ratio_mean": credit_split_ratio_mean,
+                            **base.build_held_out_scores(common_eval[method_name]),
                         }
                     )
 
