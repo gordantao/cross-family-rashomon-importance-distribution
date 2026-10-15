@@ -3,9 +3,9 @@
 #SBATCH --output=cross-rid-simulation-truvarimp_%j.out
 #SBATCH --error=cross-rid-simulation-truvarimp_%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=250
+#SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
-#SBATCH --time=48:00:00
+#SBATCH --time=120:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
@@ -14,11 +14,14 @@
 #   SLURM_CPUS_PER_TASK
 # which your Python script can read for NUM_WORKERS.
 #
-# NOTE: --cpus-per-task=250 requests 250 cores on a SINGLE node
-# (--ntasks=1). Every other .sl in this repo runs at 50 -- confirm a
-# Longleaf partition actually has a node with >=250 cores (e.g. `sinfo -N -l`)
-# before submitting, or this job will sit PENDING indefinitely rather than
-# erroring.
+# --cpus-per-task was briefly bumped to 250 here while --mem stayed at 32G
+# (every other .sl in this repo runs 50 cpus / 32G, i.e. 640MB/core) --
+# 250 joblib worker processes (compute_rid_cross_family's bootstrap-level
+# Parallel in rid/core.py) at 128MB/core OOM-killed the job within 30s,
+# before any real bootstrap computation ran (~260 oom_kill events, one per
+# worker process's baseline numpy/sklearn/pandas import overhead alone).
+# Reverted to 50 to match the configuration already proven stable at
+# rid_n_bootstraps=500 (Falcon-Cano's full-scale run, 5h24m, no errors).
 # -------------------------------------------------------
 
 set -euo pipefail

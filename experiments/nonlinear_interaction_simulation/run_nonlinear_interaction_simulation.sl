@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
-#SBATCH --time=48:00:00
+#SBATCH --time=120:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 

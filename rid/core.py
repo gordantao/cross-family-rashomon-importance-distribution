@@ -652,7 +652,8 @@ def _collect_bootstrap_results(tasks, n_jobs, n_bootstraps, label):
 def _format_bootstrap_stats(stats):
     parts = [f"{stats['seconds']:.1f}s", f"fits={stats['n_fits']}", f"rashomon={stats['rashomon_size']}"]
     if stats.get("truvarimp"):
-        parts.append(f"truvarimp={stats['truvarimp']}")
+        search_stats = {k: v for k, v in stats["truvarimp"].items() if k != "pinned"}
+        parts.append(f"truvarimp={search_stats}")
     return " ".join(parts)
 
 
@@ -691,7 +692,9 @@ def _log_bootstrap_summary(label, bootstrap_stats):
 
     search_stats = [stats["truvarimp"] for stats in bootstrap_stats if stats.get("truvarimp")]
     if search_stats:
-        numeric = [{k: v for k, v in s.items() if k != "stop_reason"} for s in search_stats]
+        numeric = [
+            {k: v for k, v in s.items() if k not in ("stop_reason", "pinned")} for s in search_stats
+        ]
         stop_reasons = Counter(s["stop_reason"] for s in search_stats)
         logger.info(
             "%s: TruVaRImp mean/bootstrap: %s; stop reasons: %s",
@@ -699,6 +702,20 @@ def _log_bootstrap_summary(label, bootstrap_stats):
             fmt(_mean_by_key(numeric)),
             dict(stop_reasons),
         )
+        # Pinned dimensions depend only on each family's model kwargs, so they're
+        # the same every bootstrap; report them once here, from the parent process.
+        pinned = {}
+        for s in search_stats:
+            for family_name, dims in s.get("pinned", {}).items():
+                pinned.setdefault(family_name, dims)
+        for family_name, dims in pinned.items():
+            logger.info(
+                "%s: family '%s' pins %s via its model kwargs; those dimensions are held fixed "
+                "rather than searched.",
+                label,
+                family_name,
+                dims,
+            )
 
 
 def _run_single_bootstrap(

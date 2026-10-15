@@ -516,7 +516,9 @@ def run_joint_truvarimp(
         (``n_warmup``, ``n_active``, ``n_harvest``, ``n_fallback``), how many
         times the acquisition tolerance eta was tightened (``n_eta_shrinks``),
         and why the active loop ended (``stop_reason``: ``"budget"``,
-        ``"exhausted"``, ``"no_threshold"`` or ``"no_candidate"``).
+        ``"exhausted"``, ``"no_threshold"`` or ``"no_candidate"``), plus
+        ``pinned``: the search-space dimensions each family fixes through its
+        model kwargs (``{family_name: [dimension, ...]}``).
 
     Returns
     -------
@@ -542,6 +544,7 @@ def run_joint_truvarimp(
 
     states = []
     family_of_state = {}
+    pinned_dims = {}
     for family_name, (trainer, model_kwargs) in resolved_model_configs.items():
         search_space = search_spaces.get(family_name)
         # Only a GridCandidateTrainer's build_estimator takes the
@@ -556,11 +559,7 @@ def run_joint_truvarimp(
         if search_space is not None and build_estimator is not None:
             search_space, pinned = drop_pinned_dimensions(search_space, model_kwargs)
             if pinned:
-                # Runs once per bootstrap inside a worker, so keep it at DEBUG.
-                logger.debug(
-                    f"Note: family '{family_name}' pins {list(pinned)} via its model kwargs; "
-                    "those dimensions are held fixed rather than searched."
-                )
+                pinned_dims[family_name] = list(pinned)
             log_flags = {
                 name: dim.log
                 for name, dim in search_space.continuous_dimensions().items()
@@ -688,6 +687,11 @@ def run_joint_truvarimp(
 
     family_losses = {name: np.array(values) for name, values in family_losses.items()}
     if not return_stats:
+        for family_name, dims in pinned_dims.items():
+            logger.debug(
+                f"Note: family '{family_name}' pins {dims} via its model kwargs; "
+                "those dimensions are held fixed rather than searched."
+            )
         return family_models, family_losses
 
     stats = {
@@ -699,6 +703,9 @@ def run_joint_truvarimp(
         ),
         "n_eta_shrinks": n_eta_shrinks,
         "stop_reason": stop_reason,
+        # Reported back rather than logged here: under n_jobs > 1 this runs in a
+        # joblib worker with no logging handler, so a log call would be dropped.
+        "pinned": pinned_dims,
     }
     return family_models, family_losses, stats
 
