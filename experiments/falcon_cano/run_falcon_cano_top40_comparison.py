@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -70,12 +71,17 @@ from rid import (  # noqa: E402
     LassoClassifier,
     RashomonImportanceDistribution,
     RidgeClassifier,
+    add_logging_arguments,
+    configure_logging,
+    silence_warnings,
 )
 from run_rashomon_falcon_cano import (  # noqa: E402
     remove_highly_correlated_features,
     resolve_num_workers,
     select_curated_descriptors,
 )
+
+logger = logging.getLogger(__name__)
 
 _AUTO_CORRELATION_THRESHOLD_SWEEP = np.round(np.arange(0.50, 0.991, 0.01), 3)
 
@@ -107,7 +113,7 @@ def _resolve_correlation_threshold(X: pd.DataFrame, correlation_threshold) -> tu
     sweep_df = sweep_thresholds(X, _AUTO_CORRELATION_THRESHOLD_SWEEP)
     elbow = find_elbow(sweep_df)
     n_at_elbow = int(sweep_df.loc[sweep_df["threshold"].sub(elbow).abs().idxmin(), "n_features_remaining"])
-    print(f"[correlation-threshold=auto] elbow={elbow:.3f} -> {n_at_elbow} features (from {X.shape[1]} raw)")
+    logger.info(f"[correlation-threshold=auto] elbow={elbow:.3f} -> {n_at_elbow} features (from {X.shape[1]} raw)")
     return elbow, {"mode": "auto", "value": elbow, "n_features_at_elbow": n_at_elbow, "n_features_raw": int(X.shape[1])}
 
 
@@ -306,6 +312,7 @@ def _parse_args() -> argparse.Namespace:
         default=0.95,
         help="Correlation strength between the injected duplicate and its source feature (default: 0.95)",
     )
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
@@ -413,7 +420,7 @@ def run_forward_stepwise_selection(
             }
         )
 
-        print(
+        logger.info(
             f"[stepwise:{model_cls.__name__}] step {step_idx:02d}/{steps}: "
             f"+{best_feature}  score={best_mean:.6f} +- {best_std:.6f}"
         )
@@ -735,24 +742,26 @@ def _pairwise_overlap_counts(comparison: pd.DataFrame, method_names: list[str]) 
 
 def main() -> None:
     args = _parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rid_n_jobs = resolve_num_workers(args.rid_n_jobs)
 
-    print("=" * 70)
-    print("Falcon-Cano Top-K Feature Comparison")
-    print(f"  data:                  {args.data}")
-    print(f"  output_dir:            {output_dir}")
-    print(f"  top_k:                 {args.top_k}")
+    logger.info("=" * 70)
+    logger.info("Falcon-Cano Top-K Feature Comparison")
+    logger.info(f"  data:                  {args.data}")
+    logger.info(f"  output_dir:            {output_dir}")
+    logger.info(f"  top_k:                 {args.top_k}")
     if args.top_k == "auto":
-        print(f"  top_k_max_sweep:       {args.top_k_max_sweep}")
-    print(f"  rid_selection:         {args.rid_selection}")
+        logger.info(f"  top_k_max_sweep:       {args.top_k_max_sweep}")
+    logger.info(f"  rid_selection:         {args.rid_selection}")
     if args.rid_selection == "mrmr":
-        print(f"  mrmr_lambda:           {args.mrmr_lambda}")
-    print(f"  correlation_threshold: {args.correlation_threshold}")
-    print(f"  use_curated_descriptors: {args.use_curated_descriptors}")
-    print(f"  rid_n_jobs:            {rid_n_jobs}")
-    print("=" * 70)
+        logger.info(f"  mrmr_lambda:           {args.mrmr_lambda}")
+    logger.info(f"  correlation_threshold: {args.correlation_threshold}")
+    logger.info(f"  use_curated_descriptors: {args.use_curated_descriptors}")
+    logger.info(f"  rid_n_jobs:            {rid_n_jobs}")
+    logger.info("=" * 70)
 
     start_time = time.time()
 
@@ -761,7 +770,7 @@ def main() -> None:
         use_curated_descriptors=args.use_curated_descriptors,
         correlation_threshold=args.correlation_threshold,
     )
-    print(
+    logger.info(
         f"[data] rows={data_meta['n_rows']} "
         f"features={data_meta['n_features_after_corr']} "
         f"(raw={data_meta['n_features_raw']})"
@@ -773,7 +782,7 @@ def main() -> None:
             X, args.inject_redundant_duplicate, args.redundancy_corr, args.random_state
         )
         redundant_pair = (args.inject_redundant_duplicate, dup_name)
-        print(
+        logger.info(
             f"[redundancy] injected '{dup_name}' as a correlated duplicate of "
             f"'{args.inject_redundant_duplicate}' (corr={args.redundancy_corr})"
         )
@@ -817,7 +826,7 @@ def main() -> None:
         }
         k_selection_results[method_name] = selection
         chosen_k = selection["k"]
-        print(
+        logger.info(
             f"[top-k=auto] {method_name}: chosen k={chosen_k} via {selection['criterion']}"
             f"{' (at ceiling)' if selection['at_ceiling'] else ''}"
         )
@@ -924,7 +933,7 @@ def main() -> None:
     )
 
     # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
-    print(
+    logger.info(
         f"[rid] metric={args.rid_metric} epsilon={args.rid_epsilon} "
         f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
     )
@@ -945,7 +954,7 @@ def main() -> None:
     cross_family_features: dict[str, list[str]] = {}
     cross_family_perf: dict[str, dict] = {}
     for balance_mode in ("unweighted", "weighted"):
-        print(
+        logger.info(
             f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
             f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
             f"family_balance_mode={balance_mode}"
@@ -997,7 +1006,7 @@ def main() -> None:
             name: compute_credit_split_ratio_top_k(features, redundant_pair)
             for name, features in method_feature_lists.items()
         }
-        print(f"[redundancy] credit-split ratios for {redundant_pair}: {credit_split_ratios}")
+        logger.info(f"[redundancy] credit-split ratios for {redundant_pair}: {credit_split_ratios}")
 
     settings = {
         "args": vars(args),
@@ -1106,19 +1115,19 @@ def main() -> None:
         json.dump(run_manifest, handle, indent=2)
 
     elapsed = time.time() - start_time
-    print("=" * 70)
+    logger.info("=" * 70)
     for name, features in method_feature_lists.items():
-        print(f"{name} top-10: {features[:10]}")
+        logger.info(f"{name} top-10: {features[:10]}")
         for evaluator_name, _, _ in evaluator_panel:
             evaluator_result = common_eval[name][evaluator_name]
-            print(
+            logger.info(
                 f"  held-out CV [{evaluator_name}] ({args.stepwise_scoring}): "
                 f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
             )
-    print(f"overlap counts: {overlap_counts}")
-    print(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
-    print(f"Results saved to: {output_dir}/")
-    print("=" * 70)
+    logger.info(f"overlap counts: {overlap_counts}")
+    logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+    logger.info(f"Results saved to: {output_dir}/")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import logging
 import os
 import pickle
 import sys
@@ -35,7 +36,12 @@ from rid import (
     RashomonImportanceDistribution,
     RidgeClassifier,
     VALID_CROSS_FAMILY_BALANCE_MODES,
+    add_logging_arguments,
+    configure_logging,
+    silence_warnings,
 )
+
+logger = logging.getLogger(__name__)
 
 matplotlib.use("Agg")
 
@@ -135,10 +141,10 @@ def select_curated_descriptors(df_descriptors):
         reason = EXCLUDED_RDKIT_DESCRIPTORS[col]
         by_reason.setdefault(reason, []).append(col)
 
-    print(f"Curated descriptor set: dropped {len(cols_to_drop)} descriptors "
+    logger.info(f"Curated descriptor set: dropped {len(cols_to_drop)} descriptors "
           f"({df_descriptors.shape[1]} → {df_curated.shape[1]})")
     for reason, cols in sorted(by_reason.items()):
-        print(f"  [{reason}] {', '.join(cols)}")
+        logger.info(f"  [{reason}] {', '.join(cols)}")
 
     return df_curated
 
@@ -149,22 +155,22 @@ def resolve_num_workers(cli_override=None):
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     if slurm_cpus is not None:
         n_workers = int(slurm_cpus)
-        print(f"[env] SLURM_CPUS_PER_TASK={n_workers} - using {n_workers} workers")
+        logger.info(f"[env] SLURM_CPUS_PER_TASK={n_workers} - using {n_workers} workers")
         return n_workers
 
     if cli_override is not None:
-        print(f"[cli] --num-workers={cli_override}")
+        logger.info(f"[cli] --num-workers={cli_override}")
         return cli_override
 
     n_workers = os.cpu_count() or 4
-    print(f"[fallback] os.cpu_count()={n_workers}")
+    logger.info(f"[fallback] os.cpu_count()={n_workers}")
     return n_workers
 
 
 def remove_highly_correlated_features(df_descriptors, correlation_threshold=0.95):
     """Remove highly correlated features, keeping the one with higher variance."""
 
-    print(f"Starting with {df_descriptors.shape[1]} features")
+    logger.info(f"Starting with {df_descriptors.shape[1]} features")
     corr_matrix = df_descriptors.corr().abs()
     removed_features = set()
 
@@ -181,33 +187,33 @@ def remove_highly_correlated_features(df_descriptors, correlation_threshold=0.95
                 removed_features.add(feature_one)
 
     df_filtered = df_descriptors.drop(columns=removed_features)
-    print(f"Removed {len(removed_features)} features, remaining: {df_filtered.shape[1]}")
+    logger.info(f"Removed {len(removed_features)} features, remaining: {df_filtered.shape[1]}")
     return df_filtered
 
 
 def print_metric_rankings(title, estimator, perf_stats=None):
     """Print top features for every available RID metric."""
 
-    print(f"\n{'=' * 60}")
-    print(title)
+    logger.info(f"{'=' * 60}")
+    logger.info(title)
 
     if perf_stats:
-        print(
+        logger.info(
             "  Rashomon-set performance: "
             f"acc={perf_stats['accuracy_mean']:.3f}\u00b1{perf_stats['accuracy_std']:.3f}  "
             f"AUPRC={perf_stats['auprc_mean']:.3f}\u00b1{perf_stats['auprc_std']:.3f}"
         )
 
     if not estimator.metric_results_:
-        print("  No RID metrics available.")
+        logger.info("  No RID metrics available.")
         return
 
     for metric in estimator.available_metrics_:
         summary = estimator.metric_summary(metric)
         ranking = estimator.rank_features(metric)
-        print(f"\nTop 10 features [{metric}]:")
+        logger.info(f"Top 10 features [{metric}]:")
         for feature_name, importance in ranking[:10]:
-            print(
+            logger.info(
                 f"  {feature_name}: E[phi]={importance:.6f}, "
                 f"P(phi>0)={summary[feature_name]['prob_positive']:.3f}"
             )
@@ -250,7 +256,7 @@ def save_metric_plots(estimator, output_dir, filename_prefix, title_prefix):
         plt.tight_layout()
         fig.savefig(os.path.join(output_dir, f"{filename_prefix}_{metric}.png"), dpi=150)
         plt.close(fig)
-        print(f"  Saved: {filename_prefix}_{metric}.png")
+        logger.info(f"  Saved: {filename_prefix}_{metric}.png")
 
 
 def save_family_composition_plot(output_dir, family_counts, balance_mode):
@@ -269,7 +275,7 @@ def save_family_composition_plot(output_dir, family_counts, balance_mode):
         dpi=150,
     )
     plt.close(fig)
-    print(f"  Saved: rid_family_composition_{balance_mode}.png")
+    logger.info(f"  Saved: rid_family_composition_{balance_mode}.png")
 
 
 def build_model_configs():
@@ -362,24 +368,27 @@ def main():
         default=False,
         help="Drop redundant RDKit descriptors before correlation filtering",
     )
+    add_logging_arguments(parser)
     args = parser.parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
 
     num_workers = resolve_num_workers(args.num_workers)
     os.makedirs(args.output_dir, exist_ok=True)
 
     start_time = time.time()
-    print(f"{'=' * 60}")
-    print("RID Analysis")
-    print(f"  Workers:      {num_workers}")
-    print(f"  Data:         {args.data}")
-    print(f"  Output dir:   {args.output_dir}")
-    print(f"  Bootstraps:   {args.n_bootstraps}")
-    print(f"  Epsilon:      {args.epsilon}")
-    print(f"  Models/pool:  {args.n_models_pool}")
-    print(f"  Cross-family only: {args.cross_family_only}")
-    print(f"  Cross-family balance modes: {args.cross_family_balance_modes}")
-    print(f"  Curated descriptors: {args.use_curated_descriptors}")
-    print(f"{'=' * 60}\n")
+    logger.info(f"{'=' * 60}")
+    logger.info("RID Analysis")
+    logger.info(f"  Workers:      {num_workers}")
+    logger.info(f"  Data:         {args.data}")
+    logger.info(f"  Output dir:   {args.output_dir}")
+    logger.info(f"  Bootstraps:   {args.n_bootstraps}")
+    logger.info(f"  Epsilon:      {args.epsilon}")
+    logger.info(f"  Models/pool:  {args.n_models_pool}")
+    logger.info(f"  Cross-family only: {args.cross_family_only}")
+    logger.info(f"  Cross-family balance modes: {args.cross_family_balance_modes}")
+    logger.info(f"  Curated descriptors: {args.use_curated_descriptors}")
+    logger.info(f"{'=' * 60}\n")
 
     df = pd.read_csv(args.data)
     if "Unnamed: 0" in df.columns:
@@ -395,10 +404,10 @@ def main():
     rid_estimators = {}
 
     if args.cross_family_only:
-        print("[cross-family-only] Skipping per-family RID.\n")
+        logger.info("[cross-family-only] Skipping per-family RID.\n")
     else:
         for name, model_config in model_configs.items():
-            print(f"\n{'=' * 60}")
+            logger.info(f"{'=' * 60}")
             estimator = RashomonImportanceDistribution(
                 epsilon=args.epsilon,
                 n_bootstraps=args.n_bootstraps,
@@ -422,7 +431,7 @@ def main():
                 handle,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
-        print(f"  Saved: rid_{name}_data.pkl")
+        logger.info(f"  Saved: rid_{name}_data.pkl")
 
     for name, estimator in rid_estimators.items():
         if estimator.metric_results_ is None:
@@ -435,8 +444,8 @@ def main():
         save_metric_plots(estimator, args.output_dir, f"rid_{name}", f"RID - {name}")
 
     for balance_mode in args.cross_family_balance_modes:
-        print(f"\n{'=' * 60}")
-        print(f"Running cross-family RID... mode={balance_mode}")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"Running cross-family RID... mode={balance_mode}")
         estimator = CrossFamilyRashomonImportanceDistribution(
             model_configs=cross_family_model_configs,
             epsilon=args.epsilon,
@@ -463,15 +472,15 @@ def main():
                 handle,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
-        print(f"  Saved: rid_{suffix}_data.pkl")
+        logger.info(f"  Saved: rid_{suffix}_data.pkl")
 
-        print(f"\n{'=' * 60}")
-        print(f"Cross-family RID results ({balance_mode}):")
-        print(f"  Family representation: {estimator.family_counts_}")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"Cross-family RID results ({balance_mode}):")
+        logger.info(f"  Family representation: {estimator.family_counts_}")
         if estimator.family_perf_stats_:
-            print("  Accuracy and AUPRC by model family (Rashomon models):")
+            logger.info("  Accuracy and AUPRC by model family (Rashomon models):")
             for family_name, perf_stats in estimator.family_perf_stats_.items():
-                print(
+                logger.info(
                     f"    {family_name}: acc={perf_stats['accuracy_mean']:.3f}\u00b1{perf_stats['accuracy_std']:.3f}  "
                     f"AUPRC={perf_stats['auprc_mean']:.3f}\u00b1{perf_stats['auprc_std']:.3f}"
                 )
@@ -488,10 +497,10 @@ def main():
         save_family_composition_plot(args.output_dir, estimator.family_counts_, balance_mode)
 
     elapsed = time.time() - start_time
-    print(f"\n{'=' * 60}")
-    print(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
-    print(f"Results saved to: {args.output_dir}/")
-    print("  Load data with: pickle.load(open('results/rid_<model>_data.pkl', 'rb'))")
+    logger.info(f"{'=' * 60}")
+    logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+    logger.info(f"Results saved to: {args.output_dir}/")
+    logger.info("  Load data with: pickle.load(open('results/rid_<model>_data.pkl', 'rb'))")
 
 
 if __name__ == "__main__":

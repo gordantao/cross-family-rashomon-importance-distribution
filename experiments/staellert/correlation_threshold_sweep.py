@@ -11,6 +11,7 @@ max-distance-from-chord heuristic if `kneed` is unavailable).
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -27,6 +28,9 @@ from run_staellert_top40_comparison import (  # noqa: E402
     _drop_index_like_columns,
     _sanitize_features,
 )
+from rid import configure_logging, silence_warnings  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "staellert_et_al" / "control_manifold_allfeatures.csv"
 TARGET_COLUMN = "annotated phase"
@@ -119,9 +123,11 @@ def plot_sweep(sweep_df: pd.DataFrame, elbow: float, output_path: Path) -> None:
 
 
 def main() -> None:
+    silence_warnings()
+    configure_logging()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     X = load_raw_features()
-    print(f"[staellert] raw features: {X.shape[1]}")
+    logger.info(f"[staellert] raw features: {X.shape[1]}")
 
     thresholds = np.round(np.arange(0.50, 0.991, 0.01), 3)
     sweep_df = sweep_thresholds(X, thresholds)
@@ -132,9 +138,9 @@ def main() -> None:
 
     n_at_elbow = int(sweep_df.loc[sweep_df["threshold"].sub(elbow).abs().idxmin(), "n_features_remaining"])
     n_at_default = int(sweep_df.loc[sweep_df["threshold"].sub(0.80).abs().idxmin(), "n_features_remaining"])
-    print(f"[staellert] elbow threshold: {elbow:.3f} ({n_at_elbow} features)")
-    print(f"[staellert] current default 0.80: {n_at_default} features")
-    print(f"[staellert] outputs written to {OUTPUT_DIR}/")
+    logger.info(f"[staellert] elbow threshold: {elbow:.3f} ({n_at_elbow} features)")
+    logger.info(f"[staellert] current default 0.80: {n_at_default} features")
+    logger.info(f"[staellert] outputs written to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

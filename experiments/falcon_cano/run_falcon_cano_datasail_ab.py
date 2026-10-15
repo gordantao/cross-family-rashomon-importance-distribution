@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -50,6 +51,9 @@ from run_falcon_cano_top40_comparison import (  # noqa: E402
     _evaluate_feature_set,
     build_common_evaluator_panel,
 )
+from rid import add_logging_arguments, configure_logging, silence_warnings  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def load_aligned_smiles(train_csv_path: Path) -> pd.DataFrame:
@@ -78,7 +82,7 @@ def load_method_feature_lists(top40_results_dir: Path) -> dict[str, list[str]]:
     for method_name, filename in file_map.items():
         path = top40_results_dir / filename
         if not path.exists():
-            print(f"[warn] {path} not found, skipping {method_name}")
+            logger.info(f"[warn] {path} not found, skipping {method_name}")
             continue
         method_feature_lists[method_name] = pd.read_csv(path)["feature"].tolist()
     return method_feature_lists
@@ -210,18 +214,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stepwise-cv-splits", type=int, default=5)
     parser.add_argument("--scoring", type=str, default="roc_auc")
     parser.add_argument("--random-state", type=int, default=42)
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print("Falcon-Cano DataSAIL leakage A/B test")
-    print(f"datasail_runs={args.datasail_runs} datasail_clusters={args.datasail_clusters}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Falcon-Cano DataSAIL leakage A/B test")
+    logger.info(f"datasail_runs={args.datasail_runs} datasail_clusters={args.datasail_clusters}")
+    logger.info("=" * 70)
 
     df = pd.read_csv(args.data)
     y = df["target"].astype(int)
@@ -236,26 +243,26 @@ def main() -> None:
     strat_map = {f"row_{i}": int(v) for i, v in enumerate(y)}
 
     method_feature_lists = load_method_feature_lists(Path(args.top40_results_dir))
-    print(f"[data] methods loaded: {list(method_feature_lists.keys())}")
+    logger.info(f"[data] methods loaded: {list(method_feature_lists.keys())}")
 
     evaluator_panel = build_common_evaluator_panel(args.random_state)
 
     # --- Arm A: leaky (current) evaluator ---
-    print("[arm A] evaluating under plain StratifiedKFold (leaky)...")
+    logger.info("[arm A] evaluating under plain StratifiedKFold (leaky)...")
     cv = StratifiedKFold(n_splits=args.stepwise_cv_splits, shuffle=True, random_state=args.random_state)
     leaky_summary = evaluate_leaky(X, y, method_feature_lists, evaluator_panel, cv, args.scoring)
 
     # --- Arm B: leakage-aware (DataSAIL) evaluator ---
-    print(f"[arm B] running {args.datasail_runs} independent DataSAIL C1e splits...")
+    logger.info(f"[arm B] running {args.datasail_runs} independent DataSAIL C1e splits...")
     t0 = time.time()
     split_assignments = run_datasail_splits(
         smiles_map, strat_map, args.datasail_clusters, args.datasail_max_sec, args.datasail_runs
     )
     elapsed = time.time() - t0
-    print(f"[arm B] {len(split_assignments)} splits obtained in {elapsed:.1f}s total")
+    logger.info(f"[arm B] {len(split_assignments)} splits obtained in {elapsed:.1f}s total")
     for run, split_assign in enumerate(split_assignments):
         counts = pd.Series(list(split_assign.values())).value_counts().to_dict()
-        print(f"[arm B] run {run + 1}/{args.datasail_runs}: {counts}")
+        logger.info(f"[arm B] run {run + 1}/{args.datasail_runs}: {counts}")
 
     leakage_aware_summary = evaluate_leakage_aware(
         X, y, method_feature_lists, evaluator_panel, split_assignments
@@ -296,10 +303,10 @@ def main() -> None:
     with (output_dir / "run_settings.json").open("w", encoding="utf-8") as handle:
         json.dump(settings, handle, indent=2)
 
-    print("=" * 70)
-    print(comparison_table.to_string(index=False))
-    print(f"\nResults saved to: {output_dir}/")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info(comparison_table.to_string(index=False))
+    logger.info(f"Results saved to: {output_dir}/")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":

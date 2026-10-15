@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -60,13 +61,23 @@ from sklearn.utils import resample
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rid import FullyEnumeratedTreeClassifier, LassoClassifier, RashomonImportanceDistribution, vi_sub_mr  # noqa: E402
+from rid import (  # noqa: E402
+    FullyEnumeratedTreeClassifier,
+    LassoClassifier,
+    RashomonImportanceDistribution,
+    add_logging_arguments,
+    configure_logging,
+    silence_warnings,
+    vi_sub_mr,
+)
 from run_nonlinear_interaction_simulation import (  # noqa: E402
     REDUNDANT_SIMULATORS,
     SIMULATORS,
     feature_columns_from_dataset,
     resolve_num_workers,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE_SIZE = 400
 DEFAULT_NOISE_STD = 1.0
@@ -278,11 +289,14 @@ def parse_args():
     parser.add_argument("--base-seed", type=int, default=DEFAULT_BASE_SEED)
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--num-workers", type=int, default=None)
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     n_jobs = resolve_num_workers(args.num_workers)
 
     dgp_names = [name.strip() for name in args.dgps.split(",") if name.strip()]
@@ -300,15 +314,15 @@ def main():
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
 
-    print("=" * 70)
-    print("RID stability-signal validation")
-    print(f"  dgps:          {dgp_names}")
-    print(f"  betas:         {args.betas}")
-    print(f"  families:      {family_names}")
-    print(f"  n_repeats:     {args.n_repeats}")
-    print(f"  output_dir:    {output_dir}")
-    print(f"  n_jobs:        {n_jobs}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("RID stability-signal validation")
+    logger.info(f"  dgps:          {dgp_names}")
+    logger.info(f"  betas:         {args.betas}")
+    logger.info(f"  families:      {family_names}")
+    logger.info(f"  n_repeats:     {args.n_repeats}")
+    logger.info(f"  output_dir:    {output_dir}")
+    logger.info(f"  n_jobs:        {n_jobs}")
+    logger.info("=" * 70)
 
     started = time.time()
     per_feature_rows = []
@@ -331,7 +345,7 @@ def main():
 
             for family_name in family_names:
                 model_cls, model_kwargs = FAMILY_CONFIGS[family_name]
-                print(f"[cell] dgp={dgp_name} beta={beta} family={family_name}")
+                logger.info(f"[cell] dgp={dgp_name} beta={beta} family={family_name}")
 
                 per_feature, spearman_corr = run_stability_cell(
                     X_scaled=X_scaled,
@@ -372,7 +386,7 @@ def main():
                         "spearman_flip_vs_ambiguity": spearman_corr,
                     }
                 )
-                print(f"       spearman(flip_rate, rid_ambiguity) = {spearman_corr}")
+                logger.info(f"       spearman(flip_rate, rid_ambiguity) = {spearman_corr}")
 
     per_feature_df = pd.concat(per_feature_rows, ignore_index=True)
     summary_df = pd.DataFrame(summary_rows)
@@ -391,13 +405,13 @@ def main():
         json.dump(settings, handle, indent=2)
 
     elapsed = time.time() - started
-    print("=" * 70)
-    print(summary_df.to_string(index=False))
-    print(f"\nSaved: {per_feature_path}")
-    print(f"Saved: {summary_path}")
-    print(f"Plots: {plots_dir}/")
-    print(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info(summary_df.to_string(index=False))
+    logger.info(f"Saved: {per_feature_path}")
+    logger.info(f"Saved: {summary_path}")
+    logger.info(f"Plots: {plots_dir}/")
+    logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":

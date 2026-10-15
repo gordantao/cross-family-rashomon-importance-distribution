@@ -12,6 +12,7 @@ unavailable).
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -24,6 +25,9 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from elbow_selection import find_elbow as _find_elbow_point  # noqa: E402
+from rid import configure_logging, silence_warnings  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 DATA_PATH = Path(__file__).resolve().parent / "falcon_cano_featured.csv"
 OUTPUT_DIR = Path(__file__).resolve().parent / "results" / "correlation_threshold_sweep"
@@ -91,9 +95,11 @@ def plot_sweep(sweep_df: pd.DataFrame, elbow: float, output_path: Path) -> None:
 
 
 def main() -> None:
+    silence_warnings()
+    configure_logging()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     X = load_raw_features()
-    print(f"[falcon_cano] raw features: {X.shape[1]}")
+    logger.info(f"[falcon_cano] raw features: {X.shape[1]}")
 
     thresholds = np.round(np.arange(0.50, 0.991, 0.01), 3)
     sweep_df = sweep_thresholds(X, thresholds)
@@ -104,9 +110,9 @@ def main() -> None:
 
     n_at_elbow = int(sweep_df.loc[sweep_df["threshold"].sub(elbow).abs().idxmin(), "n_features_remaining"])
     n_at_default = int(sweep_df.loc[sweep_df["threshold"].sub(0.80).abs().idxmin(), "n_features_remaining"])
-    print(f"[falcon_cano] elbow threshold: {elbow:.3f} ({n_at_elbow} features)")
-    print(f"[falcon_cano] current default 0.80: {n_at_default} features")
-    print(f"[falcon_cano] outputs written to {OUTPUT_DIR}/")
+    logger.info(f"[falcon_cano] elbow threshold: {elbow:.3f} ({n_at_elbow} features)")
+    logger.info(f"[falcon_cano] current default 0.80: {n_at_default} features")
+    logger.info(f"[falcon_cano] outputs written to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

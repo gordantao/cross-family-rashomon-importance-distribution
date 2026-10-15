@@ -30,6 +30,7 @@ best next candidate is computed independently and cheaply, and only the final
 from __future__ import annotations
 
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -40,6 +41,7 @@ from sklearn.metrics import log_loss
 
 from .models import GridCandidateTrainer
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Search-space specification
@@ -471,7 +473,16 @@ DEFAULT_TRUVARIMP_CONFIG = {
 }
 
 
-def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b, epsilon, config=None):
+def run_joint_truvarimp(
+    resolved_model_configs,
+    search_spaces,
+    X_boot,
+    y_boot,
+    b,
+    epsilon,
+    config=None,
+    return_stats=False,
+):
     """Run joint (CASH-style) TruVaRImp over all families for one bootstrap.
 
     Parameters
@@ -500,6 +511,12 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         TOTAL number of real model fits across all families (warm-up, active
         search, and harvest alike); ``harvest_fraction`` is the share of it
         reserved for the closing harvest phase.
+    return_stats : bool, default=False
+        Also return a dict of search diagnostics: real fits spent in each phase
+        (``n_warmup``, ``n_active``, ``n_harvest``, ``n_fallback``), how many
+        times the acquisition tolerance eta was tightened (``n_eta_shrinks``),
+        and why the active loop ended (``stop_reason``: ``"budget"``,
+        ``"exhausted"``, ``"no_threshold"`` or ``"no_candidate"``).
 
     Returns
     -------
@@ -509,6 +526,8 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         keyed back by the ORIGINAL family name (categorical sub-families are
         merged back together) -- same shape ``_run_single_bootstrap_cross_family``
         already expects from the grid-based path.
+    stats : dict
+        Only when ``return_stats=True``; see above.
     """
 
     cfg = dict(DEFAULT_TRUVARIMP_CONFIG)
@@ -537,8 +556,9 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         if search_space is not None and build_estimator is not None:
             search_space, pinned = drop_pinned_dimensions(search_space, model_kwargs)
             if pinned:
-                print(
-                    f"  Note: family '{family_name}' pins {list(pinned)} via its model kwargs; "
+                # Runs once per bootstrap inside a worker, so keep it at DEBUG.
+                logger.debug(
+                    f"Note: family '{family_name}' pins {list(pinned)} via its model kwargs; "
                     "those dimensions are held fixed rather than searched."
                 )
             log_flags = {
@@ -589,6 +609,8 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
     harvest_budget = min(int(round(budget * float(cfg["harvest_fraction"]))), budget)
     search_budget = budget - harvest_budget
     total_evaluations = 0
+    n_eta_shrinks = 0
+    stop_reason = "budget"
 
     # --- warm-start: a handful of random evaluations per searchable sub-family ---
     # Clamped against the remaining budget: without the clamp, enough families
@@ -612,11 +634,16 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
                 refit=(seed_offset == n_warmup - 1),
             )
         total_evaluations += n_warmup
+    n_warmup_total = total_evaluations
 
     # --- active-learning loop (Algorithm 1, generalized across sub-families) ---
-    while total_evaluations < search_budget and any(s.U or s.M for s in searchable):
+    while total_evaluations < search_budget:
+        if not any(s.U or s.M for s in searchable):
+            stop_reason = "exhausted"
+            break
         thresholds = _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon)
         if thresholds is None:
+            stop_reason = "no_threshold"
             break
         c_min_pes, h_pes, h_opt = thresholds
 
@@ -625,6 +652,7 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
 
         if all(state.epoch_satisfied(beta_sqrt, eta, eps_rel, delta_bar) for state in searchable):
             eta *= cfg["r"]
+            n_eta_shrinks += 1
             continue
 
         best_state, best_idx, best_score = None, None, -np.inf
@@ -634,6 +662,7 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
                 best_state, best_idx, best_score = state, idx, score
 
         if best_state is None:
+            stop_reason = "no_candidate"
             break
 
         best_state.evaluate(best_idx, X_boot, y_boot, b, seed_offset=len(best_state.evaluated_idx))
@@ -645,7 +674,7 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
     # bookkeeping and the returned pool is a boundary-biased sample that omits
     # the confidently-good configurations the Rashomon filter downstream exists
     # to collect.
-    _harvest_predicted_rashomon(
+    n_harvest = _harvest_predicted_rashomon(
         searchable, X_boot, y_boot, b, beta_sqrt, eps_rel, epsilon, harvest_budget
     )
 
@@ -658,7 +687,20 @@ def run_joint_truvarimp(resolved_model_configs, search_spaces, X_boot, y_boot, b
         family_losses[parent].extend(state.losses)
 
     family_losses = {name: np.array(values) for name, values in family_losses.items()}
-    return family_models, family_losses
+    if not return_stats:
+        return family_models, family_losses
+
+    stats = {
+        "n_warmup": n_warmup_total,
+        "n_active": total_evaluations - n_warmup_total,
+        "n_harvest": n_harvest,
+        "n_fallback": sum(
+            len(state.losses) for state in states if isinstance(state, _FallbackFamilyState)
+        ),
+        "n_eta_shrinks": n_eta_shrinks,
+        "stop_reason": stop_reason,
+    }
+    return family_models, family_losses, stats
 
 
 def _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon):

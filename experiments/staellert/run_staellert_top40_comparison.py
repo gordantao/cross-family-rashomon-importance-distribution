@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -45,7 +46,12 @@ from rid import (
     LassoClassifier,
     RashomonImportanceDistribution,
     RidgeClassifier,
+    add_logging_arguments,
+    configure_logging,
+    silence_warnings,
 )
+
+logger = logging.getLogger(__name__)
 
 
 TASK_REGISTRY = {
@@ -214,6 +220,7 @@ def _parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
@@ -346,7 +353,7 @@ def _resolve_correlation_threshold(X: pd.DataFrame, correlation_threshold) -> tu
     sweep_df = sweep_correlation_thresholds(X, _AUTO_CORRELATION_THRESHOLD_SWEEP)
     elbow = find_correlation_elbow(sweep_df)
     n_at_elbow = int(sweep_df.loc[sweep_df["threshold"].sub(elbow).abs().idxmin(), "n_features_remaining"])
-    print(f"[correlation-threshold=auto] elbow={elbow:.3f} -> {n_at_elbow} features (from {X.shape[1]} raw)")
+    logger.info(f"[correlation-threshold=auto] elbow={elbow:.3f} -> {n_at_elbow} features (from {X.shape[1]} raw)")
     return elbow, {"mode": "auto", "value": elbow, "n_features_at_elbow": n_at_elbow, "n_features_raw": int(X.shape[1])}
 
 
@@ -504,7 +511,7 @@ def run_forward_stepwise_selection(
             }
         )
 
-        print(
+        logger.info(
             f"[stepwise] step {step_idx:02d}/{steps}: "
             f"+{best_feature}  score={best_mean:.6f} +- {best_std:.6f}"
         )
@@ -760,10 +767,10 @@ def _run_single_task(
     target_column = task_config["target_column"]
     task = task_config["task"]
 
-    print("-" * 70)
-    print(f"[task] {task_name}")
-    print(f"[task] file={csv_path}")
-    print(f"[task] target={target_column} task_type={task}")
+    logger.info("-" * 70)
+    logger.info(f"[task] {task_name}")
+    logger.info(f"[task] file={csv_path}")
+    logger.info(f"[task] target={target_column} task_type={task}")
 
     X, y, data_meta = _prepare_task_dataset(
         csv_path=csv_path,
@@ -771,7 +778,7 @@ def _run_single_task(
         correlation_threshold=args.correlation_threshold,
         include_phate_features=args.include_phate_features,
     )
-    print(
+    logger.info(
         f"[data] rows={data_meta['n_rows']} "
         f"features={data_meta['n_features_after_corr']} "
         f"(removed_corr={data_meta['n_removed_corr']})"
@@ -781,7 +788,7 @@ def _run_single_task(
 
     # --- Method 1: forward stepwise selection via random forest ---
     rf_model_cls, rf_model_kwargs = _make_stepwise_rf_model(args)
-    print(
+    logger.info(
         f"[stepwise:rf] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
         f"n_estimators={args.stepwise_n_estimators}"
     )
@@ -803,7 +810,7 @@ def _run_single_task(
 
     # --- Method 2: forward stepwise selection via logistic regression ---
     logreg_model_cls, logreg_model_kwargs = _make_stepwise_logreg_model(args)
-    print(
+    logger.info(
         f"[stepwise:logreg] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
         f"model={logreg_model_cls.__name__}"
     )
@@ -830,7 +837,7 @@ def _run_single_task(
 
     # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
     # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
-    print(
+    logger.info(
         f"[rid] metric={args.rid_metric} epsilon={args.rid_epsilon} "
         f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
     )
@@ -850,7 +857,7 @@ def _run_single_task(
     cross_family_features: dict[str, list[str]] = {"unweighted": [], "weighted": []}
     cross_family_perf: dict[str, dict] = {"unweighted": {}, "weighted": {}}
     for balance_mode in ("unweighted", "weighted"):
-        print(
+        logger.info(
             f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
             f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
             f"family_balance_mode={balance_mode}"
@@ -937,12 +944,12 @@ def _run_single_task(
     with settings_path.open("w", encoding="utf-8") as handle:
         json.dump(settings, handle, indent=2)
 
-    print(f"[task] outputs saved in {task_output_dir}")
+    logger.info(f"[task] outputs saved in {task_output_dir}")
     for name, features in method_feature_lists.items():
-        print(f"[task] {name} top-10: {features[:10]}")
+        logger.info(f"[task] {name} top-10: {features[:10]}")
         for evaluator_name, _, _ in evaluator_panel:
             evaluator_result = common_eval[name][evaluator_name]
-            print(
+            logger.info(
                 f"       held-out CV [{evaluator_name}] ({stepwise_scoring}): "
                 f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
             )
@@ -983,20 +990,22 @@ def _run_single_task(
 
 def main() -> None:
     args = _parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     task_names = _parse_task_names(args.tasks)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print("Staellert Direct Target Prediction Tasks")
-    print(f"  data_dir:                 {args.data_dir}")
-    print(f"  tasks:                    {task_names}")
-    print(f"  top_k:                    {args.top_k}")
-    print(f"  correlation_threshold:    {args.correlation_threshold}")
-    print(f"  include_phate_features:   {args.include_phate_features}")
-    print(f"  output_dir:               {output_dir}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Staellert Direct Target Prediction Tasks")
+    logger.info(f"  data_dir:                 {args.data_dir}")
+    logger.info(f"  tasks:                    {task_names}")
+    logger.info(f"  top_k:                    {args.top_k}")
+    logger.info(f"  correlation_threshold:    {args.correlation_threshold}")
+    logger.info(f"  include_phate_features:   {args.include_phate_features}")
+    logger.info(f"  output_dir:               {output_dir}")
+    logger.info("=" * 70)
 
     overall_rows = []
     for task_name in task_names:
@@ -1020,11 +1029,11 @@ def main() -> None:
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(run_manifest, handle, indent=2)
 
-    print("=" * 70)
-    print("Completed")
-    print(f"  Overall summary:          {overall_summary_path}")
-    print(f"  Run manifest:             {manifest_path}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Completed")
+    logger.info(f"  Overall summary:          {overall_summary_path}")
+    logger.info(f"  Run manifest:             {manifest_path}")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":

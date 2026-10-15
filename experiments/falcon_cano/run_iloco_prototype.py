@@ -11,6 +11,7 @@ not a full RID run) and compares sub_mr / loco / iloco rankings on it.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,9 @@ from rid.core import (
     compute_model_reliance,
     describe_iloco_eligible_pairs,
 )
+from rid import add_logging_arguments, configure_logging, silence_warnings  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def _select_top_k_features(df: pd.DataFrame, target_col: str, top_k: int, existing_top40_csv: Path | None) -> list[str]:
@@ -36,10 +40,10 @@ def _select_top_k_features(df: pd.DataFrame, target_col: str, top_k: int, existi
         features = ranked.sort_values("rank")["feature"].tolist()
         available = [f for f in features if f in df.columns]
         if len(available) >= top_k:
-            print(f"[select] using existing rid_tree top-{top_k} list from {existing_top40_csv}")
+            logger.info(f"[select] using existing rid_tree top-{top_k} list from {existing_top40_csv}")
             return available[:top_k]
 
-    print("[select] no usable existing top-k list found; falling back to univariate |corr| with target")
+    logger.info("[select] no usable existing top-k list found; falling back to univariate |corr| with target")
     feature_cols = [
         c for c in df.columns if c != target_col and not c.startswith("Unnamed:")
     ]
@@ -53,7 +57,7 @@ def run(data_path: Path, top_k: int, correlation_threshold: float, existing_top4
     assert target_col in df.columns, f"expected a '{target_col}' column, got {df.columns.tolist()[:5]}..."
 
     top_features = _select_top_k_features(df, target_col, top_k, existing_top40_csv)
-    print(f"[data] restricted to {len(top_features)} features: {top_features[:8]}...")
+    logger.info(f"[data] restricted to {len(top_features)} features: {top_features[:8]}...")
 
     X_raw = df[top_features].to_numpy(dtype=float)
     y = df[target_col].to_numpy()
@@ -62,7 +66,7 @@ def run(data_path: Path, top_k: int, correlation_threshold: float, existing_top4
     model = LogisticRegression(penalty="l2", C=1.0, solver="lbfgs", max_iter=100000, random_state=42)
     model.fit(X, y)
 
-    print(f"[model] fit LogisticRegression on {X.shape[0]} rows x {X.shape[1]} features")
+    logger.info(f"[model] fit LogisticRegression on {X.shape[0]} rows x {X.shape[1]} features")
 
     t0 = time.time()
     sub_mr = compute_model_reliance(model, X, y, metric="sub_mr", rng=np.random.default_rng(0))
@@ -74,7 +78,7 @@ def run(data_path: Path, top_k: int, correlation_threshold: float, existing_top4
     t3 = time.time()
 
     n_skipped = n_total - n_eligible
-    print(
+    logger.info(
         f"[timing] sub_mr={t1 - t0:.3f}s  loco={t2 - t1:.3f}s  "
         f"iloco={t3 - t2:.3f}s (over {n_eligible}/{n_total} eligible pairs, "
         f"{n_skipped} skipped as |corr| >= {correlation_threshold})"
@@ -99,12 +103,12 @@ def run(data_path: Path, top_k: int, correlation_threshold: float, existing_top4
     out_csv = out_dir / "iloco_vs_sub_mr_loco.csv"
     result.to_csv(out_csv, index=False)
 
-    print(f"\n[result] saved comparison table to {out_csv}")
-    print(result.to_string(index=False))
+    logger.info(f"[result] saved comparison table to {out_csv}")
+    logger.info(result.to_string(index=False))
 
     biggest_shift = result.reindex(result["rank_shift_iloco_vs_sub_mr"].abs().sort_values(ascending=False).index)
-    print("\n[result] top 5 features whose iloco rank differs most from sub_mr rank:")
-    print(
+    logger.info("[result] top 5 features whose iloco rank differs most from sub_mr rank:")
+    logger.info(
         biggest_shift[["feature", "rank_sub_mr", "rank_iloco", "rank_shift_iloco_vs_sub_mr"]]
         .head(5)
         .to_string(index=False)
@@ -123,11 +127,14 @@ def _parse_args() -> argparse.Namespace:
             Path(__file__).resolve().parent / "results" / "top40_feature_comparison" / "rid_tree_top_features.csv"
         ),
     )
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     existing = Path(args.existing_top40_csv)
     run(
         data_path=Path(args.data),

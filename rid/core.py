@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+import time
+import warnings
+from collections import Counter
 from functools import partial
 from inspect import signature
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -11,6 +15,7 @@ from sklearn.metrics import accuracy_score, average_precision_score, f1_score, l
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
 
+from ._logging import ProgressLogger, format_duration
 from .models import resolve_candidate_trainer, resolve_model_config, train_candidate_models
 from .truvarimp import (
     DEFAULT_TRUVARIMP_CONFIG,
@@ -23,6 +28,8 @@ VALID_VI_METRICS = ("sub_mr", "loco", "coef", "iloco")
 VALID_PERFORMANCE_METRICS = ("accuracy", "f1", "auprc")
 VALID_CROSS_FAMILY_BALANCE_MODES = ("unweighted", "weighted")
 VALID_CANDIDATE_SEARCH_MODES = ("grid", "truvarimp_joint")
+
+logger = logging.getLogger(__name__)
 
 
 def compute_model_reliance(model, X, y, metric="sub_mr", rng=None):
@@ -593,6 +600,107 @@ def _format_perf_stats(perf_stats, performance_metric_specs):
     return "  ".join(parts)
 
 
+def _run_bootstrap_task(worker, b, suppress_warnings, *args):
+    """Run one bootstrap worker, returning ``(b, result, stats)``.
+
+    Warnings are ignored here, inside the worker process, because joblib's loky
+    workers don't share the parent's warning filters -- without this, every
+    sklearn ConvergenceWarning/FutureWarning from every candidate fit lands in
+    the job's stderr. ``catch_warnings`` restores the filters afterwards, which
+    matters when ``n_jobs=1`` runs the worker in the caller's own process.
+    """
+
+    start = time.perf_counter()
+    with warnings.catch_warnings():
+        if suppress_warnings:
+            warnings.simplefilter("ignore")
+        result, stats = worker(b, *args)
+    stats["seconds"] = time.perf_counter() - start
+    return b, result, stats
+
+
+def _make_parallel(n_jobs):
+    # generator_unordered (joblib>=1.4) yields each bootstrap as soon as it
+    # finishes, which is what makes live progress possible; older joblib only
+    # has the in-order generator, which still works, just with laggier progress.
+    try:
+        return Parallel(n_jobs=n_jobs, return_as="generator_unordered")
+    except ValueError:
+        return Parallel(n_jobs=n_jobs, return_as="generator")
+
+
+def _collect_bootstrap_results(tasks, n_jobs, n_bootstraps, label):
+    """Consume bootstrap tasks as they complete, logging progress; return ``(results, stats)`` sorted by b.
+
+    Sorting by bootstrap index keeps aggregation order -- and therefore every
+    downstream number -- identical to the previous ordered ``Parallel`` call.
+    """
+
+    progress = ProgressLogger(label, n_bootstraps, log=logger)
+    collected = []
+    n_valid = 0
+    for b, result, stats in _make_parallel(n_jobs)(tasks):
+        collected.append((b, result, stats))
+        n_valid += bool(stats.get("valid"))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s: bootstrap %d %s", label, b, _format_bootstrap_stats(stats))
+        progress.update(extra=f"valid={n_valid}")
+    collected.sort(key=lambda item: item[0])
+    return [result for _, result, _ in collected], [stats for _, _, stats in collected]
+
+
+def _format_bootstrap_stats(stats):
+    parts = [f"{stats['seconds']:.1f}s", f"fits={stats['n_fits']}", f"rashomon={stats['rashomon_size']}"]
+    if stats.get("truvarimp"):
+        parts.append(f"truvarimp={stats['truvarimp']}")
+    return " ".join(parts)
+
+
+def _mean_by_key(dicts):
+    keys = list(dicts[0]) if dicts else []
+    return {key: float(np.mean([d.get(key, 0) for d in dicts])) for key in keys}
+
+
+def _log_bootstrap_summary(label, bootstrap_stats):
+    if not bootstrap_stats:
+        return
+    seconds = np.array([stats["seconds"] for stats in bootstrap_stats])
+    logger.info(
+        "%s: per-bootstrap time mean=%s median=%s max=%s",
+        label,
+        format_duration(seconds.mean()),
+        format_duration(np.median(seconds)),
+        format_duration(seconds.max()),
+    )
+
+    def fmt(means):
+        return ", ".join(f"{key}={value:.1f}" for key, value in means.items())
+
+    n_fits = [stats["n_fits"] for stats in bootstrap_stats]
+    rashomon = [stats["rashomon_size"] for stats in bootstrap_stats]
+    if isinstance(n_fits[0], dict):
+        logger.info("%s: mean fits/bootstrap: %s", label, fmt(_mean_by_key(n_fits)))
+        logger.info("%s: mean Rashomon size/bootstrap: %s", label, fmt(_mean_by_key(rashomon)))
+    else:
+        logger.info(
+            "%s: mean fits/bootstrap=%.1f, mean Rashomon size/bootstrap=%.1f",
+            label,
+            float(np.mean(n_fits)),
+            float(np.mean(rashomon)),
+        )
+
+    search_stats = [stats["truvarimp"] for stats in bootstrap_stats if stats.get("truvarimp")]
+    if search_stats:
+        numeric = [{k: v for k, v in s.items() if k != "stop_reason"} for s in search_stats]
+        stop_reasons = Counter(s["stop_reason"] for s in search_stats)
+        logger.info(
+            "%s: TruVaRImp mean/bootstrap: %s; stop reasons: %s",
+            label,
+            fmt(_mean_by_key(numeric)),
+            dict(stop_reasons),
+        )
+
+
 def _run_single_bootstrap(
     b,
     X_scaled,
@@ -615,8 +723,13 @@ def _run_single_bootstrap(
     min_loss = np.min(losses)
     rashomon_mask = losses <= min_loss + epsilon
     rashomon_models = [model for model, keep in zip(models, rashomon_mask) if keep]
+    stats = {
+        "n_fits": len(losses),
+        "rashomon_size": len(rashomon_models),
+        "valid": bool(rashomon_models),
+    }
     if not rashomon_models:
-        return None
+        return None, stats
 
     boot_importances = {
         metric: {feature_name: [] for feature_name in feature_names}
@@ -658,7 +771,7 @@ def _run_single_bootstrap(
             if metric_value is not None:
                 boot_perf[metric_name].append(metric_value)
 
-    return boot_importances, boot_perf
+    return (boot_importances, boot_perf), stats
 
 
 def _run_single_bootstrap_cross_family(
@@ -679,9 +792,17 @@ def _run_single_bootstrap_cross_family(
     rng = np.random.default_rng(seed=b)
     X_boot, y_boot = resample(X_scaled, y, random_state=b)
 
+    search_stats = None
     if candidate_search == "truvarimp_joint":
-        family_models, family_losses = run_joint_truvarimp(
-            model_configs, search_spaces or {}, X_boot, y_boot, b, epsilon, truvarimp_config
+        family_models, family_losses, search_stats = run_joint_truvarimp(
+            model_configs,
+            search_spaces or {},
+            X_boot,
+            y_boot,
+            b,
+            epsilon,
+            truvarimp_config,
+            return_stats=True,
         )
     else:
         family_models = {}
@@ -693,11 +814,19 @@ def _run_single_bootstrap_cross_family(
             family_models[name] = models
             family_losses[name] = losses
 
+    stats = {
+        "n_fits": {name: len(family_losses[name]) for name in model_configs},
+        "rashomon_size": {name: 0 for name in model_configs},
+        "truvarimp": search_stats,
+        "valid": False,
+    }
+    empty_result = (None, None, None, None)
+
     all_losses = np.concatenate(
         [losses for losses in family_losses.values() if len(losses) > 0]
     ) if any(len(losses) > 0 for losses in family_losses.values()) else np.array([])
     if all_losses.size == 0:
-        return None, None, None, None
+        return empty_result, stats
     global_min_loss = np.min(all_losses)
 
     family_rashomon = {name: [] for name in model_configs}
@@ -715,9 +844,10 @@ def _run_single_bootstrap_cross_family(
         family_rashomon_mask = losses <= global_min_loss + epsilon
         family_rashomon[name] = [model for model, keep in zip(models, family_rashomon_mask) if keep]
 
+    stats["rashomon_size"] = {name: len(models) for name, models in family_rashomon.items()}
     non_empty_families = [name for name, models in family_rashomon.items() if models]
     if not non_empty_families:
-        return None, None, None, None
+        return empty_result, stats
 
     rashomon_models = []
     rashomon_labels = []
@@ -739,8 +869,9 @@ def _run_single_bootstrap_cross_family(
         model_weights = None
 
     if not rashomon_models:
-        return None, None, None, None
+        return empty_result, stats
 
+    stats["valid"] = True
     boot_family_counts = {name: 0 for name in model_configs}
     for label in rashomon_labels:
         boot_family_counts[label] += 1
@@ -788,7 +919,7 @@ def _run_single_bootstrap_cross_family(
             if metric_value is not None:
                 boot_family_perf[label][metric_name].append(metric_value)
 
-    return boot_importances, boot_family_counts, boot_family_perf, model_weights
+    return (boot_importances, boot_family_counts, boot_family_perf, model_weights), stats
 
 
 def compute_rid(
@@ -805,8 +936,13 @@ def compute_rid(
     performance_metrics=None,
     n_cdf_points=200,
     n_jobs=1,
+    suppress_warnings=True,
 ):
-    """Compute single-family RID and return metric results, performance, and valid bootstrap count."""
+    """Compute single-family RID and return metric results, performance, and valid bootstrap count.
+
+    ``suppress_warnings`` (default True) ignores every Python warning raised
+    while fitting and scoring candidates inside each bootstrap worker.
+    """
 
     if model_config is not None:
         if model_class is not None or model_trainer is not None or model_kwargs is not None:
@@ -833,15 +969,18 @@ def compute_rid(
     X_scaled = scaler.fit_transform(X_values)
 
     model_name = getattr(model_class, "__name__", type(model_trainer).__name__)
-    print(
+    logger.info(
         f"RID: {model_name}, {len(feature_names)} features, "
         f"B={n_bootstraps}, pool={n_models_pool}, epsilon={epsilon}, n_jobs={n_jobs}, "
         f"metrics={vi_metric_names}, performance_metrics={performance_metric_names}"
     )
 
-    results = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_run_single_bootstrap)(
+    progress_label = f"RID[{model_name}] bootstraps"
+    tasks = (
+        delayed(_run_bootstrap_task)(
+            _run_single_bootstrap,
             b,
+            suppress_warnings,
             X_scaled,
             y_values,
             model_trainer,
@@ -854,6 +993,10 @@ def compute_rid(
         )
         for b in range(n_bootstraps)
     )
+    results, bootstrap_stats = _collect_bootstrap_results(
+        tasks, n_jobs, n_bootstraps, progress_label
+    )
+    _log_bootstrap_summary(progress_label, bootstrap_stats)
 
     per_bootstrap_importances = []
     per_bootstrap_perf = []
@@ -866,12 +1009,12 @@ def compute_rid(
 
     n_valid = len(per_bootstrap_importances)
     if n_valid == 0:
-        print("Warning: No bootstraps produced a non-empty Rashomon set.")
+        logger.warning("No bootstraps produced a non-empty Rashomon set.")
         return None, None, 0
 
     active_metrics = _active_metrics(per_bootstrap_importances, feature_names, vi_metric_names)
     if not active_metrics:
-        print(f"Warning: No active VI metrics produced values for metrics={vi_metric_names}")
+        logger.warning(f"No active VI metrics produced values for metrics={vi_metric_names}")
 
     metric_results = _aggregate_metric_results(
         per_bootstrap_importances,
@@ -881,8 +1024,8 @@ def compute_rid(
     )
     perf_stats = _aggregate_perf_stats(per_bootstrap_perf, performance_metric_specs)
 
-    print(
-        f"  Done. {n_valid}/{n_bootstraps} valid bootstraps. "
+    logger.info(
+        f"Done. {n_valid}/{n_bootstraps} valid bootstraps. "
         f"Metrics: {list(metric_results.keys())}  "
         f"{_format_perf_stats(perf_stats, performance_metric_specs)}"
     )
@@ -903,8 +1046,12 @@ def compute_rid_cross_family(
     n_jobs=1,
     candidate_search="grid",
     truvarimp_config=None,
+    suppress_warnings=True,
 ):
     """Compute cross-family RID and return metric results, family counts, and family performance.
+
+    ``suppress_warnings`` (default True) ignores every Python warning raised
+    while fitting and scoring candidates inside each bootstrap worker.
 
     ``candidate_search`` selects how each bootstrap populates its candidate
     pool before Rashomon filtering:
@@ -955,14 +1102,14 @@ def compute_rid_cross_family(
             )
             search_spaces[name] = explicit_space or resolve_default_search_space(model_class)
             if search_spaces[name] is None:
-                print(
-                    f"  Note: family '{name}' ({getattr(model_class, '__name__', model_class)}) has no "
+                logger.info(
+                    f"Note: family '{name}' ({getattr(model_class, '__name__', model_class)}) has no "
                     "continuous search space for truvarimp_joint; falling back to a single fixed "
                     "evaluation via its own trainer for this family."
                 )
             elif _declared_search_grid(model_config) is not None:
-                print(
-                    f"  Note: family '{name}' declares a custom search_grid, which only the "
+                logger.info(
+                    f"Note: family '{name}' declares a custom search_grid, which only the "
                     "'grid' candidate_search uses; truvarimp_joint searches its continuous "
                     "space instead. Pass 'truvarimp_search_space' in a mapping config to "
                     "constrain the joint search."
@@ -974,7 +1121,7 @@ def compute_rid_cross_family(
         if candidate_search == "truvarimp_joint"
         else f"pool={n_models_per_class}/class"
     )
-    print(
+    logger.info(
         f"Cross-family RID (per-family Rashomon): {family_names}, {len(feature_names)} features, "
         f"B={n_bootstraps}, candidate_search={candidate_search}, "
         f"{pool_description}, epsilon={epsilon}, n_jobs={n_jobs}, "
@@ -982,9 +1129,12 @@ def compute_rid_cross_family(
         f"family_balance_mode={family_balance_mode}"
     )
 
-    results = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_run_single_bootstrap_cross_family)(
+    progress_label = f"cross-family RID[{family_balance_mode}, {candidate_search}] bootstraps"
+    tasks = (
+        delayed(_run_bootstrap_task)(
+            _run_single_bootstrap_cross_family,
             b,
+            suppress_warnings,
             X_scaled,
             y_values,
             resolved_model_configs,
@@ -1000,6 +1150,10 @@ def compute_rid_cross_family(
         )
         for b in range(n_bootstraps)
     )
+    results, bootstrap_stats = _collect_bootstrap_results(
+        tasks, n_jobs, n_bootstraps, progress_label
+    )
+    _log_bootstrap_summary(progress_label, bootstrap_stats)
 
     per_bootstrap_importances = []
     per_bootstrap_family_perf = []
@@ -1017,12 +1171,12 @@ def compute_rid_cross_family(
 
     n_valid = len(per_bootstrap_importances)
     if n_valid == 0:
-        print("Warning: No bootstraps produced a non-empty Rashomon set.")
+        logger.warning("No bootstraps produced a non-empty Rashomon set.")
         return None, family_counts, None, 0
 
     active_metrics = _active_metrics(per_bootstrap_importances, feature_names, vi_metric_names)
     if not active_metrics:
-        print(f"Warning: No active VI metrics produced values for metrics={vi_metric_names}")
+        logger.warning(f"No active VI metrics produced values for metrics={vi_metric_names}")
 
     weights_arg = per_bootstrap_weights if family_balance_mode == "weighted" else None
     metric_results = _aggregate_metric_results(
@@ -1038,11 +1192,11 @@ def compute_rid_cross_family(
         performance_metric_specs,
     )
 
-    print(f"  Done. {n_valid}/{n_bootstraps} valid bootstraps. Metrics: {list(metric_results.keys())}")
-    print(f"  Family representation in Rashomon sets: {family_counts}")
-    print("  Performance by model family (Rashomon models, bootstrap mean):")
+    logger.info(f"Done. {n_valid}/{n_bootstraps} valid bootstraps. Metrics: {list(metric_results.keys())}")
+    logger.info(f"Family representation in Rashomon sets: {family_counts}")
+    logger.info("Performance by model family (Rashomon models, bootstrap mean):")
     for name, perf_stats in family_perf_stats.items():
-        print(f"    {name}: {_format_perf_stats(perf_stats, performance_metric_specs)}")
+        logger.info(f"  {name}: {_format_perf_stats(perf_stats, performance_metric_specs)}")
 
     return metric_results, family_counts, family_perf_stats, n_valid
 
@@ -1088,6 +1242,7 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
         performance_metrics=None,
         n_cdf_points=200,
         n_jobs=1,
+        suppress_warnings=True,
     ):
         self.epsilon = epsilon
         self.n_bootstraps = n_bootstraps
@@ -1100,6 +1255,7 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
         self.performance_metrics = performance_metrics
         self.n_cdf_points = n_cdf_points
         self.n_jobs = n_jobs
+        self.suppress_warnings = suppress_warnings
 
     def fit(self, X, y):
         self.metric_results_, self.perf_stats_, self.n_valid_bootstraps_ = compute_rid(
@@ -1116,6 +1272,7 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
             performance_metrics=self.performance_metrics,
             n_cdf_points=self.n_cdf_points,
             n_jobs=self.n_jobs,
+            suppress_warnings=self.suppress_warnings,
         )
         _, _, self.feature_names_ = _prepare_inputs(X, y)
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()
@@ -1222,6 +1379,10 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         Number of parallel jobs for bootstrap execution (passed to
         :class:`joblib.Parallel`).
 
+    suppress_warnings : bool, default=True
+        Ignore every Python warning (e.g. sklearn ``ConvergenceWarning``)
+        raised while fitting and scoring candidates inside each bootstrap.
+
     Attributes
     ----------
     metric_results_ : dict or None
@@ -1268,6 +1429,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         n_jobs=1,
         candidate_search="grid",
         truvarimp_config=None,
+        suppress_warnings=True,
     ):
         self.model_configs = model_configs
         self.epsilon = epsilon
@@ -1280,6 +1442,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         self.n_jobs = n_jobs
         self.candidate_search = candidate_search
         self.truvarimp_config = truvarimp_config
+        self.suppress_warnings = suppress_warnings
 
     def fit(self, X, y):
         (
@@ -1301,6 +1464,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             n_jobs=self.n_jobs,
             candidate_search=self.candidate_search,
             truvarimp_config=self.truvarimp_config,
+            suppress_warnings=self.suppress_warnings,
         )
         _, _, self.feature_names_ = _prepare_inputs(X, y)
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()

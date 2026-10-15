@@ -24,9 +24,8 @@ Usage:
 """
 
 import argparse
-import contextlib
-import io
 import json
+import logging
 import os
 import sys
 import time
@@ -35,9 +34,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from rid import CrossFamilyRashomonImportanceDistribution
+from rid import (
+    CrossFamilyRashomonImportanceDistribution,
+    add_logging_arguments,
+    configure_logging,
+    silence_warnings,
+)
 
 import run_nonlinear_interaction_simulation as base
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TRUVARIMP_TOTAL_BUDGET = 300
 DEFAULT_OUTPUT_DIR = str(
@@ -68,8 +74,7 @@ def run_cross_family_rid_truvarimp(
         truvarimp_config={"total_budget": total_budget},
     )
 
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        estimator.fit(X, y)
+    estimator.fit(X, y)
 
     ranked_features = [feature for feature, _ in estimator.rank_features(rid_metric)]
     return ranked_features
@@ -133,8 +138,9 @@ def run_simulation_study_truvarimp(
                 )
                 stepwise_scoring = "roc_auc"
 
-                method_rankings = {
-                    "cross_family_unweighted": run_cross_family_rid_truvarimp(
+                cell_label = f"[{dgp_name} beta={beta} rep={rep}]"
+                method_runners = {
+                    "cross_family_unweighted": lambda: run_cross_family_rid_truvarimp(
                         X,
                         y,
                         n_bootstraps=n_bootstraps,
@@ -144,7 +150,7 @@ def run_simulation_study_truvarimp(
                         n_jobs=n_jobs,
                         rid_metric=rid_metric,
                     ),
-                    "cross_family_weighted": run_cross_family_rid_truvarimp(
+                    "cross_family_weighted": lambda: run_cross_family_rid_truvarimp(
                         X,
                         y,
                         n_bootstraps=n_bootstraps,
@@ -154,7 +160,7 @@ def run_simulation_study_truvarimp(
                         n_jobs=n_jobs,
                         rid_metric=rid_metric,
                     ),
-                    "stepwise_logreg": base.run_forward_stepwise_ranking(
+                    "stepwise_logreg": lambda: base.run_forward_stepwise_ranking(
                         X,
                         y,
                         base.LogisticRegression,
@@ -162,7 +168,7 @@ def run_simulation_study_truvarimp(
                         cv,
                         stepwise_scoring,
                     ),
-                    "stepwise_rf": base.run_forward_stepwise_ranking(
+                    "stepwise_rf": lambda: base.run_forward_stepwise_ranking(
                         X,
                         y,
                         base.RandomForestClassifier,
@@ -174,7 +180,7 @@ def run_simulation_study_truvarimp(
                         cv,
                         stepwise_scoring,
                     ),
-                    "rid_tree": base.run_single_family_tree_rid(
+                    "rid_tree": lambda: base.run_single_family_tree_rid(
                         X,
                         y,
                         epsilon=epsilon,
@@ -184,6 +190,9 @@ def run_simulation_study_truvarimp(
                         rid_metric=rid_metric,
                     ),
                 }
+                method_rankings, method_seconds = base.run_methods_with_logging(
+                    method_runners, cell_label
+                )
 
                 for method_name, ranked_features in method_rankings.items():
                     metric_row = base.compute_selection_metrics(ranked_features, ground_truth)
@@ -215,13 +224,7 @@ def run_simulation_study_truvarimp(
                     )
 
                 completed += 1
-                if completed % max(1, n_repetitions) == 0:
-                    elapsed = time.time() - start
-                    print(
-                        f"progress {completed}/{total_cells} "
-                        f"({100.0 * completed / total_cells:.1f}%) "
-                        f"elapsed={elapsed / 60.0:.1f}m"
-                    )
+                base.log_cell_progress(completed, total_cells, cell_label, method_seconds, start)
 
     return base.pd.DataFrame(rows), base.pd.DataFrame(snr_rows)
 
@@ -342,11 +345,14 @@ def parse_args():
             "addition, off by default (default: False)."
         ),
     )
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     n_jobs = base.resolve_num_workers(args.num_workers)
 
     simulators = dict(base.SIMULATORS)
@@ -355,26 +361,26 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 70)
-    print("Running nonlinear interaction simulation study (TruVaRImp candidate search)")
-    print(f"output_dir={args.output_dir}")
-    print(f"sample_size={args.sample_size}")
-    print(f"repetitions={args.repetitions}")
-    print(f"bootstraps={args.bootstraps}")
-    print(f"truvarimp_total_budget={args.truvarimp_total_budget}")
-    print(f"models_per_class (rid_tree only)={args.models_per_class}")
-    print(f"beta_grid={args.beta_grid}")
-    print(f"noise_std={args.noise_std}")
-    print(f"epsilon={args.epsilon}")
-    print(f"rid_metric={args.rid_metric}")
-    print(f"stepwise_cv_splits={args.stepwise_cv_splits}")
-    print(f"stepwise_logreg_C={args.stepwise_logreg_C}")
-    print(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
-    print(f"methods_compared={list(base.METHODS)}")
-    print(f"include_redundant_dgps={args.include_redundant_dgps}")
-    print(f"simulations_included={list(simulators.keys())}")
-    print(f"n_jobs={n_jobs}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Running nonlinear interaction simulation study (TruVaRImp candidate search)")
+    logger.info(f"output_dir={args.output_dir}")
+    logger.info(f"sample_size={args.sample_size}")
+    logger.info(f"repetitions={args.repetitions}")
+    logger.info(f"bootstraps={args.bootstraps}")
+    logger.info(f"truvarimp_total_budget={args.truvarimp_total_budget}")
+    logger.info(f"models_per_class (rid_tree only)={args.models_per_class}")
+    logger.info(f"beta_grid={args.beta_grid}")
+    logger.info(f"noise_std={args.noise_std}")
+    logger.info(f"epsilon={args.epsilon}")
+    logger.info(f"rid_metric={args.rid_metric}")
+    logger.info(f"stepwise_cv_splits={args.stepwise_cv_splits}")
+    logger.info(f"stepwise_logreg_C={args.stepwise_logreg_C}")
+    logger.info(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
+    logger.info(f"methods_compared={list(base.METHODS)}")
+    logger.info(f"include_redundant_dgps={args.include_redundant_dgps}")
+    logger.info(f"simulations_included={list(simulators.keys())}")
+    logger.info(f"n_jobs={n_jobs}")
+    logger.info("=" * 70)
 
     started = time.time()
 
@@ -438,14 +444,14 @@ def main():
         json.dump(study_settings, handle, indent=2)
 
     elapsed = time.time() - started
-    print("\nSaved outputs:")
-    print(f"  {study_results_path}")
-    print(f"  {dgp_beta_path}")
-    print(f"  {dgp_path}")
-    print(f"  {snr_table_path}")
-    print(f"  {snr_plot_path}")
-    print(f"  {settings_path}")
-    print(f"\nFinished in {elapsed:.1f}s ({elapsed / 60.0:.1f} min)")
+    logger.info("Saved outputs:")
+    logger.info(f"  {study_results_path}")
+    logger.info(f"  {dgp_beta_path}")
+    logger.info(f"  {dgp_path}")
+    logger.info(f"  {snr_table_path}")
+    logger.info(f"  {snr_plot_path}")
+    logger.info(f"  {settings_path}")
+    logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60.0:.1f} min)")
 
 
 if __name__ == "__main__":

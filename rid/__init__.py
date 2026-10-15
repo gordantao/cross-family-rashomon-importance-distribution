@@ -1,5 +1,6 @@
 """Estimator-style API for Rashomon Importance Distribution analyses."""
 
+from ._logging import add_logging_arguments, configure_logging, silence_warnings
 from .core import (
     CrossFamilyRashomonImportanceDistribution,
     RashomonImportanceDistribution,
@@ -47,17 +48,20 @@ __all__ = [
     "VALID_CROSS_FAMILY_BALANCE_MODES",
     "VALID_PERFORMANCE_METRICS",
     "VALID_VI_METRICS",
+    "add_logging_arguments",
     "compute_coef_importance",
     "compute_loco_importance",
     "compute_model_reliance",
     "compute_rid",
     "compute_rid_cross_family",
+    "configure_logging",
     "performance_accuracy",
     "performance_auprc",
     "performance_f1",
     "register_candidate_trainer",
     "resolve_candidate_trainer",
     "resolve_model_config",
+    "silence_warnings",
     "summarize_metric_result",
     "vi_coef",
     "vi_loco",

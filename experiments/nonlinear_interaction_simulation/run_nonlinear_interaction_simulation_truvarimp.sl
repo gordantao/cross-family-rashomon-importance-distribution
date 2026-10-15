@@ -44,6 +44,15 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
+# --- Real-time logging, no warning spam ---
+# Unbuffered stdout so progress lines reach the .out file as they happen
+# rather than only when Python's 8KB block buffer fills. PYTHONWARNINGS is
+# inherited by every joblib worker process, where nearly all sklearn
+# ConvergenceWarning/FutureWarning output originates (each script and
+# rid.compute_rid* also ignore warnings in-process; this is belt-and-braces).
+export PYTHONUNBUFFERED=1
+export PYTHONWARNINGS=ignore
+
 echo "Thread settings:"
 echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"

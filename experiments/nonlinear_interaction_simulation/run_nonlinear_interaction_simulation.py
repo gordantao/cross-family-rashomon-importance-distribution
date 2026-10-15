@@ -22,10 +22,9 @@ Usage:
 """
 
 import argparse
-import contextlib
 import functools
-import io
 import json
+import logging
 import os
 import re
 import sys
@@ -51,10 +50,16 @@ from rid import (
     LassoClassifier,
     RashomonImportanceDistribution,
     RidgeClassifier,
+    add_logging_arguments,
+    configure_logging,
     performance_accuracy,
     performance_auprc,
     performance_f1,
+    silence_warnings,
 )
+from rid._logging import format_duration  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE_SIZE = 400
 DEFAULT_REPETITIONS = 12
@@ -117,15 +122,15 @@ def resolve_num_workers(cli_override=None):
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     if slurm_cpus is not None:
         n_workers = int(slurm_cpus)
-        print(f"[env] SLURM_CPUS_PER_TASK={n_workers} -> using {n_workers} workers")
+        logger.info(f"[env] SLURM_CPUS_PER_TASK={n_workers} -> using {n_workers} workers")
         return n_workers
 
     if cli_override is not None:
-        print(f"[cli] --num-workers={cli_override}")
+        logger.info(f"[cli] --num-workers={cli_override}")
         return cli_override
 
     n_workers = os.cpu_count() or 1
-    print(f"[fallback] os.cpu_count()={n_workers}")
+    logger.info(f"[fallback] os.cpu_count()={n_workers}")
     return n_workers
 
 
@@ -707,8 +712,7 @@ def run_cross_family_rid(
         n_jobs=n_jobs,
     )
 
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        estimator.fit(X, y)
+    estimator.fit(X, y)
 
     ranked_features = [feature for feature, _ in estimator.rank_features(rid_metric)]
     return ranked_features
@@ -763,11 +767,39 @@ def run_single_family_tree_rid(
         n_jobs=n_jobs,
     )
 
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        estimator.fit(X, y)
+    estimator.fit(X, y)
 
     ranked_features = [feature for feature, _ in estimator.rank_features(rid_metric)]
     return ranked_features
+
+
+def run_methods_with_logging(method_runners, cell_label):
+    """Run each method's zero-arg runner in order, logging start/finish and wall time.
+
+    Returns ``(method_rankings, method_seconds)``, both keyed by method name in
+    the runners' order.
+    """
+
+    method_rankings = {}
+    method_seconds = {}
+    for method_name, runner in method_runners.items():
+        logger.info(f"{cell_label}: starting {method_name}")
+        method_start = time.time()
+        method_rankings[method_name] = runner()
+        method_seconds[method_name] = time.time() - method_start
+        logger.info(f"{cell_label}: {method_name} done in {format_duration(method_seconds[method_name])}")
+    return method_rankings, method_seconds
+
+
+def log_cell_progress(completed, total_cells, cell_label, method_seconds, start):
+    elapsed = time.time() - start
+    eta = elapsed / completed * (total_cells - completed)
+    timings = ", ".join(f"{name}={format_duration(sec)}" for name, sec in method_seconds.items())
+    logger.info(
+        f"progress {completed}/{total_cells} ({100.0 * completed / total_cells:.1f}%) "
+        f"{cell_label} | {timings} | elapsed={format_duration(elapsed)} "
+        f"ETA={format_duration(eta)}"
+    )
 
 
 def build_common_evaluator_panel(random_state):
@@ -886,8 +918,9 @@ def run_simulation_study(
                 cv = StratifiedKFold(n_splits=stepwise_cv_splits, shuffle=True, random_state=random_state)
                 stepwise_scoring = "roc_auc"
 
-                method_rankings = {
-                    "cross_family_unweighted": run_cross_family_rid(
+                cell_label = f"[{dgp_name} beta={beta} rep={rep}]"
+                method_runners = {
+                    "cross_family_unweighted": lambda: run_cross_family_rid(
                         X,
                         y,
                         n_bootstraps=n_bootstraps,
@@ -897,7 +930,7 @@ def run_simulation_study(
                         n_jobs=n_jobs,
                         rid_metric=rid_metric,
                     ),
-                    "cross_family_weighted": run_cross_family_rid(
+                    "cross_family_weighted": lambda: run_cross_family_rid(
                         X,
                         y,
                         n_bootstraps=n_bootstraps,
@@ -907,7 +940,7 @@ def run_simulation_study(
                         n_jobs=n_jobs,
                         rid_metric=rid_metric,
                     ),
-                    "stepwise_logreg": run_forward_stepwise_ranking(
+                    "stepwise_logreg": lambda: run_forward_stepwise_ranking(
                         X,
                         y,
                         LogisticRegression,
@@ -915,7 +948,7 @@ def run_simulation_study(
                         cv,
                         stepwise_scoring,
                     ),
-                    "stepwise_rf": run_forward_stepwise_ranking(
+                    "stepwise_rf": lambda: run_forward_stepwise_ranking(
                         X,
                         y,
                         RandomForestClassifier,
@@ -923,7 +956,7 @@ def run_simulation_study(
                         cv,
                         stepwise_scoring,
                     ),
-                    "rid_tree": run_single_family_tree_rid(
+                    "rid_tree": lambda: run_single_family_tree_rid(
                         X,
                         y,
                         epsilon=epsilon,
@@ -933,6 +966,7 @@ def run_simulation_study(
                         rid_metric=rid_metric,
                     ),
                 }
+                method_rankings, method_seconds = run_methods_with_logging(method_runners, cell_label)
 
                 method_feature_lists = {
                     method_name: ranked_features[: len(ground_truth)]
@@ -979,13 +1013,7 @@ def run_simulation_study(
                     )
 
                 completed += 1
-                if completed % max(1, n_repetitions) == 0:
-                    elapsed = time.time() - start
-                    print(
-                        f"progress {completed}/{total_cells} "
-                        f"({100.0 * completed / total_cells:.1f}%) "
-                        f"elapsed={elapsed / 60.0:.1f}m"
-                    )
+                log_cell_progress(completed, total_cells, cell_label, method_seconds, start)
 
     return pd.DataFrame(rows), pd.DataFrame(snr_rows)
 
@@ -1192,11 +1220,14 @@ def parse_args():
             "addition, off by default (default: False)."
         ),
     )
+    add_logging_arguments(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    silence_warnings()
+    configure_logging(args.log_level, args.log_file)
     n_jobs = resolve_num_workers(args.num_workers)
 
     simulators = dict(SIMULATORS)
@@ -1205,25 +1236,25 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 70)
-    print("Running nonlinear interaction simulation study")
-    print(f"output_dir={args.output_dir}")
-    print(f"sample_size={args.sample_size}")
-    print(f"repetitions={args.repetitions}")
-    print(f"bootstraps={args.bootstraps}")
-    print(f"models_per_class={args.models_per_class}")
-    print(f"beta_grid={args.beta_grid}")
-    print(f"noise_std={args.noise_std}")
-    print(f"epsilon={args.epsilon}")
-    print(f"rid_metric={args.rid_metric}")
-    print(f"stepwise_cv_splits={args.stepwise_cv_splits}")
-    print(f"stepwise_logreg_C={args.stepwise_logreg_C}")
-    print(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
-    print(f"methods_compared={list(METHODS)}")
-    print(f"include_redundant_dgps={args.include_redundant_dgps}")
-    print(f"simulations_included={list(simulators.keys())}")
-    print(f"n_jobs={n_jobs}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Running nonlinear interaction simulation study")
+    logger.info(f"output_dir={args.output_dir}")
+    logger.info(f"sample_size={args.sample_size}")
+    logger.info(f"repetitions={args.repetitions}")
+    logger.info(f"bootstraps={args.bootstraps}")
+    logger.info(f"models_per_class={args.models_per_class}")
+    logger.info(f"beta_grid={args.beta_grid}")
+    logger.info(f"noise_std={args.noise_std}")
+    logger.info(f"epsilon={args.epsilon}")
+    logger.info(f"rid_metric={args.rid_metric}")
+    logger.info(f"stepwise_cv_splits={args.stepwise_cv_splits}")
+    logger.info(f"stepwise_logreg_C={args.stepwise_logreg_C}")
+    logger.info(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
+    logger.info(f"methods_compared={list(METHODS)}")
+    logger.info(f"include_redundant_dgps={args.include_redundant_dgps}")
+    logger.info(f"simulations_included={list(simulators.keys())}")
+    logger.info(f"n_jobs={n_jobs}")
+    logger.info("=" * 70)
 
     started = time.time()
 
@@ -1284,14 +1315,14 @@ def main():
         json.dump(study_settings, handle, indent=2)
 
     elapsed = time.time() - started
-    print("\nSaved outputs:")
-    print(f"  {study_results_path}")
-    print(f"  {dgp_beta_path}")
-    print(f"  {dgp_path}")
-    print(f"  {snr_table_path}")
-    print(f"  {snr_plot_path}")
-    print(f"  {settings_path}")
-    print(f"\nFinished in {elapsed:.1f}s ({elapsed / 60.0:.1f} min)")
+    logger.info("Saved outputs:")
+    logger.info(f"  {study_results_path}")
+    logger.info(f"  {dgp_beta_path}")
+    logger.info(f"  {dgp_path}")
+    logger.info(f"  {snr_table_path}")
+    logger.info(f"  {snr_plot_path}")
+    logger.info(f"  {settings_path}")
+    logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60.0:.1f} min)")
 
 
 if __name__ == "__main__":
