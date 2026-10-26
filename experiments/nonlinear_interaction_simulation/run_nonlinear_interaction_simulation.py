@@ -4,12 +4,16 @@ Cross-family RID simulation study runner (cluster-friendly).
 
 This script reproduces the cleaned nonlinear interaction notebook as a
 command-line workflow suitable for Slurm jobs, and benchmarks ground-truth
-feature recovery across five methods on each simulated dataset:
+feature recovery across four methods on each simulated dataset:
 1) Cross-family RID with family_balance_mode='unweighted'.
-2) Cross-family RID with family_balance_mode='weighted'.
-3) Forward stepwise selection scored via logistic regression.
-4) Forward stepwise selection scored via random forest.
-5) Single-family RID on a fully enumerated decision-tree Rashomon set.
+2) Forward stepwise selection scored via logistic regression.
+3) Forward stepwise selection scored via random forest.
+4) Single-family RID on a fully enumerated decision-tree Rashomon set.
+
+Results are checkpointed to one CSV per DGP (``per_dgp/study_results_<dgp>.csv``)
+after every completed (dgp, beta, rep) cell, and a rerun into the same
+--output-dir skips cells already on disk, so a run that hits the SLURM time
+limit can simply be resubmitted (optionally restricted via --dgps).
 
 Ground-truth recovery (precision@k/recall@k/NDCG@k/exact-match vs. the known
 relevant features) is unaffected by RID's in-sample performance-metric
@@ -74,7 +78,8 @@ DEFAULT_STEPWISE_CV_SPLITS = 5
 DEFAULT_STEPWISE_LOGREG_C = 1.0
 DEFAULT_STEPWISE_RF_N_ESTIMATORS = 100
 DEFAULT_RANDOM_STATE = 42
-METHODS = ("cross_family_unweighted", "cross_family_weighted", "stepwise_logreg", "stepwise_rf", "rid_tree")
+METHODS = ("cross_family_unweighted", "stepwise_logreg", "stepwise_rf", "rid_tree")
+PER_DGP_SUBDIR = "per_dgp"
 
 # No per-family search_grid overrides here: every family now inherits its
 # grid straight from rid.models.TRAINER_REGISTRY, standardizing this
@@ -608,6 +613,11 @@ REDUNDANT_SIMULATORS = {
     "friedman_redundant_r070": functools.partial(simulate_friedman_redundant, redundancy_corr=0.70),
 }
 
+# Canonical DGP order. A DGP's per-cell seed is derived from its index here
+# (not its position in whatever subset --dgps selected), so running a DGP alone
+# reproduces exactly the datasets it would get in a full run.
+ALL_SIMULATORS = {**SIMULATORS, **REDUNDANT_SIMULATORS}
+
 
 def feature_columns_from_dataset(dataset):
     def sort_key(name):
@@ -876,36 +886,170 @@ def build_held_out_scores(method_eval):
     return held_out_scores
 
 
-def run_simulation_study(
-    simulators,
+def build_method_runners(
+    X,
+    y,
+    cv,
+    scoring,
     *,
-    beta_grid,
-    sample_size,
-    n_repetitions,
     n_bootstraps,
     n_models_per_class,
-    noise_std,
     epsilon,
-    base_seed,
-    stepwise_cv_splits,
     stepwise_logreg_C,
     stepwise_rf_n_estimators,
     random_state,
     n_jobs=1,
     rid_metric="sub_mr",
 ):
-    rows = []
-    snr_rows = []
+    """Zero-arg runner per method in ``METHODS`` order, each returning a full feature ranking."""
+
+    return {
+        "cross_family_unweighted": lambda: run_cross_family_rid(
+            X,
+            y,
+            n_bootstraps=n_bootstraps,
+            n_models_per_class=n_models_per_class,
+            epsilon=epsilon,
+            family_balance_mode="unweighted",
+            n_jobs=n_jobs,
+            rid_metric=rid_metric,
+        ),
+        "stepwise_logreg": lambda: run_forward_stepwise_ranking(
+            X,
+            y,
+            LogisticRegression,
+            {"C": stepwise_logreg_C, "max_iter": 100000, "random_state": random_state},
+            cv,
+            scoring,
+        ),
+        "stepwise_rf": lambda: run_forward_stepwise_ranking(
+            X,
+            y,
+            RandomForestClassifier,
+            {"n_estimators": stepwise_rf_n_estimators, "random_state": random_state, "n_jobs": 1},
+            cv,
+            scoring,
+        ),
+        "rid_tree": lambda: run_single_family_tree_rid(
+            X,
+            y,
+            epsilon=epsilon,
+            n_bootstraps=n_bootstraps,
+            n_models_pool=n_models_per_class,
+            n_jobs=n_jobs,
+            rid_metric=rid_metric,
+        ),
+    }
+
+
+def per_dgp_results_path(output_dir, dgp_name):
+    return os.path.join(output_dir, PER_DGP_SUBDIR, f"study_results_{dgp_name}.csv")
+
+
+def write_csv_atomic(df, path):
+    """Write via a temp file + rename so a job killed mid-write (or a concurrent
+    array task) never leaves a truncated CSV behind."""
+
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)
+
+
+def load_completed_cells(results_path, methods):
+    """Rows of every (beta, rep) cell already checkpointed for one DGP with all
+    ``methods`` present, plus the set of those ``(beta, rep)`` keys."""
+
+    if not os.path.exists(results_path):
+        return [], set()
+
+    existing = pd.read_csv(results_path)
+    existing["beta"] = existing["beta"].astype(float)
+    complete = existing.groupby(["beta", "rep"])["method"].apply(lambda m: set(methods) <= set(m))
+    done_cells = {(float(beta), int(rep)) for (beta, rep), ok in complete.items() if ok}
+    keep = [(float(b), int(r)) in done_cells for b, r in zip(existing["beta"], existing["rep"])]
+    return existing[keep].to_dict("records"), done_cells
+
+
+def prepare_output_dir(output_dir, study_settings):
+    """Create ``output_dir`` and write ``study_settings.json``, refusing to mix
+    checkpointed per-DGP results produced under different settings.
+
+    ``num_workers`` and the selected DGP subset are excluded from the check,
+    since neither changes any cell's result.
+    """
+
+    os.makedirs(os.path.join(output_dir, PER_DGP_SUBDIR), exist_ok=True)
+    settings_path = os.path.join(output_dir, "study_settings.json")
+    ignored_keys = {"num_workers"}
+
+    has_checkpoints = any(
+        name.endswith(".csv") for name in os.listdir(os.path.join(output_dir, PER_DGP_SUBDIR))
+    )
+    if has_checkpoints and os.path.exists(settings_path):
+        with open(settings_path, encoding="utf-8") as handle:
+            previous = json.load(handle)
+        mismatched = sorted(
+            key
+            for key in (set(previous) | set(study_settings)) - ignored_keys
+            if previous.get(key) != study_settings.get(key)
+        )
+        if mismatched:
+            raise SystemExit(
+                f"{output_dir} already holds per-DGP checkpoints produced with different "
+                f"settings ({', '.join(mismatched)}). Use a new --output-dir, or delete "
+                f"{os.path.join(output_dir, PER_DGP_SUBDIR)} to start over."
+            )
+
+    tmp_path = f"{settings_path}.{os.getpid()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(study_settings, handle, indent=2)
+    os.replace(tmp_path, settings_path)
+
+
+def run_simulation_study(
+    simulators,
+    *,
+    beta_grid,
+    sample_size,
+    n_repetitions,
+    noise_std,
+    base_seed,
+    stepwise_cv_splits,
+    random_state,
+    make_method_runners,
+    output_dir,
+):
+    """Run every (dgp, beta, rep) cell, checkpointing each DGP's rows to its own
+    CSV after every cell and skipping cells already checkpointed in ``output_dir``.
+
+    ``make_method_runners(X, y, cv, scoring)`` returns the ``{method: runner}``
+    mapping for one cell (see ``build_method_runners``).
+    """
+
     start = time.time()
-
     evaluator_panel = build_common_evaluator_panel(random_state)
+    stepwise_scoring = "roc_auc"
 
-    total_cells = len(simulators) * len(beta_grid) * n_repetitions
+    checkpoints = {
+        dgp_name: load_completed_cells(per_dgp_results_path(output_dir, dgp_name), METHODS)
+        for dgp_name in simulators
+    }
+    n_skipped = sum(len(done_cells) for _, done_cells in checkpoints.values())
+    total_cells = len(simulators) * len(beta_grid) * n_repetitions - n_skipped
+    if n_skipped:
+        logger.info(f"Resuming: {n_skipped} cells already checkpointed, {total_cells} remaining")
     completed = 0
 
-    for dgp_index, (dgp_name, simulator) in enumerate(simulators.items()):
+    for dgp_name, simulator in simulators.items():
+        dgp_index = list(ALL_SIMULATORS).index(dgp_name)
+        results_path = per_dgp_results_path(output_dir, dgp_name)
+        rows, done_cells = checkpoints[dgp_name]
+
         for beta_index, beta in enumerate(beta_grid):
             for rep in range(n_repetitions):
+                if (float(beta), rep) in done_cells:
+                    continue
+
                 seed = base_seed + dgp_index * 1_000_000 + beta_index * 10_000 + rep
                 dataset = simulator(
                     n=sample_size,
@@ -921,66 +1065,10 @@ def run_simulation_study(
                 equivalence_classes = dataset.attrs.get("equivalence_classes") or {}
                 snr_empirical = float(dataset.attrs["snr_empirical"])
 
-                snr_rows.append(
-                    {
-                        "dgp": dgp_name,
-                        "beta": float(beta),
-                        "rep": rep,
-                        "snr_empirical": snr_empirical,
-                    }
-                )
-
                 cv = StratifiedKFold(n_splits=stepwise_cv_splits, shuffle=True, random_state=random_state)
-                stepwise_scoring = "roc_auc"
 
                 cell_label = f"[{dgp_name} beta={beta} rep={rep}]"
-                method_runners = {
-                    "cross_family_unweighted": lambda: run_cross_family_rid(
-                        X,
-                        y,
-                        n_bootstraps=n_bootstraps,
-                        n_models_per_class=n_models_per_class,
-                        epsilon=epsilon,
-                        family_balance_mode="unweighted",
-                        n_jobs=n_jobs,
-                        rid_metric=rid_metric,
-                    ),
-                    "cross_family_weighted": lambda: run_cross_family_rid(
-                        X,
-                        y,
-                        n_bootstraps=n_bootstraps,
-                        n_models_per_class=n_models_per_class,
-                        epsilon=epsilon,
-                        family_balance_mode="weighted",
-                        n_jobs=n_jobs,
-                        rid_metric=rid_metric,
-                    ),
-                    "stepwise_logreg": lambda: run_forward_stepwise_ranking(
-                        X,
-                        y,
-                        LogisticRegression,
-                        {"C": stepwise_logreg_C, "max_iter": 100000, "random_state": random_state},
-                        cv,
-                        stepwise_scoring,
-                    ),
-                    "stepwise_rf": lambda: run_forward_stepwise_ranking(
-                        X,
-                        y,
-                        RandomForestClassifier,
-                        {"n_estimators": stepwise_rf_n_estimators, "random_state": random_state, "n_jobs": 1},
-                        cv,
-                        stepwise_scoring,
-                    ),
-                    "rid_tree": lambda: run_single_family_tree_rid(
-                        X,
-                        y,
-                        epsilon=epsilon,
-                        n_bootstraps=n_bootstraps,
-                        n_models_pool=n_models_per_class,
-                        n_jobs=n_jobs,
-                        rid_metric=rid_metric,
-                    ),
-                }
+                method_runners = make_method_runners(X, y, cv, stepwise_scoring)
                 method_rankings, method_seconds = run_methods_with_logging(method_runners, cell_label)
 
                 method_feature_lists = {
@@ -1017,10 +1105,46 @@ def run_simulation_study(
                         }
                     )
 
+                write_csv_atomic(pd.DataFrame(rows).sort_values(["beta", "rep"], kind="stable"), results_path)
+
                 completed += 1
                 log_cell_progress(completed, total_cells, cell_label, method_seconds, start)
 
-    return pd.DataFrame(rows), pd.DataFrame(snr_rows)
+        logger.info(f"[{dgp_name}] complete -> {results_path}")
+        write_combined_outputs(output_dir)
+
+
+def write_combined_outputs(output_dir):
+    """Rebuild the combined study_results/metric/SNR outputs from every per-DGP
+    checkpoint in ``output_dir`` (including DGPs run by earlier or concurrent jobs)."""
+
+    per_dgp_dir = os.path.join(output_dir, PER_DGP_SUBDIR)
+    per_dgp_paths = sorted(
+        os.path.join(per_dgp_dir, name) for name in os.listdir(per_dgp_dir) if name.endswith(".csv")
+    )
+    if not per_dgp_paths:
+        logger.info("No per-DGP results yet; skipping combined outputs")
+        return []
+
+    study_results = pd.concat([pd.read_csv(path) for path in per_dgp_paths], ignore_index=True)
+    snr_results = study_results.drop_duplicates(["dgp", "beta", "rep"])[["dgp", "beta", "rep", "snr_empirical"]]
+
+    metric_table_by_dgp_beta, metric_table_by_dgp = build_metric_tables(study_results)
+    snr_plot_table = build_snr_plot_table(snr_results)
+
+    study_results_path = os.path.join(output_dir, "study_results.csv")
+    dgp_beta_path = os.path.join(output_dir, "metric_table_by_dgp_beta.csv")
+    dgp_path = os.path.join(output_dir, "metric_table_by_dgp.csv")
+    snr_table_path = os.path.join(output_dir, "snr_plot_table.csv")
+    snr_plot_path = os.path.join(output_dir, "snr_vs_beta.png")
+
+    write_csv_atomic(study_results, study_results_path)
+    write_csv_atomic(metric_table_by_dgp_beta, dgp_beta_path)
+    write_csv_atomic(metric_table_by_dgp, dgp_path)
+    write_csv_atomic(snr_plot_table.round(6), snr_table_path)
+    save_snr_plot(snr_plot_table, snr_plot_path)
+
+    return [study_results_path, dgp_beta_path, dgp_path, snr_table_path, snr_plot_path]
 
 
 HELD_OUT_SCORE_COLUMNS = [
@@ -1111,9 +1235,9 @@ def save_snr_plot(snr_plot_table, output_path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark ground-truth feature recovery across five methods (cross-family RID "
-            "unweighted, cross-family RID weighted, stepwise logistic regression, stepwise "
-            "random forest, and single-family tree RID) "
+            "Benchmark ground-truth feature recovery across four methods (cross-family RID "
+            "unweighted, stepwise logistic regression, stepwise random forest, and "
+            "single-family tree RID) "
             "on simulated nonlinear-interaction datasets, and save tables/plots."
         )
     )
@@ -1177,9 +1301,8 @@ def parse_args():
         type=str,
         default="sub_mr",
         help=(
-            "RID variable-importance metric used by cross_family_unweighted, "
-            "cross_family_weighted, and rid_tree (default: sub_mr; also available: "
-            "loco, coef, iloco). DGP feature counts are tiny (6-11), so iloco's "
+            "RID variable-importance metric used by cross_family_unweighted and "
+            "rid_tree (default: sub_mr; also available: loco, coef, iloco). DGP feature counts are tiny (6-11), so iloco's "
             "O(features^2) pairwise cost is negligible here, unlike on the real "
             "Falcon-Cano/Staellert datasets."
         ),
@@ -1222,11 +1345,36 @@ def parse_args():
             "Also run the redundant-driver DGP variants (REDUNDANT_SIMULATORS): "
             "chen/friedman with a correlated duplicate of the true driver X1 at "
             "redundancy_corr 0.95 and 0.70, on top of the standard DGPs. Diagnostic "
-            "addition, off by default (default: False)."
+            "addition, off by default (default: False). Ignored when --dgps is given."
         ),
     )
+    add_dgps_argument(parser)
     add_logging_arguments(parser)
     return parser.parse_args()
+
+
+def add_dgps_argument(parser):
+    parser.add_argument(
+        "--dgps",
+        type=str,
+        nargs="+",
+        choices=list(ALL_SIMULATORS),
+        default=None,
+        help=(
+            "Run only these DGPs (any of the standard or redundant ones), e.g. to finish the "
+            "DGPs a timed-out run didn't reach. Overrides --include-redundant-dgps. Cells "
+            "already checkpointed in --output-dir are skipped either way."
+        ),
+    )
+
+
+def select_simulators(dgps, include_redundant_dgps):
+    if dgps:
+        return {name: ALL_SIMULATORS[name] for name in dgps}
+    simulators = dict(SIMULATORS)
+    if include_redundant_dgps:
+        simulators.update(REDUNDANT_SIMULATORS)
+    return simulators
 
 
 def main():
@@ -1235,11 +1383,26 @@ def main():
     configure_logging(args.log_level, args.log_file)
     n_jobs = resolve_num_workers(args.num_workers)
 
-    simulators = dict(SIMULATORS)
-    if args.include_redundant_dgps:
-        simulators.update(REDUNDANT_SIMULATORS)
+    simulators = select_simulators(args.dgps, args.include_redundant_dgps)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    study_settings = {
+        "sample_size": args.sample_size,
+        "repetitions_per_beta": args.repetitions,
+        "bootstraps": args.bootstraps,
+        "models_per_class": args.models_per_class,
+        "beta_grid": args.beta_grid,
+        "noise_std": args.noise_std,
+        "base_seed": args.base_seed,
+        "epsilon": args.epsilon,
+        "rid_metric": args.rid_metric,
+        "stepwise_cv_splits": args.stepwise_cv_splits,
+        "stepwise_logreg_C": args.stepwise_logreg_C,
+        "stepwise_rf_n_estimators": args.stepwise_rf_n_estimators,
+        "random_state": args.random_state,
+        "num_workers": n_jobs,
+        "methods_compared": list(METHODS),
+    }
+    prepare_output_dir(args.output_dir, study_settings)
 
     logger.info("=" * 70)
     logger.info("Running nonlinear interaction simulation study")
@@ -1256,77 +1419,43 @@ def main():
     logger.info(f"stepwise_logreg_C={args.stepwise_logreg_C}")
     logger.info(f"stepwise_rf_n_estimators={args.stepwise_rf_n_estimators}")
     logger.info(f"methods_compared={list(METHODS)}")
-    logger.info(f"include_redundant_dgps={args.include_redundant_dgps}")
     logger.info(f"simulations_included={list(simulators.keys())}")
     logger.info(f"n_jobs={n_jobs}")
     logger.info("=" * 70)
 
     started = time.time()
 
-    study_results, snr_results = run_simulation_study(
+    run_simulation_study(
         simulators,
         beta_grid=args.beta_grid,
         sample_size=args.sample_size,
         n_repetitions=args.repetitions,
-        n_bootstraps=args.bootstraps,
-        n_models_per_class=args.models_per_class,
         noise_std=args.noise_std,
-        epsilon=args.epsilon,
         base_seed=args.base_seed,
         stepwise_cv_splits=args.stepwise_cv_splits,
-        stepwise_logreg_C=args.stepwise_logreg_C,
-        stepwise_rf_n_estimators=args.stepwise_rf_n_estimators,
         random_state=args.random_state,
-        n_jobs=n_jobs,
-        rid_metric=args.rid_metric,
+        make_method_runners=lambda X, y, cv, scoring: build_method_runners(
+            X,
+            y,
+            cv,
+            scoring,
+            n_bootstraps=args.bootstraps,
+            n_models_per_class=args.models_per_class,
+            epsilon=args.epsilon,
+            stepwise_logreg_C=args.stepwise_logreg_C,
+            stepwise_rf_n_estimators=args.stepwise_rf_n_estimators,
+            random_state=args.random_state,
+            n_jobs=n_jobs,
+            rid_metric=args.rid_metric,
+        ),
+        output_dir=args.output_dir,
     )
-
-    metric_table_by_dgp_beta, metric_table_by_dgp = build_metric_tables(study_results)
-    snr_plot_table = build_snr_plot_table(snr_results)
-
-    study_settings = {
-        "sample_size": args.sample_size,
-        "repetitions_per_beta": args.repetitions,
-        "bootstraps": args.bootstraps,
-        "models_per_class": args.models_per_class,
-        "beta_grid": args.beta_grid,
-        "noise_std": args.noise_std,
-        "epsilon": args.epsilon,
-        "rid_metric": args.rid_metric,
-        "stepwise_cv_splits": args.stepwise_cv_splits,
-        "stepwise_logreg_C": args.stepwise_logreg_C,
-        "stepwise_rf_n_estimators": args.stepwise_rf_n_estimators,
-        "random_state": args.random_state,
-        "num_workers": n_jobs,
-        "include_redundant_dgps": args.include_redundant_dgps,
-        "simulations_included": list(simulators.keys()),
-        "methods_compared": list(METHODS),
-    }
-
-    study_results_path = os.path.join(args.output_dir, "study_results.csv")
-    dgp_beta_path = os.path.join(args.output_dir, "metric_table_by_dgp_beta.csv")
-    dgp_path = os.path.join(args.output_dir, "metric_table_by_dgp.csv")
-    snr_table_path = os.path.join(args.output_dir, "snr_plot_table.csv")
-    snr_plot_path = os.path.join(args.output_dir, "snr_vs_beta.png")
-    settings_path = os.path.join(args.output_dir, "study_settings.json")
-
-    study_results.to_csv(study_results_path, index=False)
-    metric_table_by_dgp_beta.to_csv(dgp_beta_path, index=False)
-    metric_table_by_dgp.to_csv(dgp_path, index=False)
-    snr_plot_table.round(6).to_csv(snr_table_path, index=False)
-    save_snr_plot(snr_plot_table, snr_plot_path)
-
-    with open(settings_path, "w", encoding="utf-8") as handle:
-        json.dump(study_settings, handle, indent=2)
+    output_paths = write_combined_outputs(args.output_dir)
 
     elapsed = time.time() - started
     logger.info("Saved outputs:")
-    logger.info(f"  {study_results_path}")
-    logger.info(f"  {dgp_beta_path}")
-    logger.info(f"  {dgp_path}")
-    logger.info(f"  {snr_table_path}")
-    logger.info(f"  {snr_plot_path}")
-    logger.info(f"  {settings_path}")
+    for path in [os.path.join(args.output_dir, PER_DGP_SUBDIR), *output_paths]:
+        logger.info(f"  {path}")
     logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60.0:.1f} min)")
 
 

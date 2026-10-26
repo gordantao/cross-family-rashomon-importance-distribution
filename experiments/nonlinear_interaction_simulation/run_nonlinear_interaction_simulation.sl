@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=cross-rid-simulation
-#SBATCH --output=cross-rid-simulation_%j.out
-#SBATCH --error=cross-rid-simulation_%j.err
+#SBATCH --output=cross-rid-simulation_%A_%a.out
+#SBATCH --error=cross-rid-simulation_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
 #SBATCH --mem=32G
-#SBATCH --time=120:00:00
+#SBATCH --time=48:00:00
+#SBATCH --array=0-9
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
@@ -13,12 +14,24 @@
 # SLURM automatically sets:
 #   SLURM_CPUS_PER_TASK
 # which your Python script can read for NUM_WORKERS.
+#
+# Job array: one task per DGP (index into DGPS below), each with its own
+# 48h limit. At 500 bootstraps / 100 models-per-class a cell takes ~16 min
+# (dominated by cross_family_unweighted), so one DGP's 84 cells (7 betas x 12
+# reps) is ~22h, versus ~225h for all 10 DGPs serially in one job.
+# All tasks share one --output-dir: each writes only its own
+# per_dgp/study_results_<dgp>.csv, and the combined tables are rebuilt from
+# whatever per-DGP files exist whenever a task finishes a DGP.
+#
+# Timed-out or failed tasks: resubmit with the same arguments -- cells already
+# checkpointed are skipped. To rerun specific DGPs only:
+#   sbatch --array=0,3 experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation.sl
 # -------------------------------------------------------
 
 set -euo pipefail
 
 echo "========================================"
-echo "Job ID:        $SLURM_JOB_ID"
+echo "Job ID:        $SLURM_JOB_ID (array ${SLURM_ARRAY_JOB_ID:-n/a}_${SLURM_ARRAY_TASK_ID:-n/a})"
 echo "Node:          $(hostname)"
 echo "CPUs per task: $SLURM_CPUS_PER_TASK"
 echo "Memory:        $SLURM_MEM_PER_NODE MB"
@@ -58,17 +71,24 @@ echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
 # --- Run the analysis ---
-# Benchmarks ground-truth feature recovery across five methods per simulated cell:
-# (1) cross-family RID (unweighted), (2) cross-family RID (weighted),
-# (3) stepwise logistic regression, (4) stepwise random forest,
-# (5) single-family RID on a fully enumerated decision-tree Rashomon set.
-# --include-redundant-dgps adds 4 diagnostic DGPs (chen/friedman with a
-# correlated duplicate of the true driver X1 at redundancy_corr 0.95/0.70) on
-# top of the standard 6, testing whether methods share importance credit
-# across a redundant pair instead of arbitrarily crediting only one.
+# Benchmarks ground-truth feature recovery across four methods per simulated cell:
+# (1) cross-family RID (unweighted), (2) stepwise logistic regression,
+# (3) stepwise random forest, (4) single-family RID on a fully enumerated
+# decision-tree Rashomon set.
+# The last 4 DGPs are the redundant-driver diagnostics (chen/friedman with a
+# correlated duplicate of the true driver X1 at redundancy_corr 0.95/0.70),
+# testing whether methods share importance credit across a redundant pair
+# instead of arbitrarily crediting only one.
+DGPS=(
+	chen friedman monk1 monk3 custom_nonlinear custom_sin_log
+	chen_redundant_r095 chen_redundant_r070 friedman_redundant_r095 friedman_redundant_r070
+)
+DGP="${DGPS[$SLURM_ARRAY_TASK_ID]}"
+echo "DGP:           $DGP"
+
 $PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation.py \
 	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation \
-	--include-redundant-dgps \
+	--dgps "$DGP" \
 	--bootstraps 500 \
 	--models-per-class 100 \
 	--num-workers "$SLURM_CPUS_PER_TASK"

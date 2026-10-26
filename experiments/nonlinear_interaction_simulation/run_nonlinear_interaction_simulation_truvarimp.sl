@@ -66,11 +66,14 @@ $PYTHON_ENV --version
 
 # --- Run the analysis ---
 # Same ground-truth-recovery study as run_nonlinear_interaction_simulation.sl,
-# except cross_family_unweighted/cross_family_weighted populate their
+# except cross_family_unweighted populates its
 # per-bootstrap candidate pool via joint TruVaRImp (CASH-style active search,
 # rid/truvarimp.py) instead of exhaustively refitting every grid point.
 # rid_tree (single-family RID) has no candidate_search option and stays on
 # the grid path, controlled by --models-per-class as before.
+# Results are checkpointed per DGP after every cell; if this times out,
+# resubmit unchanged (finished cells are skipped) or add --dgps <name ...> to
+# target specific DGPs.
 $PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation_truvarimp.py \
 	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation_truvarimp \
 	--include-redundant-dgps \
