@@ -10,9 +10,11 @@ that competes every family's best next candidate against each other.
 
 Design choice -- this module only decides WHICH hyperparameter configuration to
 spend a real model fit on next. Every evaluated candidate is actually fit on
-X_boot/y_boot and scored with the real training log-loss, exactly like
-GridCandidateTrainer. Rashomon-set membership downstream in rid/core.py is still
-decided from that exact observed loss (`loss <= global_min_loss + epsilon`), never
+X_boot/y_boot and scored with its real log-loss on the bootstrap's out-of-bag
+rows (X_eval/y_eval), exactly like GridCandidateTrainer -- so the GP surrogate
+and the implicit threshold track the same held-out loss the exact filter uses.
+Rashomon-set membership downstream in rid/core.py is still decided from that
+exact observed loss (`loss <= global_min_loss + epsilon`), never
 from a GP posterior -- TruVaRImp here is an adaptive *search policy* over a much
 larger/continuous hyperparameter space, not a replacement for the exact filter.
 
@@ -37,9 +39,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
-from sklearn.metrics import log_loss
-
-from .models import GridCandidateTrainer
+from .models import GridCandidateTrainer, candidate_loss
 
 logger = logging.getLogger(__name__)
 
@@ -343,12 +343,12 @@ class _FamilySearchState:
         # y units as self.sigma2 (see the docstring's point 2).
         self._K_post_full = (kernel(self._X_gp) - K_cross_all.T @ K_inv_cross) * y_var_scale
 
-    def evaluate(self, idx, X_boot, y_boot, b, seed_offset, refit=True):
+    def evaluate(self, idx, X_boot, y_boot, X_eval, y_eval, b, seed_offset, refit=True):
         config = dict(self.candidate_configs[idx])
         random_state = b * _RANDOM_STATE_STRIDE + seed_offset
         model = self.build_estimator(config, random_state, {})
         model.fit(X_boot, y_boot)
-        loss = log_loss(y_boot, model.predict_proba(X_boot))
+        loss = candidate_loss(model, X_eval, y_eval)
 
         self.evaluated_idx.append(idx)
         self._evaluated_set.add(idx)
@@ -478,6 +478,8 @@ def run_joint_truvarimp(
     search_spaces,
     X_boot,
     y_boot,
+    X_eval,
+    y_eval,
     b,
     epsilon,
     config=None,
@@ -500,6 +502,8 @@ def run_joint_truvarimp(
         kwargs are dropped from its space rather than searched over.
     X_boot, y_boot : ndarray
         The bootstrap resample to fit candidates on.
+    X_eval, y_eval : ndarray
+        The bootstrap's out-of-bag rows, which every candidate's loss is scored on.
     b : int
         Bootstrap index, used to seed random draws/model random_state.
     epsilon : float
@@ -598,7 +602,7 @@ def run_joint_truvarimp(
             # SingleCandidateTrainer, or a custom trainer with no known
             # continuous space): fall back to its own .train() once, and fold
             # the result straight into the output rather than active-searching it.
-            models, losses = trainer.train(X_boot, y_boot, 1, b, model_kwargs)
+            models, losses = trainer.train(X_boot, y_boot, X_eval, y_eval, 1, b, model_kwargs)
             state = _FallbackFamilyState(family_name, models, losses)
             states.append(state)
             family_of_state[family_name] = family_name
@@ -628,6 +632,8 @@ def run_joint_truvarimp(
                 int(idx),
                 X_boot,
                 y_boot,
+                X_eval,
+                y_eval,
                 b,
                 seed_offset,
                 refit=(seed_offset == n_warmup - 1),
@@ -664,7 +670,9 @@ def run_joint_truvarimp(
             stop_reason = "no_candidate"
             break
 
-        best_state.evaluate(best_idx, X_boot, y_boot, b, seed_offset=len(best_state.evaluated_idx))
+        best_state.evaluate(
+            best_idx, X_boot, y_boot, X_eval, y_eval, b, seed_offset=len(best_state.evaluated_idx)
+        )
         total_evaluations += 1
 
     # --- harvest: actually fit the configurations the search believes are IN
@@ -674,7 +682,7 @@ def run_joint_truvarimp(
     # the confidently-good configurations the Rashomon filter downstream exists
     # to collect.
     n_harvest = _harvest_predicted_rashomon(
-        searchable, X_boot, y_boot, b, beta_sqrt, eps_rel, epsilon, harvest_budget
+        searchable, X_boot, y_boot, X_eval, y_eval, b, beta_sqrt, eps_rel, epsilon, harvest_budget
     )
 
     # --- collapse sub-family states back into the caller's family keys ---
@@ -735,7 +743,7 @@ def _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon):
 
 
 def _harvest_predicted_rashomon(
-    searchable, X_boot, y_boot, b, beta_sqrt, eps_rel, epsilon, harvest_budget
+    searchable, X_boot, y_boot, X_eval, y_eval, b, beta_sqrt, eps_rel, epsilon, harvest_budget
 ):
     """Spend the reserved budget fitting the best *predicted* configurations.
 
@@ -773,7 +781,7 @@ def _harvest_predicted_rashomon(
     evaluated = 0
     for _, _, idx, state in queue[:harvest_budget]:
         state.evaluate(
-            idx, X_boot, y_boot, b, seed_offset=len(state.evaluated_idx), refit=False
+            idx, X_boot, y_boot, X_eval, y_eval, b, seed_offset=len(state.evaluated_idx), refit=False
         )
         evaluated += 1
     return evaluated

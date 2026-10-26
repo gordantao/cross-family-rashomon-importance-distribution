@@ -253,6 +253,7 @@ def main():
 
     study_settings = {
         "candidate_search": "truvarimp_joint",
+        "rashomon_evaluation": "out_of_bag",
         "sample_size": args.sample_size,
         "repetitions_per_beta": args.repetitions,
         "bootstraps": args.bootstraps,

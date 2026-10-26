@@ -38,6 +38,17 @@ class FullyEnumeratedTreeClassifier(DecisionTreeClassifier):
     branch-and-bound tree enumerator (e.g. TreeFARMS/GOSDT)."""
 
 
+def candidate_loss(model, X_eval, y_eval):
+    """Log-loss of a fitted candidate on held-out (out-of-bag) rows.
+
+    This is the loss Rashomon-set membership is judged on. ``labels`` comes from
+    the model so the loss is defined even when the evaluation rows happen to
+    contain only one class.
+    """
+
+    return log_loss(y_eval, model.predict_proba(X_eval), labels=model.classes_)
+
+
 @dataclass(frozen=True)
 class GridCandidateTrainer:
     """Trainer for model families explored through a hyperparameter grid."""
@@ -46,7 +57,7 @@ class GridCandidateTrainer:
     random_state_multiplier: int
     build_estimator: Callable[..., Any]
 
-    def train(self, X_boot, y_boot, n_models_pool, b, model_kwargs):
+    def train(self, X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs):
         models = []
         losses = []
         per = max(1, n_models_pool // len(self.configs))
@@ -57,7 +68,7 @@ class GridCandidateTrainer:
                 clf = self.build_estimator(config, random_state, model_kwargs)
                 clf.fit(X_boot, y_boot)
                 models.append(clf)
-                losses.append(log_loss(y_boot, clf.predict_proba(X_boot)))
+                losses.append(candidate_loss(clf, X_eval, y_eval))
 
         return models, np.array(losses)
 
@@ -68,11 +79,11 @@ class SingleCandidateTrainer:
 
     build_estimator: Callable[..., Any]
 
-    def train(self, X_boot, y_boot, n_models_pool, b, model_kwargs):
+    def train(self, X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs):
         del n_models_pool, b
         clf = self.build_estimator(model_kwargs)
         clf.fit(X_boot, y_boot)
-        return [clf], np.array([log_loss(y_boot, clf.predict_proba(X_boot))])
+        return [clf], np.array([candidate_loss(clf, X_eval, y_eval)])
 
 
 def _normalize_search_grid(search_grid):
@@ -440,7 +451,8 @@ def resolve_model_config(model_config):
     return model_or_trainer, trainer, model_kwargs
 
 
-def train_candidate_models(model_trainer, X_boot, y_boot, n_models_pool, b, model_kwargs):
-    """Train the candidate model pool for a single bootstrap."""
+def train_candidate_models(model_trainer, X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs):
+    """Fit the candidate model pool for a single bootstrap on ``X_boot``/``y_boot``,
+    scoring each candidate's loss on the held-out ``X_eval``/``y_eval``."""
 
-    return model_trainer.train(X_boot, y_boot, n_models_pool, b, model_kwargs)
+    return model_trainer.train(X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs)

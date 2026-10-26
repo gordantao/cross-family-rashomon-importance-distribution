@@ -14,10 +14,10 @@ classification task (%F >= 50 vs. < 50):
 Every method's selected top-k feature set is scored with the SAME held-out
 cross-validated evaluator (logistic regression, proper k-fold CV) so the five
 methods are directly comparable. RID's own internal Rashomon-set performance
-stats (accuracy/AUPRC computed on the same bootstrap sample each model was
-fit on -- in-sample, not held-out) are recorded separately in
-run_settings.json for diagnostic purposes only; they are NOT comparable to
-the held-out CV scores and are not used to rank methods.
+stats (accuracy/AUPRC on each bootstrap's out-of-bag rows) are recorded
+separately in run_settings.json for diagnostic purposes only; they use a
+different evaluation protocol from the held-out CV scores and are not used
+to rank methods.
 
 Optional diagnostic (--inject-redundant-duplicate FEATURE): adds a
 correlated engineered duplicate of an existing real feature and reports each

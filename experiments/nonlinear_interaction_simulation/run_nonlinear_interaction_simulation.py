@@ -16,9 +16,9 @@ after every completed (dgp, beta, rep) cell, and a rerun into the same
 limit can simply be resubmitted (optionally restricted via --dgps).
 
 Ground-truth recovery (precision@k/recall@k/NDCG@k/exact-match vs. the known
-relevant features) is unaffected by RID's in-sample performance-metric
-caveat (see rid/core.py) since it never touches predictive performance --
-only ranking overlap with ground truth.
+relevant features) only measures ranking overlap with ground truth, never
+predictive performance. RID judges Rashomon membership, VI and its own
+performance metrics on each bootstrap's out-of-bag rows (see rid/core.py).
 
 Usage:
     python run_nonlinear_interaction_simulation.py
@@ -1386,6 +1386,7 @@ def main():
     simulators = select_simulators(args.dgps, args.include_redundant_dgps)
 
     study_settings = {
+        "rashomon_evaluation": "out_of_bag",
         "sample_size": args.sample_size,
         "repetitions_per_beta": args.repetitions,
         "bootstraps": args.bootstraps,

@@ -718,6 +718,27 @@ def _log_bootstrap_summary(label, bootstrap_stats):
             )
 
 
+def _bootstrap_split(X_scaled, y, b):
+    """In-bag resample and out-of-bag rows for bootstrap ``b``.
+
+    The in-bag rows are exactly what ``resample(X_scaled, y, random_state=b)``
+    draws; the out-of-bag (OOB) rows -- about 1/e of the data -- are the ones it
+    never drew. Every candidate is fit in-bag and judged out-of-bag: Rashomon
+    membership, VI metrics and performance metrics all use the OOB rows, so a
+    model that memorizes its bootstrap can't win membership on training loss.
+
+    Returns ``None`` when the OOB rows hold fewer than two classes, since
+    log-loss-based membership and VI aren't meaningful there.
+    """
+
+    in_bag = resample(np.arange(len(y)), random_state=b)
+    oob_mask = np.ones(len(y), dtype=bool)
+    oob_mask[in_bag] = False
+    if np.unique(y[oob_mask]).size < 2:
+        return None
+    return X_scaled[in_bag], y[in_bag], X_scaled[oob_mask], y[oob_mask]
+
+
 def _run_single_bootstrap(
     b,
     X_scaled,
@@ -731,10 +752,13 @@ def _run_single_bootstrap(
     performance_metric_specs,
 ):
     rng = np.random.default_rng(seed=b)
-    X_boot, y_boot = resample(X_scaled, y, random_state=b)
+    split = _bootstrap_split(X_scaled, y, b)
+    if split is None:
+        return None, {"n_fits": 0, "rashomon_size": 0, "valid": False}
+    X_boot, y_boot, X_oob, y_oob = split
 
     models, losses = train_candidate_models(
-        model_trainer, X_boot, y_boot, n_models_pool, b, model_kwargs
+        model_trainer, X_boot, y_boot, X_oob, y_oob, n_models_pool, b, model_kwargs
     )
 
     min_loss = np.min(losses)
@@ -759,7 +783,7 @@ def _run_single_bootstrap(
         for metric_name, metric_fn in vi_metric_specs:
             metric_values[metric_name] = _coerce_importance_values(
                 metric_name,
-                _call_metric(metric_fn, model=model, X=X_boot, y=y_boot, rng=rng),
+                _call_metric(metric_fn, model=model, X=X_oob, y=y_oob, rng=rng),
                 len(feature_names),
             )
 
@@ -770,16 +794,16 @@ def _run_single_bootstrap(
                         float(metric_values[metric_name][index])
                     )
 
-        y_pred = model.predict(X_boot)
-        y_prob = model.predict_proba(X_boot)
+        y_pred = model.predict(X_oob)
+        y_prob = model.predict_proba(X_oob)
         for metric_name, metric_fn in performance_metric_specs:
             metric_value = _coerce_performance_value(
                 metric_name,
                 _call_metric(
                     metric_fn,
                     model=model,
-                    X=X_boot,
-                    y=y_boot,
+                    X=X_oob,
+                    y=y_oob,
                     y_pred=y_pred,
                     y_prob=y_prob,
                     rng=rng,
@@ -807,7 +831,15 @@ def _run_single_bootstrap_cross_family(
     truvarimp_config=None,
 ):
     rng = np.random.default_rng(seed=b)
-    X_boot, y_boot = resample(X_scaled, y, random_state=b)
+    split = _bootstrap_split(X_scaled, y, b)
+    if split is None:
+        return (None, None, None, None), {
+            "n_fits": {name: 0 for name in model_configs},
+            "rashomon_size": {name: 0 for name in model_configs},
+            "truvarimp": None,
+            "valid": False,
+        }
+    X_boot, y_boot, X_oob, y_oob = split
 
     search_stats = None
     if candidate_search == "truvarimp_joint":
@@ -816,6 +848,8 @@ def _run_single_bootstrap_cross_family(
             search_spaces or {},
             X_boot,
             y_boot,
+            X_oob,
+            y_oob,
             b,
             epsilon,
             truvarimp_config,
@@ -826,7 +860,7 @@ def _run_single_bootstrap_cross_family(
         family_losses = {}
         for name, (trainer, kwargs) in model_configs.items():
             models, losses = train_candidate_models(
-                trainer, X_boot, y_boot, n_models_per_class, b, kwargs
+                trainer, X_boot, y_boot, X_oob, y_oob, n_models_per_class, b, kwargs
             )
             family_models[name] = models
             family_losses[name] = losses
@@ -907,7 +941,7 @@ def _run_single_bootstrap_cross_family(
         for metric_name, metric_fn in vi_metric_specs:
             metric_values[metric_name] = _coerce_importance_values(
                 metric_name,
-                _call_metric(metric_fn, model=model, X=X_boot, y=y_boot, rng=rng),
+                _call_metric(metric_fn, model=model, X=X_oob, y=y_oob, rng=rng),
                 len(feature_names),
             )
 
@@ -918,16 +952,16 @@ def _run_single_bootstrap_cross_family(
                         float(metric_values[metric_name][index])
                     )
 
-        y_pred = model.predict(X_boot)
-        y_prob = model.predict_proba(X_boot)
+        y_pred = model.predict(X_oob)
+        y_prob = model.predict_proba(X_oob)
         for metric_name, metric_fn in performance_metric_specs:
             metric_value = _coerce_performance_value(
                 metric_name,
                 _call_metric(
                     metric_fn,
                     model=model,
-                    X=X_boot,
-                    y=y_boot,
+                    X=X_oob,
+                    y=y_oob,
                     y_pred=y_pred,
                     y_prob=y_prob,
                     rng=rng,
@@ -1082,7 +1116,7 @@ def compute_rid_cross_family(
       Rashomon threshold -- see ``rid.truvarimp`` for the algorithm and
       ``rid.truvarimp.DEFAULT_CONTINUOUS_SEARCH_SPACES_BY_NAME`` for the
       built-in per-family search spaces this falls back to. Every evaluated
-      candidate is still fit for real and scored by exact training log-loss;
+      candidate is still fit for real and scored by its exact out-of-bag log-loss;
       only the search policy differs. A family's config mapping can override
       the default search space with a ``"truvarimp_search_space"`` key
       (a :class:`rid.truvarimp.ContinuousSearchSpace`). ``n_models_per_class``
