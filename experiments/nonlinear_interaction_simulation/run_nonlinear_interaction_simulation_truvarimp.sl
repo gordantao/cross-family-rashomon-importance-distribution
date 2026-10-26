@@ -39,11 +39,17 @@ module purge
 # --- Change to the working directory ---
 cd "$SLURM_SUBMIT_DIR"
 
-# --- Explicitly set thread counts to match SLURM allocation ---
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
+# --- One BLAS/OpenMP thread per process ---
+# Parallelism comes from joblib worker processes (n_jobs = SLURM_CPUS_PER_TASK).
+# joblib would cap each worker's BLAS pool at cpu_count // n_jobs, but defers
+# to these variables when they're set -- setting them to SLURM_CPUS_PER_TASK
+# gave every worker its own N-thread pool, i.e. N^2 threads on N cores (a
+# ~400x slowdown of TruVaRImp's GP math; see
+# experiments/nonlinear_interaction_simulation/profile_truvarimp.py).
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 
 # --- Real-time logging, no warning spam ---
 # Unbuffered stdout so progress lines reach the .out file as they happen

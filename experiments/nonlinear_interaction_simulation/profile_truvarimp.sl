@@ -1,0 +1,78 @@
+#!/bin/bash
+#SBATCH --job-name=profile-truvarimp
+#SBATCH --output=profile-truvarimp_%j.out
+#SBATCH --error=profile-truvarimp_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=32G
+#SBATCH --time=06:00:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=gtao@unc.edu
+
+# -------------------------------------------------------
+# SLURM automatically sets:
+#   SLURM_CPUS_PER_TASK
+# which your Python script can read for NUM_WORKERS.
+# -------------------------------------------------------
+
+set -euo pipefail
+
+echo "========================================"
+echo "Job ID:        $SLURM_JOB_ID"
+echo "Node:          $(hostname)"
+echo "CPUs per task: $SLURM_CPUS_PER_TASK"
+echo "Memory:        $SLURM_MEM_PER_NODE MB"
+echo "Submit dir:    $SLURM_SUBMIT_DIR"
+echo "Start time:    $(date)"
+echo "========================================"
+
+# --- Clean module environment ---
+module purge
+
+# --- Change to the working directory ---
+cd "$SLURM_SUBMIT_DIR"
+
+# --- Thread env: deliberately the OLD production setting ---
+# Every other .sl now exports these as 1. This one keeps them at
+# SLURM_CPUS_PER_TASK so the parallel probe's "env" run reproduces the
+# oversubscribed configuration the TruVaRImp job originally ran under.
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+# --- Real-time logging, no warning spam ---
+# Unbuffered stdout so progress lines reach the .out file as they happen
+# rather than only when Python's 8KB block buffer fills. PYTHONWARNINGS is
+# inherited by every joblib worker process, where nearly all sklearn
+# ConvergenceWarning/FutureWarning output originates (each script and
+# rid.compute_rid* also ignore warnings in-process; this is belt-and-braces).
+export PYTHONUNBUFFERED=1
+export PYTHONWARNINGS=ignore
+
+echo "Thread settings:"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
+echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"
+
+# --- Use Python directly from your conda environment ---
+PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab-nonlinear_interaction_simulation/bin/python"
+
+echo "Using python from: $PYTHON_ENV"
+$PYTHON_ENV --version
+
+# --- Run the profiler ---
+# Thread env above is the old production setting
+# (OMP/MKL/OPENBLAS_NUM_THREADS = SLURM_CPUS_PER_TASK), so the parallel
+# probe's "env" setting reproduces the oversubscribed run while "1" shows the
+# same wave with one BLAS thread per worker. Probe 1 (single) profiles 2
+# bootstraps in-process with BLAS capped at 1 thread.
+$PYTHON_ENV experiments/nonlinear_interaction_simulation/profile_truvarimp.py \
+	--output-dir experiments/nonlinear_interaction_simulation/results/profile_truvarimp \
+	--probe both \
+	--bootstraps 2 \
+	--n-jobs "$SLURM_CPUS_PER_TASK" \
+	--inner-threads 1 env
+
+echo "========================================"
+echo "End time: $(date)"
+echo "========================================"
