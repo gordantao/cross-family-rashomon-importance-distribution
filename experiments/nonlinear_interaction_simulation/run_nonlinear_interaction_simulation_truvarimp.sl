@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=cross-rid-simulation-truvarimp
-#SBATCH --output=cross-rid-simulation-truvarimp_%j.out
-#SBATCH --error=cross-rid-simulation-truvarimp_%j.err
+#SBATCH --output=cross-rid-simulation-truvarimp_%A_%a.out
+#SBATCH --error=cross-rid-simulation-truvarimp_%A_%a.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=250
-#SBATCH --mem=200G
-#SBATCH --time=120:00:00
+#SBATCH --cpus-per-task=50
+#SBATCH --mem=32G
+#SBATCH --time=48:00:00
+#SBATCH --array=0-9
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
@@ -14,18 +15,22 @@
 #   SLURM_CPUS_PER_TASK
 # which your Python script can read for NUM_WORKERS.
 #
-# --cpus-per-task=250 requests 250 cores on a SINGLE node (--ntasks=1); every
-# other .sl in this repo runs at 50. An earlier 250-cpu attempt at --mem=32G
-# (128MB/core) OOM-killed the job within 30s -- one oom_kill per joblib worker
-# from baseline numpy/sklearn/pandas import overhead alone -- so memory is
-# raised to 200G (~800MB/core, above the 640MB/core the 50-cpu/32G scripts
-# have been stable at).
+# Job array: one task per DGP (index into DGPS below), same layout as
+# run_nonlinear_interaction_simulation.sl. This used to be one 250-cpu/200G
+# job, which (a) was ~400x slower than necessary from BLAS oversubscription
+# (fixed below) and (b) sat pending for lack of a node with 250 free cores.
+# 50 cpus/32G per task is the configuration the base array schedules
+# immediately and runs stably at (640MB/core).
+#
+# Timed-out or failed tasks: resubmit with the same arguments -- cells already
+# checkpointed are skipped. To rerun specific DGPs only:
+#   sbatch --array=0,3 experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation_truvarimp.sl
 # -------------------------------------------------------
 
 set -euo pipefail
 
 echo "========================================"
-echo "Job ID:        $SLURM_JOB_ID"
+echo "Job ID:        $SLURM_JOB_ID (array ${SLURM_ARRAY_JOB_ID:-n/a}_${SLURM_ARRAY_TASK_ID:-n/a})"
 echo "Node:          $(hostname)"
 echo "CPUs per task: $SLURM_CPUS_PER_TASK"
 echo "Memory:        $SLURM_MEM_PER_NODE MB"
@@ -77,12 +82,16 @@ $PYTHON_ENV --version
 # rid/truvarimp.py) instead of exhaustively refitting every grid point.
 # rid_tree (single-family RID) has no candidate_search option and stays on
 # the grid path, controlled by --models-per-class as before.
-# Results are checkpointed per DGP after every cell; if this times out,
-# resubmit unchanged (finished cells are skipped) or add --dgps <name ...> to
-# target specific DGPs.
+DGPS=(
+	chen friedman monk1 monk3 custom_nonlinear custom_sin_log
+	chen_redundant_r095 chen_redundant_r070 friedman_redundant_r095 friedman_redundant_r070
+)
+DGP="${DGPS[$SLURM_ARRAY_TASK_ID]}"
+echo "DGP:           $DGP"
+
 $PYTHON_ENV experiments/nonlinear_interaction_simulation/run_nonlinear_interaction_simulation_truvarimp.py \
 	--output-dir experiments/nonlinear_interaction_simulation/results/nonlinear_interaction_simulation_truvarimp \
-	--include-redundant-dgps \
+	--dgps "$DGP" \
 	--bootstraps 500 \
 	--truvarimp-total-budget 300 \
 	--models-per-class 100 \
