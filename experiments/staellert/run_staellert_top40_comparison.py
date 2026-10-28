@@ -2,20 +2,27 @@
 """Run Staellert direct target prediction tasks with feature selection.
 
 This script is classification-only (regression-task support was removed --
-see TASK_REGISTRY) and compares five top-k feature sets:
-1) Forward stepwise selection scored via random forest.
-2) Forward stepwise selection scored via logistic regression.
-3) Single-family RID on a fully enumerated decision-tree Rashomon set.
-4) Cross-family RID with family_balance_mode='unweighted'.
-5) Cross-family RID with family_balance_mode='weighted'.
+see TASK_REGISTRY) and compares five top-k feature sets (METHODS):
+1) stepwise_rf: forward stepwise selection scored via random forest.
+2) stepwise_logreg: forward stepwise selection scored via logistic regression.
+3) rid_tree: single-family RID on a fully enumerated decision-tree Rashomon set.
+4) cross_family_unweighted: cross-family RID, exhaustive grid candidate search.
+5) cross_family_unweighted_truvarimp: cross-family RID, joint TruVaRImp
+   candidate search (candidate_search='truvarimp_joint', rid/truvarimp.py).
+The weighted cross-family variant was dropped, as in the nonlinear simulation.
 
-Every method's selected top-k feature set is scored with the SAME held-out
-cross-validated evaluator (logistic regression, proper k-fold CV) so all five
-methods are directly comparable. RID's own internal Rashomon-set performance
-stats (accuracy/AUPRC computed on the same bootstrap sample each model was
-fit on -- in-sample, not held-out) are recorded separately in
-run_settings.json for diagnostic purposes only; they are NOT comparable to
-the held-out CV scores and are not used to rank methods.
+Every method's selected top-k feature set is scored with the SAME panel of
+held-out cross-validated evaluators so all methods are directly comparable.
+RID's own Rashomon-set performance stats (accuracy/AUPRC on each bootstrap's
+out-of-bag rows) are recorded in run_settings.json for diagnostics only; they
+come from a different protocol than the evaluator panel and are not used to
+rank methods.
+
+Each method is checkpointed separately (<task>/<method>_result.json plus
+<method>_top_features.csv), so --methods can run any subset -- e.g. one method
+per SLURM array task -- and reruns skip methods already checkpointed. Once
+every method has a checkpoint, the combined outputs (top_feature_overlap.csv,
+run_settings.json, overall_task_summary.csv) are (re)built.
 
 Default task is the classification target directly annotated in the
 paper-style dataset: annotated_phase.
@@ -26,7 +33,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +83,29 @@ KNOWN_TARGET_COLUMNS = {
     "annotated age",
 }
 
+METHODS = (
+    "stepwise_rf",
+    "stepwise_logreg",
+    "rid_tree",
+    "cross_family_unweighted",
+    "cross_family_unweighted_truvarimp",
+)
+
+# Arguments that change a method's result. A checkpoint written under different
+# values is refused rather than silently reused (n_jobs/logging/paths don't count).
+_DATA_SETTING_KEYS = ("top_k", "correlation_threshold", "include_phate_features", "random_state",
+                      "stepwise_cv_splits", "stepwise_scoring_classification")
+_STEPWISE_SETTING_KEYS = ("stepwise_n_estimators", "stepwise_max_depth", "stepwise_min_samples_leaf",
+                          "stepwise_class_weight", "stepwise_logreg_C")
+_RID_SETTING_KEYS = ("rid_metric", "rid_epsilon", "rid_n_bootstraps")
+METHOD_SETTING_KEYS = {
+    "stepwise_rf": _DATA_SETTING_KEYS + _STEPWISE_SETTING_KEYS,
+    "stepwise_logreg": _DATA_SETTING_KEYS + _STEPWISE_SETTING_KEYS,
+    "rid_tree": _DATA_SETTING_KEYS + _RID_SETTING_KEYS + ("rid_n_models_pool",),
+    "cross_family_unweighted": _DATA_SETTING_KEYS + _RID_SETTING_KEYS + ("rid_n_models_pool",),
+    "cross_family_unweighted_truvarimp": _DATA_SETTING_KEYS + _RID_SETTING_KEYS + ("truvarimp_total_budget",),
+}
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -81,7 +113,7 @@ def _parse_args() -> argparse.Namespace:
             "Run classification-only direct target prediction tasks on Staellert data, "
             "comparing random-forest and logistic-regression forward stepwise feature "
             "selection against single-family RID on a fully enumerated decision-tree "
-            "Rashomon set and cross-family RID (both unweighted and weighted balance modes)."
+            "Rashomon set and unweighted cross-family RID (grid and TruVaRImp candidate search)."
         )
     )
     parser.add_argument(
@@ -212,6 +244,26 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="RID parallel jobs (default: 1)",
+    )
+    parser.add_argument(
+        "--truvarimp-total-budget",
+        type=int,
+        default=300,
+        help=(
+            "Shared per-bootstrap real-fit budget across all families for "
+            "cross_family_unweighted_truvarimp (default: 300). That method ignores "
+            "--rid-n-models-pool."
+        ),
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=METHODS,
+        default=list(METHODS),
+        help=(
+            "Methods to run this invocation (default: all). Methods already "
+            "checkpointed in --output-dir are skipped."
+        ),
     )
 
     parser.add_argument(
@@ -586,8 +638,9 @@ def run_cross_family_rid(
     epsilon: float,
     n_bootstraps: int,
     n_models_per_class: int,
-    family_balance_mode: str,
     n_jobs: int,
+    candidate_search: str = "grid",
+    truvarimp_total_budget: int | None = None,
 ) -> tuple[list[str], pd.DataFrame, dict]:
     estimator = CrossFamilyRashomonImportanceDistribution(
         model_configs=_build_cross_family_model_configs(),
@@ -596,14 +649,18 @@ def run_cross_family_rid(
         n_models_per_class=n_models_per_class,
         vi_metrics=(rid_metric,),
         performance_metrics=("accuracy", "auprc"),
-        family_balance_mode=family_balance_mode,
+        family_balance_mode="unweighted",
         n_jobs=n_jobs,
+        candidate_search=candidate_search,
+        truvarimp_config=(
+            {"total_budget": truvarimp_total_budget} if candidate_search == "truvarimp_joint" else None
+        ),
     )
     estimator.fit(X, y)
 
     if estimator.metric_results_ is None:
         raise RuntimeError(
-            f"Cross-family RID ({family_balance_mode}) returned no metric results; "
+            f"Cross-family RID ({candidate_search}) returned no metric results; "
             "no valid Rashomon bootstraps were found"
         )
 
@@ -667,12 +724,16 @@ def _pairwise_overlap_counts(comparison: pd.DataFrame, method_names: list[str]) 
 
 
 def _summarize_cross_family_perf(perf_summary: dict) -> dict:
+    # Families with no Rashomon members report NaN stats; average only the rest.
     family_perf_stats = perf_summary.get("family_perf_stats") or {}
-    accuracy_means = [stats["accuracy_mean"] for stats in family_perf_stats.values()]
-    auprc_means = [stats["auprc_mean"] for stats in family_perf_stats.values()]
+
+    def _mean_over_families(key: str) -> float | None:
+        values = [stats[key] for stats in family_perf_stats.values() if not np.isnan(stats[key])]
+        return float(np.mean(values)) if values else None
+
     return {
-        "accuracy_mean": float(np.mean(accuracy_means)) if accuracy_means else None,
-        "auprc_mean": float(np.mean(auprc_means)) if auprc_means else None,
+        "accuracy_mean": _mean_over_families("accuracy_mean"),
+        "auprc_mean": _mean_over_families("auprc_mean"),
     }
 
 
@@ -754,12 +815,143 @@ def run_common_evaluation_panel(
     }
 
 
+def _write_json_atomic(payload: dict, path: Path) -> None:
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _write_csv_atomic(df: pd.DataFrame, path: Path) -> None:
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, path)
+
+
+def _method_settings(method: str, args: argparse.Namespace) -> dict:
+    settings = {key: getattr(args, key) for key in METHOD_SETTING_KEYS[method]}
+    if method.startswith(("rid_", "cross_family_")):
+        settings["rashomon_evaluation"] = "out_of_bag"
+    return settings
+
+
+def _method_result_path(task_output_dir: Path, method: str) -> Path:
+    return task_output_dir / f"{method}_result.json"
+
+
+def _load_method_checkpoint(task_output_dir: Path, method: str, args: argparse.Namespace) -> dict | None:
+    """Return a method's checkpoint, or None if absent. Refuse one written under different settings."""
+
+    path = _method_result_path(task_output_dir, method)
+    if not path.exists():
+        return None
+    checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    expected = json.loads(json.dumps(_method_settings(method, args)))
+    if checkpoint.get("settings") != expected:
+        raise SystemExit(
+            f"{path} was written with settings {checkpoint.get('settings')}, but this run uses "
+            f"{expected}. Use a different --output-dir, or delete the checkpoint to recompute."
+        )
+    return checkpoint
+
+
+def _run_method(
+    method: str,
+    X: pd.DataFrame,
+    y: pd.Series,
+    args: argparse.Namespace,
+    cv,
+    stepwise_scoring: str,
+) -> tuple[list[str], pd.DataFrame, dict]:
+    """Run one method; return (top_features, per-feature table, method-specific info)."""
+
+    if method in ("stepwise_rf", "stepwise_logreg"):
+        if method == "stepwise_rf":
+            model_cls, model_kwargs = _make_stepwise_rf_model(args)
+        else:
+            model_cls, model_kwargs = _make_stepwise_logreg_model(args)
+        logger.info(
+            f"[{method}] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
+            f"model={model_cls.__name__}"
+        )
+        features, history = run_forward_stepwise_selection(
+            X=X,
+            y=y,
+            top_k=args.top_k,
+            model_cls=model_cls,
+            model_kwargs=model_kwargs,
+            cv=cv,
+            scoring=stepwise_scoring,
+            n_jobs=args.stepwise_n_jobs,
+        )
+        search_eval = _evaluate_feature_set(
+            X=X, y=y, features=features,
+            model_cls=model_cls, model_kwargs=model_kwargs, cv=cv, scoring=stepwise_scoring,
+        )
+        info = {
+            "scoring": stepwise_scoring,
+            "model_kwargs": model_kwargs,
+            "search_model_evaluation": search_eval,
+        }
+        return features, history, info
+
+    if method == "rid_tree":
+        logger.info(
+            f"[rid_tree] metric={args.rid_metric} epsilon={args.rid_epsilon} "
+            f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
+        )
+        features, table, perf = run_single_family_tree_rid(
+            X=X,
+            y=y,
+            top_k=args.top_k,
+            rid_metric=args.rid_metric,
+            epsilon=args.rid_epsilon,
+            n_bootstraps=args.rid_n_bootstraps,
+            n_models_pool=args.rid_n_models_pool,
+            n_jobs=args.rid_n_jobs,
+        )
+        return features, table, {"metric": args.rid_metric, "rashomon_oob_perf_stats": perf}
+
+    candidate_search = "truvarimp_joint" if method == "cross_family_unweighted_truvarimp" else "grid"
+    logger.info(
+        f"[{method}] metric={args.rid_metric} epsilon={args.rid_epsilon} "
+        f"n_bootstraps={args.rid_n_bootstraps} candidate_search={candidate_search} "
+        + (
+            f"total_budget={args.truvarimp_total_budget}"
+            if candidate_search == "truvarimp_joint"
+            else f"n_models_per_class={args.rid_n_models_pool}"
+        )
+    )
+    features, table, perf = run_cross_family_rid(
+        X=X,
+        y=y,
+        top_k=args.top_k,
+        rid_metric=args.rid_metric,
+        epsilon=args.rid_epsilon,
+        n_bootstraps=args.rid_n_bootstraps,
+        n_models_per_class=args.rid_n_models_pool,
+        n_jobs=args.rid_n_jobs,
+        candidate_search=candidate_search,
+        truvarimp_total_budget=args.truvarimp_total_budget,
+    )
+    info = {
+        "metric": args.rid_metric,
+        "candidate_search": candidate_search,
+        "rashomon_oob_perf_stats": perf,
+    }
+    return features, table, info
+
+
 def _run_single_task(
     task_name: str,
     task_config: dict,
     args: argparse.Namespace,
     output_dir: Path,
-) -> dict:
+) -> dict | None:
+    """Run this invocation's --methods for one task, checkpointing each, then
+    assemble the combined outputs if every method in METHODS is checkpointed.
+    Returns the task's summary row, or None while methods are still missing."""
+
     task_output_dir = output_dir / task_name
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -771,6 +963,9 @@ def _run_single_task(
     logger.info(f"[task] {task_name}")
     logger.info(f"[task] file={csv_path}")
     logger.info(f"[task] target={target_column} task_type={task}")
+
+    # Refuse mismatched checkpoints before spending hours on anything else.
+    checkpoints = {method: _load_method_checkpoint(task_output_dir, method, args) for method in METHODS}
 
     X, y, data_meta = _prepare_task_dataset(
         csv_path=csv_path,
@@ -785,112 +980,55 @@ def _run_single_task(
     )
 
     cv, stepwise_scoring = _make_stepwise_cv_and_scoring(args, y)
-
-    # --- Method 1: forward stepwise selection via random forest ---
-    rf_model_cls, rf_model_kwargs = _make_stepwise_rf_model(args)
-    logger.info(
-        f"[stepwise:rf] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
-        f"n_estimators={args.stepwise_n_estimators}"
-    )
-    stepwise_rf_features, stepwise_rf_history = run_forward_stepwise_selection(
-        X=X,
-        y=y,
-        top_k=args.top_k,
-        model_cls=rf_model_cls,
-        model_kwargs=rf_model_kwargs,
-        cv=cv,
-        scoring=stepwise_scoring,
-        n_jobs=args.stepwise_n_jobs,
-    )
-    stepwise_rf_eval = _evaluate_feature_set(
-        X=X, y=y, features=stepwise_rf_features,
-        model_cls=rf_model_cls, model_kwargs=rf_model_kwargs, cv=cv, scoring=stepwise_scoring,
-    )
-    stepwise_rf_history.to_csv(task_output_dir / "stepwise_rf_top_features.csv", index=False)
-
-    # --- Method 2: forward stepwise selection via logistic regression ---
-    logreg_model_cls, logreg_model_kwargs = _make_stepwise_logreg_model(args)
-    logger.info(
-        f"[stepwise:logreg] scoring={stepwise_scoring} cv_splits={args.stepwise_cv_splits} "
-        f"model={logreg_model_cls.__name__}"
-    )
-    stepwise_logreg_features, stepwise_logreg_history = run_forward_stepwise_selection(
-        X=X,
-        y=y,
-        top_k=args.top_k,
-        model_cls=logreg_model_cls,
-        model_kwargs=logreg_model_kwargs,
-        cv=cv,
-        scoring=stepwise_scoring,
-        n_jobs=args.stepwise_n_jobs,
-    )
-    stepwise_logreg_eval = _evaluate_feature_set(
-        X=X, y=y, features=stepwise_logreg_features,
-        model_cls=logreg_model_cls, model_kwargs=logreg_model_kwargs, cv=cv, scoring=stepwise_scoring,
-    )
-    stepwise_logreg_history.to_csv(task_output_dir / "stepwise_logreg_top_features.csv", index=False)
-
-    method_feature_lists = {
-        "stepwise_rf": stepwise_rf_features,
-        "stepwise_logreg": stepwise_logreg_features,
-    }
-
-    # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
-    # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
-    logger.info(
-        f"[rid] metric={args.rid_metric} epsilon={args.rid_epsilon} "
-        f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
-    )
-    rid_tree_features, rid_tree_table, rid_tree_perf = run_single_family_tree_rid(
-        X=X,
-        y=y,
-        top_k=args.top_k,
-        rid_metric=args.rid_metric,
-        epsilon=args.rid_epsilon,
-        n_bootstraps=args.rid_n_bootstraps,
-        n_models_pool=args.rid_n_models_pool,
-        n_jobs=args.rid_n_jobs,
-    )
-    rid_tree_table.to_csv(task_output_dir / "rid_tree_top_features.csv", index=False)
-    method_feature_lists["rid_tree"] = rid_tree_features
-
-    cross_family_features: dict[str, list[str]] = {"unweighted": [], "weighted": []}
-    cross_family_perf: dict[str, dict] = {"unweighted": {}, "weighted": {}}
-    for balance_mode in ("unweighted", "weighted"):
-        logger.info(
-            f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
-            f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
-            f"family_balance_mode={balance_mode}"
-        )
-        features, table, perf = run_cross_family_rid(
-            X=X,
-            y=y,
-            top_k=args.top_k,
-            rid_metric=args.rid_metric,
-            epsilon=args.rid_epsilon,
-            n_bootstraps=args.rid_n_bootstraps,
-            n_models_per_class=args.rid_n_models_pool,
-            family_balance_mode=balance_mode,
-            n_jobs=args.rid_n_jobs,
-        )
-        table.to_csv(task_output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
-        cross_family_features[balance_mode] = features
-        cross_family_perf[balance_mode] = perf
-        method_feature_lists[f"cross_family_{balance_mode}"] = features
-
-    comparison = _build_comparison_table(method_feature_lists)
-    comparison.sort_values(
-        ["n_methods_selected", "stepwise_rf_rank"],
-        ascending=[False, True],
-    ).to_csv(task_output_dir / "top_feature_overlap.csv", index=False)
-    overlap_counts = _pairwise_overlap_counts(comparison, list(method_feature_lists.keys()))
-
-    # --- Common held-out CV evaluation: every method's features scored the same way,
-    # under a panel of evaluators spanning different inductive biases ---
     evaluator_panel = build_common_evaluator_panel(args.random_state)
-    common_eval = run_common_evaluation_panel(
-        X, y, method_feature_lists, evaluator_panel, cv, stepwise_scoring
+
+    for method in args.methods:
+        if checkpoints[method] is not None:
+            logger.info(f"[{method}] checkpoint found in {task_output_dir}; skipping")
+            continue
+
+        started = time.time()
+        features, table, info = _run_method(method, X, y, args, cv, stepwise_scoring)
+        elapsed = time.time() - started
+
+        # Common held-out CV evaluation: every method's features scored the same way,
+        # under a panel of evaluators spanning different inductive biases.
+        common_eval = run_common_evaluation_panel(
+            X, y, {method: features}, evaluator_panel, cv, stepwise_scoring
+        )[method]
+
+        _write_csv_atomic(table, task_output_dir / f"{method}_top_features.csv")
+        checkpoint = {
+            "settings": json.loads(json.dumps(_method_settings(method, args))),
+            "top_features": features,
+            "elapsed_seconds": elapsed,
+            "common_eval": common_eval,
+            **info,
+        }
+        _write_json_atomic(checkpoint, _method_result_path(task_output_dir, method))
+        checkpoints[method] = checkpoint
+
+        logger.info(f"[{method}] finished in {elapsed / 60.0:.1f} min; top-10: {features[:10]}")
+        for evaluator_name, _, _ in evaluator_panel:
+            evaluator_result = common_eval[evaluator_name]
+            logger.info(
+                f"       held-out CV [{evaluator_name}] ({stepwise_scoring}): "
+                f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
+            )
+
+    completed = {method: checkpoint for method, checkpoint in checkpoints.items() if checkpoint is not None}
+    missing = [method for method in METHODS if method not in completed]
+    if missing:
+        logger.info(f"[task] {task_name}: methods not yet checkpointed {missing}; skipping combined outputs")
+        return None
+
+    method_feature_lists = {method: completed[method]["top_features"] for method in METHODS}
+    comparison = _build_comparison_table(method_feature_lists)
+    _write_csv_atomic(
+        comparison.sort_values(["n_methods_selected", "stepwise_rf_rank"], ascending=[False, True]),
+        task_output_dir / "top_feature_overlap.csv",
     )
+    overlap_counts = _pairwise_overlap_counts(comparison, list(METHODS))
 
     settings = {
         "task_name": task_name,
@@ -908,54 +1046,15 @@ def _run_single_task(
                 "this panel (spanning linear, bagged-tree, and kernel-margin inductive "
                 "biases), so no method's score is an artifact of one evaluator's blind spot."
             ),
-            "results": common_eval,
+            "results": {method: completed[method]["common_eval"] for method in METHODS},
         },
-        "stepwise_rf": {
-            "scoring": stepwise_scoring,
-            "model_kwargs": rf_model_kwargs,
-            "top_features": stepwise_rf_features,
-            "search_model_evaluation": stepwise_rf_eval,
-        },
-        "stepwise_logreg": {
-            "scoring": stepwise_scoring,
-            "model_kwargs": logreg_model_kwargs,
-            "top_features": stepwise_logreg_features,
-            "search_model_evaluation": stepwise_logreg_eval,
-        },
-        "rid_tree": {
-            "metric": args.rid_metric,
-            "top_features": rid_tree_features,
-            "rashomon_train_perf_stats": rid_tree_perf,
-        },
-        "cross_family_unweighted": {
-            "metric": args.rid_metric,
-            "top_features": cross_family_features["unweighted"],
-            "rashomon_train_perf_stats": cross_family_perf["unweighted"],
-        },
-        "cross_family_weighted": {
-            "metric": args.rid_metric,
-            "top_features": cross_family_features["weighted"],
-            "rashomon_train_perf_stats": cross_family_perf["weighted"],
+        **{
+            method: {key: value for key, value in completed[method].items() if key != "common_eval"}
+            for method in METHODS
         },
         "overlap_counts": overlap_counts,
     }
-
-    settings_path = task_output_dir / "run_settings.json"
-    with settings_path.open("w", encoding="utf-8") as handle:
-        json.dump(settings, handle, indent=2)
-
-    logger.info(f"[task] outputs saved in {task_output_dir}")
-    for name, features in method_feature_lists.items():
-        logger.info(f"[task] {name} top-10: {features[:10]}")
-        for evaluator_name, _, _ in evaluator_panel:
-            evaluator_result = common_eval[name][evaluator_name]
-            logger.info(
-                f"       held-out CV [{evaluator_name}] ({stepwise_scoring}): "
-                f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
-            )
-
-    cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
-    cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"])
+    _write_json_atomic(settings, task_output_dir / "run_settings.json")
 
     row = {
         "task_name": task_name,
@@ -966,25 +1065,26 @@ def _run_single_task(
         "n_features": data_meta["n_features_after_corr"],
         "common_eval_scoring": stepwise_scoring,
     }
-    for name in method_feature_lists:
+    for method in METHODS:
         per_evaluator_means = []
         for evaluator_name, _, _ in evaluator_panel:
-            evaluator_result = common_eval[name][evaluator_name]
-            row[f"{name}_held_out_cv_score_mean__{evaluator_name}"] = evaluator_result["cv_score_mean"]
-            row[f"{name}_held_out_cv_score_std__{evaluator_name}"] = evaluator_result["cv_score_std"]
+            evaluator_result = completed[method]["common_eval"][evaluator_name]
+            row[f"{method}_held_out_cv_score_mean__{evaluator_name}"] = evaluator_result["cv_score_mean"]
+            row[f"{method}_held_out_cv_score_std__{evaluator_name}"] = evaluator_result["cv_score_std"]
             per_evaluator_means.append(evaluator_result["cv_score_mean"])
-        row[f"{name}_held_out_cv_score_mean_avg"] = float(np.mean(per_evaluator_means))
-    row.update(
-        {
-            "rid_tree_rashomon_train_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
-            "rid_tree_rashomon_train_auprc_mean": rid_tree_perf.get("auprc_mean"),
-            "cross_family_unweighted_rashomon_train_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
-            "cross_family_unweighted_rashomon_train_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
-            "cross_family_weighted_rashomon_train_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],
-            "cross_family_weighted_rashomon_train_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
-        }
-    )
+        row[f"{method}_held_out_cv_score_mean_avg"] = float(np.mean(per_evaluator_means))
+        row[f"{method}_elapsed_seconds"] = completed[method]["elapsed_seconds"]
+
+    rid_tree_perf = completed["rid_tree"]["rashomon_oob_perf_stats"]
+    row["rid_tree_rashomon_oob_accuracy_mean"] = rid_tree_perf.get("accuracy_mean")
+    row["rid_tree_rashomon_oob_auprc_mean"] = rid_tree_perf.get("auprc_mean")
+    for method in ("cross_family_unweighted", "cross_family_unweighted_truvarimp"):
+        cross_family_rashomon = _summarize_cross_family_perf(completed[method]["rashomon_oob_perf_stats"])
+        row[f"{method}_rashomon_oob_accuracy_mean"] = cross_family_rashomon["accuracy_mean"]
+        row[f"{method}_rashomon_oob_auprc_mean"] = cross_family_rashomon["auprc_mean"]
     row.update(overlap_counts)
+
+    logger.info(f"[task] combined outputs saved in {task_output_dir}")
     return row
 
 
@@ -1001,9 +1101,11 @@ def main() -> None:
     logger.info("Staellert Direct Target Prediction Tasks")
     logger.info(f"  data_dir:                 {args.data_dir}")
     logger.info(f"  tasks:                    {task_names}")
+    logger.info(f"  methods:                  {args.methods}")
     logger.info(f"  top_k:                    {args.top_k}")
     logger.info(f"  correlation_threshold:    {args.correlation_threshold}")
     logger.info(f"  include_phate_features:   {args.include_phate_features}")
+    logger.info(f"  truvarimp_total_budget:   {args.truvarimp_total_budget}")
     logger.info(f"  output_dir:               {output_dir}")
     logger.info("=" * 70)
 
@@ -1015,19 +1117,26 @@ def main() -> None:
             args=args,
             output_dir=output_dir,
         )
-        overall_rows.append(row)
+        if row is not None:
+            overall_rows.append(row)
+
+    if len(overall_rows) < len(task_names):
+        logger.info("=" * 70)
+        logger.info("Checkpoints saved; combined summary waits until every method has run for every task")
+        logger.info("=" * 70)
+        return
 
     overall_summary_path = output_dir / "overall_task_summary.csv"
-    pd.DataFrame(overall_rows).to_csv(overall_summary_path, index=False)
+    _write_csv_atomic(pd.DataFrame(overall_rows), overall_summary_path)
 
     run_manifest = {
         "args": vars(args),
         "tasks_run": task_names,
+        "methods": list(METHODS),
         "overall_summary_csv": str(overall_summary_path),
     }
     manifest_path = output_dir / "run_manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as handle:
-        json.dump(run_manifest, handle, indent=2)
+    _write_json_atomic(run_manifest, manifest_path)
 
     logger.info("=" * 70)
     logger.info("Completed")

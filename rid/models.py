@@ -96,15 +96,25 @@ def _normalize_search_grid(search_grid):
     return list(search_grid)
 
 
+# SAGA (the L1/elastic-net logistic solver) runs one pass over the data per
+# iteration. On larger data (e.g. Staellert, 2930 rows x 156 features) it needed
+# ~3,000-3,700 passes to reach tol -- 30-80s per fit, ~1/3 of a grid bootstrap --
+# while fits stopped at 1,000 passes had equal or lower held-out log-loss. Every
+# candidate is still judged on its actual OOB loss, so an early-stopped fit is a
+# legitimate (slightly more regularized) candidate, not an invalid one.
+SAGA_MAX_ITER = 1000
+
+
 def _build_logistic_estimator(config, random_state, model_kwargs):
     if isinstance(config, Mapping):
-        kwargs = {"max_iter": 100000, **config, **model_kwargs}
+        kwargs = {**config, **model_kwargs}
         # Mirror the tuple branch's solver/l1_ratio handling: a mapping config
         # that only names {"C", "penalty"} (e.g. one sampled by
         # rid.truvarimp's continuous search space) would otherwise inherit
         # sklearn's default lbfgs solver, which rejects every penalty except
         # "l2"/None, and would omit the l1_ratio that "elasticnet" requires.
         kwargs.setdefault("solver", "saga")
+        kwargs.setdefault("max_iter", SAGA_MAX_ITER if kwargs["solver"] == "saga" else 100000)
         if kwargs.get("penalty") == "elasticnet":
             kwargs.setdefault("l1_ratio", 0.5)
         return LogisticRegression(random_state=random_state, **kwargs)
@@ -114,7 +124,7 @@ def _build_logistic_estimator(config, random_state, model_kwargs):
         "penalty": penalty,
         "solver": "saga",
         "C": C,
-        "max_iter": 100000,
+        "max_iter": SAGA_MAX_ITER,
         **model_kwargs,
     }
     if penalty == "elasticnet":
@@ -185,7 +195,7 @@ def _build_lasso_estimator(config, random_state, model_kwargs):
         return LassoClassifier(
             solver="saga",
             penalty="l1",
-            max_iter=100000,
+            max_iter=SAGA_MAX_ITER,
             random_state=random_state,
             **config,
             **model_kwargs,
@@ -195,7 +205,7 @@ def _build_lasso_estimator(config, random_state, model_kwargs):
         penalty="l1",
         solver="saga",
         C=config,
-        max_iter=100000,
+        max_iter=SAGA_MAX_ITER,
         random_state=random_state,
         **model_kwargs,
     )
@@ -206,7 +216,7 @@ def _build_elastic_net_estimator(config, random_state, model_kwargs):
         return ElasticNetClassifier(
             solver="saga",
             penalty="elasticnet",
-            max_iter=100000,
+            max_iter=SAGA_MAX_ITER,
             random_state=random_state,
             **config,
             **model_kwargs,
@@ -218,7 +228,7 @@ def _build_elastic_net_estimator(config, random_state, model_kwargs):
         solver="saga",
         C=C,
         l1_ratio=l1_ratio,
-        max_iter=100000,
+        max_iter=SAGA_MAX_ITER,
         random_state=random_state,
         **model_kwargs,
     )
