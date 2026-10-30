@@ -4,7 +4,7 @@
 #SBATCH --error=top40-feature-comparison_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=32G
+#SBATCH --mem=96G
 #SBATCH --time=48:00:00
 #SBATCH --array=0-4
 #SBATCH --mail-type=END,FAIL
@@ -20,6 +20,11 @@
 # finishes; whichever task finishes last finds all five checkpoints and builds
 # the combined outputs (top_feature_overlap.csv, run_settings.json,
 # overall_task_summary.csv).
+#
+# Memory: 96G, not 32G. The grid cross-family task holds each bootstrap's full
+# candidate pool (~520 fitted models, ~0.5GB -- mostly unbounded-depth random
+# forests) in every one of its 50 workers at once; at 32G it was OOM-killed
+# (MaxRSS 33.5G, job 7128947_3). TruVaRImp peaked at 19.5G.
 #
 # Timed-out or failed tasks: resubmit -- checkpointed methods are skipped. To
 # rerun specific methods only:
