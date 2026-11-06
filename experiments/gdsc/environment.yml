@@ -1,0 +1,17 @@
+name: zikry_lab-gdsc
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - numpy>=1.26
+  - pandas>=2.1
+  - scikit-learn>=1.4
+  - joblib>=1.4        # bundled with scikit-learn; >=1.4 for Parallel(return_as="generator_unordered")
+  - openpyxl>=3.1      # reads GDSC's .xlsx dose-response and cell-line files
+  - kneed>=0.8          # Kneedle elbow detection for --correlation-threshold auto
+  - pip
+
+# Covers: download_gdsc_data.sh (curl only), prepare_gdsc_data.py and
+# run_gdsc_top40_comparison.py. The scripts import the shared `rid` package from
+# the repo root at runtime via a sys.path insert, so `rid` is not listed here.

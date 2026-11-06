@@ -1016,6 +1016,9 @@ def _run_single_task(
                 f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
             )
 
+    # Re-read: array tasks for the other methods run concurrently and may have
+    # checkpointed since this invocation started.
+    checkpoints = {method: _load_method_checkpoint(task_output_dir, method, args) for method in METHODS}
     completed = {method: checkpoint for method, checkpoint in checkpoints.items() if checkpoint is not None}
     missing = [method for method in METHODS if method not in completed]
     if missing:
