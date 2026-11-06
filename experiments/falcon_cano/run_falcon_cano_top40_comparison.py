@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 import logging
 import sys
 import time
@@ -56,6 +57,8 @@ from joblib import Parallel, delayed
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -610,7 +613,26 @@ def _summarize_cross_family_perf(perf_summary: dict) -> dict:
     }
 
 
-def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dict]]:
+def scaled_logistic_regression(**kwargs):
+    """LogisticRegression behind a StandardScaler, fit inside each CV fold.
+
+    Falcon-Cano descriptor SDs span ~4 orders of magnitude (fr_azide ~0.03,
+    BertzCT ~380) and Ipc reaches ~1e16. Unscaled, the L2 penalty makes
+    small-scale descriptors expensive to use, so selection and scoring favor
+    large-scale ones regardless of signal.
+    """
+
+    return make_pipeline(StandardScaler(), LogisticRegression(**kwargs))
+
+
+def scaled_rbf_svc(**kwargs):
+    """RBF SVC behind a StandardScaler: unscaled, kernel distances are dominated by
+    the largest-scale descriptor (Ipc), so the SVM sees little else."""
+
+    return make_pipeline(StandardScaler(), SVC(**kwargs))
+
+
+def build_common_evaluator_panel(random_state: int) -> list[tuple[str, Callable, dict]]:
     """Three fixed evaluators spanning distinct inductive biases, so a feature
     set's held-out score isn't an artifact of one model's blind spots (e.g. a
     linear-only evaluator can't reward features whose signal is nonlinear or
@@ -623,7 +645,7 @@ def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dic
     return [
         (
             "logreg",
-            LogisticRegression,
+            scaled_logistic_regression,
             {"penalty": "l2", "C": 1.0, "solver": "lbfgs", "max_iter": 100000, "random_state": random_state},
         ),
         (
@@ -633,7 +655,7 @@ def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dic
         ),
         (
             "svm_rbf",
-            SVC,
+            scaled_rbf_svc,
             {"kernel": "rbf", "C": 1.0, "gamma": "scale", "random_state": random_state},
         ),
     ]
@@ -643,7 +665,7 @@ def run_common_evaluation_panel(
     X: pd.DataFrame,
     y: pd.Series,
     method_feature_lists: dict[str, list[str]],
-    evaluators: list[tuple[str, type, dict]],
+    evaluators: list[tuple[str, Callable, dict]],
     cv,
     scoring: str,
 ) -> dict[str, dict[str, dict]]:
@@ -857,7 +879,7 @@ def main() -> None:
             features = reordered
             signal_values = (
                 _compute_incremental_cv_curve(
-                    X, y, features, LogisticRegression, logreg_kwargs, cv, args.stepwise_scoring
+                    X, y, features, scaled_logistic_regression, logreg_kwargs, cv, args.stepwise_scoring
                 )
                 if auto_k_selection
                 else None
@@ -882,7 +904,7 @@ def main() -> None:
         X=X,
         y=y,
         top_k=selection_top_k,
-        model_cls=LogisticRegression,
+        model_cls=scaled_logistic_regression,
         model_kwargs=logreg_kwargs,
         cv=cv,
         scoring=args.stepwise_scoring,
@@ -895,7 +917,7 @@ def main() -> None:
         "cv_gain",
     )
     stepwise_logreg_eval = _evaluate_feature_set(
-        X, y, stepwise_logreg_features, LogisticRegression, logreg_kwargs, cv, args.stepwise_scoring
+        X, y, stepwise_logreg_features, scaled_logistic_regression, logreg_kwargs, cv, args.stepwise_scoring
     )
     stepwise_logreg_history.head(len(stepwise_logreg_features)).to_csv(
         output_dir / "stepwise_logreg_top_features.csv", index=False

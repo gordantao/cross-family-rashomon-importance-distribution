@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 import logging
 import os
 import sys
@@ -44,6 +45,8 @@ from joblib import Parallel, delayed
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -485,9 +488,28 @@ def _make_stepwise_rf_model(args: argparse.Namespace):
     }
 
 
+def scaled_logistic_regression(**kwargs):
+    """LogisticRegression behind a StandardScaler, fit inside each CV fold.
+
+    Staellert feature SDs span ~7 orders of magnitude (Cell area ~1.7e3, most
+    marker medians ~1e-3). Unscaled, the L2 penalty makes small-scale features
+    expensive to use, so selection and scoring favor large-scale features
+    regardless of signal.
+    """
+
+    return make_pipeline(StandardScaler(), LogisticRegression(**kwargs))
+
+
+def scaled_rbf_svc(**kwargs):
+    """RBF SVC behind a StandardScaler: unscaled, kernel distances are dominated by
+    the largest-scale features (cell/nuclear area), so the SVM sees little else."""
+
+    return make_pipeline(StandardScaler(), SVC(**kwargs))
+
+
 def _make_stepwise_logreg_model(args: argparse.Namespace):
     class_weight = None if str(args.stepwise_class_weight).lower() == "none" else args.stepwise_class_weight
-    return LogisticRegression, {
+    return scaled_logistic_regression, {
         "C": args.stepwise_logreg_C,
         "max_iter": 100000,
         "random_state": args.random_state,
@@ -764,7 +786,13 @@ def _evaluate_feature_set(
     }
 
 
-def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dict]]:
+# Bump when the evaluator panel changes: checkpoints scored under an older panel
+# are re-scored on load (cheap -- the feature lists themselves are unchanged).
+# v2 (2026-11-06): logreg and svm_rbf standardize features inside each fold.
+EVALUATOR_PANEL_VERSION = 2
+
+
+def build_common_evaluator_panel(random_state: int) -> list[tuple[str, Callable, dict]]:
     """Three fixed evaluators spanning distinct inductive biases, so a feature
     set's held-out score isn't an artifact of one model's blind spots (e.g. a
     linear-only evaluator can't reward features whose signal is nonlinear or
@@ -777,7 +805,7 @@ def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dic
     return [
         (
             "logreg",
-            LogisticRegression,
+            scaled_logistic_regression,
             {"penalty": "l2", "C": 1.0, "solver": "lbfgs", "max_iter": 100000, "random_state": random_state},
         ),
         (
@@ -787,7 +815,7 @@ def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dic
         ),
         (
             "svm_rbf",
-            SVC,
+            scaled_rbf_svc,
             {"kernel": "rbf", "C": 1.0, "gamma": "scale", "random_state": random_state},
         ),
     ]
@@ -797,7 +825,7 @@ def run_common_evaluation_panel(
     X: pd.DataFrame,
     y: pd.Series,
     method_feature_lists: dict[str, list[str]],
-    evaluators: list[tuple[str, type, dict]],
+    evaluators: list[tuple[str, Callable, dict]],
     cv,
     scoring: str,
 ) -> dict[str, dict[str, dict]]:
@@ -830,6 +858,9 @@ def _write_csv_atomic(df: pd.DataFrame, path: Path) -> None:
 
 def _method_settings(method: str, args: argparse.Namespace) -> dict:
     settings = {key: getattr(args, key) for key in METHOD_SETTING_KEYS[method]}
+    if method == "stepwise_logreg":
+        # Added 2026-11-06; checkpoints from the unscaled selection model lack it and are refused.
+        settings["selection_model_scaling"] = "standardized_per_fold"
     if method.startswith(("rid_", "cross_family_")):
         settings["rashomon_evaluation"] = "out_of_bag"
     return settings
@@ -840,7 +871,13 @@ def _method_result_path(task_output_dir: Path, method: str) -> Path:
 
 
 def _load_method_checkpoint(task_output_dir: Path, method: str, args: argparse.Namespace) -> dict | None:
-    """Return a method's checkpoint, or None if absent. Refuse one written under different settings."""
+    """Return a method's checkpoint, or None if absent.
+
+    A checkpoint written under different settings is refused (SystemExit) if this
+    invocation runs that method, so hours aren't spent next to a stale result. For
+    another method's checkpoint it's only treated as missing, so e.g. a stale
+    stepwise_logreg checkpoint doesn't stop the rid_tree array task.
+    """
 
     path = _method_result_path(task_output_dir, method)
     if not path.exists():
@@ -848,11 +885,30 @@ def _load_method_checkpoint(task_output_dir: Path, method: str, args: argparse.N
     checkpoint = json.loads(path.read_text(encoding="utf-8"))
     expected = json.loads(json.dumps(_method_settings(method, args)))
     if checkpoint.get("settings") != expected:
+        if method not in args.methods:
+            logger.warning(f"[{method}] {path} has stale settings; treating it as not checkpointed")
+            return None
         raise SystemExit(
             f"{path} was written with settings {checkpoint.get('settings')}, but this run uses "
             f"{expected}. Use a different --output-dir, or delete the checkpoint to recompute."
         )
     return checkpoint
+
+
+def _refresh_common_eval(checkpoints, task_output_dir, X, y, evaluator_panel, cv, scoring) -> None:
+    """Re-score any checkpoint whose common_eval came from an older evaluator panel."""
+
+    for method, checkpoint in checkpoints.items():
+        if checkpoint is None or checkpoint.get("evaluator_panel_version") == EVALUATOR_PANEL_VERSION:
+            continue
+        logger.info(f"[{method}] re-scoring saved top-{len(checkpoint['top_features'])} under evaluator panel "
+                    f"v{EVALUATOR_PANEL_VERSION} (was v{checkpoint.get('evaluator_panel_version', 1)})")
+        checkpoint["common_eval_previous_panel"] = checkpoint.get("common_eval")
+        checkpoint["common_eval"] = run_common_evaluation_panel(
+            X, y, {method: checkpoint["top_features"]}, evaluator_panel, cv, scoring
+        )[method]
+        checkpoint["evaluator_panel_version"] = EVALUATOR_PANEL_VERSION
+        _write_json_atomic(checkpoint, _method_result_path(task_output_dir, method))
 
 
 def _run_method(
@@ -1003,6 +1059,7 @@ def _run_single_task(
             "top_features": features,
             "elapsed_seconds": elapsed,
             "common_eval": common_eval,
+            "evaluator_panel_version": EVALUATOR_PANEL_VERSION,
             **info,
         }
         _write_json_atomic(checkpoint, _method_result_path(task_output_dir, method))
@@ -1024,6 +1081,8 @@ def _run_single_task(
     if missing:
         logger.info(f"[task] {task_name}: methods not yet checkpointed {missing}; skipping combined outputs")
         return None
+    # Only the invocation that assembles the combined outputs re-scores stale checkpoints.
+    _refresh_common_eval(completed, task_output_dir, X, y, evaluator_panel, cv, stepwise_scoring)
 
     method_feature_lists = {method: completed[method]["top_features"] for method in METHODS}
     comparison = _build_comparison_table(method_feature_lists)
@@ -1044,6 +1103,8 @@ def _run_single_task(
                 for evaluator_name, model_cls, model_kwargs in evaluator_panel
             },
             "scoring": stepwise_scoring,
+            "evaluator_panel_version": EVALUATOR_PANEL_VERSION,
+            "rescored_methods": [m for m in METHODS if "common_eval_previous_panel" in completed[m]],
             "note": (
                 "Every method's selected top-k features scored under every evaluator in "
                 "this panel (spanning linear, bagged-tree, and kernel-margin inductive "

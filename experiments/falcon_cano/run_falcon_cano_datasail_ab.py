@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 import logging
 import sys
 import time
@@ -127,7 +128,7 @@ def evaluate_leakage_aware(
     X: pd.DataFrame,
     y: pd.Series,
     method_feature_lists: dict[str, list[str]],
-    evaluator_panel: list[tuple[str, type, dict]],
+    evaluator_panel: list[tuple[str, Callable, dict]],
     split_assignments: list[dict[str, str]],
 ) -> dict[str, dict[str, dict]]:
     per_run_scores = {
@@ -170,7 +171,7 @@ def evaluate_leaky(
     X: pd.DataFrame,
     y: pd.Series,
     method_feature_lists: dict[str, list[str]],
-    evaluator_panel: list[tuple[str, type, dict]],
+    evaluator_panel: list[tuple[str, Callable, dict]],
     cv,
     scoring: str,
 ) -> dict[str, dict[str, dict]]:

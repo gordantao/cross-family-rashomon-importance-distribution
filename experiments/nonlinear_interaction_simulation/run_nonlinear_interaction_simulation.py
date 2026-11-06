@@ -815,9 +815,13 @@ def log_cell_progress(completed, total_cells, cell_label, method_seconds, start)
 def build_common_evaluator_panel(random_state):
     """Three fixed evaluators spanning distinct inductive biases, so a
     feature set's held-out score isn't an artifact of one model's blind spots
-    -- identical panel to the Falcon-Cano/Staellert top-k comparison scripts'
-    build_common_evaluator_panel, so predictive-accuracy numbers from this
-    simulation stay comparable to those real-data studies."""
+    -- the same three models as the Falcon-Cano/Staellert top-k comparison
+    scripts' build_common_evaluator_panel, but NOT the same panel since
+    2026-11-06: those scripts now standardize features inside each fold for
+    logreg and svm_rbf (their descriptor/marker scales span 4-7 orders of
+    magnitude), while this one doesn't. Every simulated feature in a DGP shares
+    one distribution (uniform(0,1) or N(0,1)), so scaling matters little here,
+    but held-out logreg/svm_rbf numbers aren't strictly comparable across them."""
 
     return [
         (
