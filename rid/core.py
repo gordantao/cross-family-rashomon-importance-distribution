@@ -739,7 +739,11 @@ def _bootstrap_split(X_scaled, y, b):
     oob_mask = np.ones(len(y), dtype=bool)
     oob_mask[in_bag] = False
     n_classes = np.unique(y).size
-    if np.unique(y[in_bag]).size < n_classes or np.unique(y[oob_mask]).size < n_classes:
+    if (
+        n_classes < 2
+        or np.unique(y[in_bag]).size < n_classes
+        or np.unique(y[oob_mask]).size < n_classes
+    ):
         return None
     return X_scaled[in_bag], y[in_bag], X_scaled[oob_mask], y[oob_mask]
 
