@@ -908,12 +908,14 @@ def _run_single_bootstrap_cross_family(
             rashomon_labels.append(name)
 
     if family_balance_mode == "weighted":
-        family_sizes = {name: len(family_rashomon[name]) for name in non_empty_families}
-        inv_prop_sum = sum(1.0 / s for s in family_sizes.values())
+        # Each non-empty family gets total mass 1/K (K = non-empty families),
+        # split evenly over its s_f members: per-model weight 1/(K * s_f).
+        # Weights sum to 1 within this bootstrap.
+        n_families = len(non_empty_families)
         model_weights = []
         for name in non_empty_families:
-            size = family_sizes[name]
-            per_model_w = 1.0 / (size * size * inv_prop_sum)
+            size = len(family_rashomon[name])
+            per_model_w = 1.0 / (n_families * size)
             for _ in family_rashomon[name]:
                 model_weights.append(per_model_w)
     else:
@@ -1418,7 +1420,9 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
 
         - ``"unweighted"``: each Rashomon model contributes equally.
         - ``"weighted"``: each family contributes equal total mass per
-          bootstrap (models are reweighted inversely by family Rashomon count).
+          bootstrap: each model gets weight ``1 / (K * s_f)``, where ``s_f``
+          is its family's Rashomon count and ``K`` the number of families
+          with at least one Rashomon member in that bootstrap.
 
         If ``None``, this is normalized to ``"unweighted"``.
 
