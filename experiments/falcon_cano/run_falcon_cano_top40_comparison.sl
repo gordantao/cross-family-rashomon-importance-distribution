@@ -69,13 +69,17 @@ $PYTHON_ENV --version
 #           (3) single-family RID on a fully enumerated decision-tree Rashomon set,
 #           (4) cross-family RID (family_balance_mode=unweighted),
 #           (5) cross-family RID (family_balance_mode=weighted).
-# Every method's selected features are scored by the same held-out CV
-# evaluator panel (logreg and RBF SVM behind a per-fold StandardScaler, RF).
+# Every method selects on the train rows of one outer stratified holdout
+# (--holdout-fraction 0.2, --holdout-seed 42); its selected features are scored
+# by the same evaluator panel (logreg and RBF SVM behind a StandardScaler, RF),
+# fit on the train rows and scored on the held-out test rows.
 #
-# Output goes to top40_feature_comparison_oob/: results in the older
-# top40_feature_comparison/ predate both out-of-bag Rashomon membership
-# (f134dd8) and the evaluator/stepwise-logreg scaling fix (bdee476).
-# They also used --rid-n-models-pool 50; this run uses 100.
+# Output goes to top40_feature_comparison_holdout/: the older
+# top40_feature_comparison_oob/ scored stepwise methods on the same CV folds
+# they selected on (and every method on rows it selected on), and
+# top40_feature_comparison/ additionally predates out-of-bag Rashomon
+# membership (f134dd8) and the evaluator/stepwise-logreg scaling fix (bdee476)
+# and used --rid-n-models-pool 50; this run uses 100.
 # Memory: 96G, as for the Staellert grid cross-family run that OOM'd at 32G.
 # (--inject-redundant-duplicate is available as an opt-in diagnostic but is
 # NOT used here -- it changes the feature space for every method, which
@@ -83,7 +87,9 @@ $PYTHON_ENV --version
 # it as a separate one-off invocation instead, e.g. via sbatch --wrap.)
 $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --data experiments/falcon_cano/falcon_cano_featured.csv \
-    --output-dir experiments/falcon_cano/results/top40_feature_comparison_oob \
+    --output-dir experiments/falcon_cano/results/top40_feature_comparison_holdout \
+    --holdout-fraction 0.2 \
+    --holdout-seed 42 \
     --top-k 40 \
     --rid-n-bootstraps 500 \
     --rid-n-models-pool 100 \

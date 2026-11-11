@@ -11,12 +11,21 @@ classification task (%F >= 50 vs. < 50):
 4) Cross-family RID with family_balance_mode='unweighted'.
 5) Cross-family RID with family_balance_mode='weighted'.
 
-Every method's selected top-k feature set is scored with the SAME held-out
-cross-validated evaluator (logistic regression, proper k-fold CV) so the five
-methods are directly comparable. RID's own internal Rashomon-set performance
-stats (accuracy/AUPRC on each bootstrap's out-of-bag rows) are recorded
-separately in run_settings.json for diagnostic purposes only; they use a
-different evaluation protocol from the held-out CV scores and are not used
+Evaluation protocol (outer stratified holdout): the rows are split once into
+train and test (--holdout-fraction, default 0.2; --holdout-seed). Feature
+selection never sees the test rows: the correlation filter (including
+--correlation-threshold auto), stepwise selection (whose inner CV runs on the
+train rows only), every RID fit, --top-k auto curves, mRMR reordering and the
+redundant-duplicate's noise scale all use the train rows alone. Every method's
+selected top-k feature set is then scored with the SAME panel of evaluators
+(logreg, random forest, RBF SVM), each fit on the train rows restricted to those
+features and scored once on the held-out test rows (holdout_score) -- the
+primary, comparable score for every method. The panel's in-train CV score
+(train_cv_score_*, the same folds stepwise selection maximized) is kept
+alongside only to show how much reusing selection folds for evaluation inflates
+the stepwise methods. RID's own internal Rashomon-set performance stats
+(accuracy/AUPRC on each bootstrap's out-of-bag train rows) are recorded
+separately in run_settings.json for diagnostic purposes only and are not used
 to rank methods.
 
 Optional diagnostic (--inject-redundant-duplicate FEATURE): adds a
@@ -44,6 +53,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections.abc import Callable
 import logging
@@ -56,7 +66,8 @@ import pandas as pd
 from joblib import Parallel, delayed
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.metrics import get_scorer
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -127,8 +138,9 @@ def _parse_args() -> argparse.Namespace:
             "random forest) against single-family RID on a fully enumerated "
             "decision-tree Rashomon set and cross-family RID (both unweighted and "
             "weighted balance modes), for the Falcon-Cano bioavailability task. "
-            "Every method's selected features are scored with a common held-out "
-            "CV evaluator for a fair comparison."
+            "Every method selects on the train rows of an outer stratified holdout; its "
+            "selected features are scored with a common evaluator panel fit on those "
+            "train rows and scored on the held-out test rows, for a fair comparison."
         )
     )
     parser.add_argument(
@@ -140,8 +152,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(__file__).resolve().parent / "results" / "top40_feature_comparison"),
-        help="Directory for outputs (default: <script dir>/results/top40_feature_comparison)",
+        default=str(Path(__file__).resolve().parent / "results" / "top40_feature_comparison_holdout"),
+        help="Directory for outputs (default: <script dir>/results/top40_feature_comparison_holdout)",
+    )
+    parser.add_argument(
+        "--holdout-fraction",
+        type=float,
+        default=0.2,
+        help=(
+            "Fraction of rows held out (stratified) as the test set the evaluator panel "
+            "scores on; feature selection only sees the rest (default: 0.2)"
+        ),
+    )
+    parser.add_argument(
+        "--holdout-seed",
+        type=int,
+        default=42,
+        help="Random seed for the outer stratified train/test split (default: 42)",
     )
     parser.add_argument(
         "--top-k",
@@ -160,7 +187,7 @@ def _parse_args() -> argparse.Namespace:
         default=100,
         help=(
             "Ceiling on how many features to rank when --top-k=auto -- each method's "
-            "signal curve (prob_positive for RID methods, held-out CV gain for stepwise "
+            "signal curve (prob_positive for RID methods, in-train CV gain for stepwise "
             "methods) is computed over rank=1..this value, and the chosen k can't exceed "
             "it. Ignored when --top-k is a fixed integer (default: 100)"
         ),
@@ -191,7 +218,10 @@ def _parse_args() -> argparse.Namespace:
         "--stepwise-cv-splits",
         type=int,
         default=5,
-        help="CV folds for stepwise selection and evaluation (default: 5)",
+        help=(
+            "CV folds for stepwise selection, --top-k auto CV-gain curves and the in-train "
+            "CV diagnostic, all on the train rows only (default: 5)"
+        ),
     )
     parser.add_argument(
         "--stepwise-n-jobs",
@@ -295,7 +325,7 @@ def _parse_args() -> argparse.Namespace:
         "--random-state",
         type=int,
         default=42,
-        help="Random state for CV folds and the stepwise search models (default: 42)",
+        help="Random state for the inner CV folds, the models and the duplicate's noise (default: 42)",
     )
     parser.add_argument(
         "--inject-redundant-duplicate",
@@ -319,11 +349,46 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _make_holdout_split(y: pd.Series, holdout_fraction: float, holdout_seed: int) -> tuple[pd.Index, pd.Index, dict]:
+    """One outer stratified train/test split of the rows (original row order kept
+    within each part). Feature selection sees only the train rows; the evaluator
+    panel scores on the test rows. Also returns the split's metadata, including a
+    hash of the test rows."""
+
+    if not 0.0 < holdout_fraction < 1.0:
+        raise ValueError(f"--holdout-fraction must be in (0, 1), got {holdout_fraction}")
+    if not y.index.is_unique:
+        raise ValueError("Row index must be unique to define a holdout split")
+    train_pos, test_pos = train_test_split(
+        np.arange(len(y)), test_size=holdout_fraction, stratify=y.to_numpy(), random_state=holdout_seed
+    )
+    train_index, test_index = y.index[np.sort(train_pos)], y.index[np.sort(test_pos)]
+    test_ids = [str(i) for i in test_index]
+    metadata = {
+        "protocol": "outer_stratified_holdout",
+        "holdout_fraction": holdout_fraction,
+        "holdout_seed": holdout_seed,
+        "n_train": int(len(train_index)),
+        "n_test": int(len(test_index)),
+        "train_class_counts": {str(k): int(v) for k, v in y.loc[train_index].value_counts().items()},
+        "test_class_counts": {str(k): int(v) for k, v in y.loc[test_index].value_counts().items()},
+        "test_rows_sha256": hashlib.sha256("\n".join(test_ids).encode("utf-8")).hexdigest()[:16],
+        "test_rows": test_ids,
+    }
+    return train_index, test_index, metadata
+
+
 def _prepare_dataset(
     data_path: Path,
     use_curated_descriptors: bool,
     correlation_threshold: float,
-) -> tuple[pd.DataFrame, pd.Series, dict]:
+    holdout_fraction: float,
+    holdout_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, dict]:
+    """Load the data, split it into train/test rows, and fit the correlation
+    filter on the train rows only. Returns (X_train, X_test, y_train, y_test,
+    metadata); row ids are the CSV's row numbers."""
+
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {data_path}")
 
@@ -334,13 +399,16 @@ def _prepare_dataset(
     X = df.drop(columns=["target"])
     y = df["target"].astype(int)
 
+    train_index, test_index, holdout_meta = _make_holdout_split(y, holdout_fraction, holdout_seed)
+
     n_features_raw = X.shape[1]
     if use_curated_descriptors:
-        X = select_curated_descriptors(X)
+        X = select_curated_descriptors(X)  # a fixed descriptor list; looks at no rows
     n_features_curated = X.shape[1]
 
-    resolved_threshold, threshold_info = _resolve_correlation_threshold(X, correlation_threshold)
-    X = remove_highly_correlated_features(X, correlation_threshold=resolved_threshold)
+    resolved_threshold, threshold_info = _resolve_correlation_threshold(X.loc[train_index], correlation_threshold)
+    X_train = remove_highly_correlated_features(X.loc[train_index], correlation_threshold=resolved_threshold)
+    X = X[X_train.columns]
 
     metadata = {
         "dataset_path": str(data_path),
@@ -351,8 +419,9 @@ def _prepare_dataset(
         "n_features_after_corr": int(X.shape[1]),
         "class_counts": y.value_counts().to_dict(),
         "correlation_threshold_info": threshold_info,
+        "holdout": holdout_meta,
     }
-    return X, y, metadata
+    return X.loc[train_index], X.loc[test_index], y.loc[train_index], y.loc[test_index], metadata
 
 
 def _score_candidate_feature(
@@ -417,8 +486,8 @@ def run_forward_stepwise_selection(
             {
                 "rank": step_idx,
                 "feature": best_feature,
-                "cv_score_mean": best_mean,
-                "cv_score_std": best_std,
+                "train_cv_score_mean": best_mean,
+                "train_cv_score_std": best_std,
                 "n_features_in_model": len(selected_features),
             }
         )
@@ -458,6 +527,36 @@ def _evaluate_feature_set(
     }
 
 
+def _evaluate_feature_set_holdout(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    features: list[str],
+    model_cls,
+    model_kwargs: dict,
+    train_cv,
+    scoring: str,
+) -> dict:
+    """Fit on the train rows restricted to `features`, score once on the held-out
+    test rows (holdout_score, the primary score). Also report the same evaluator's
+    CV score within the train rows (train_cv_score_*), on the folds stepwise
+    selection searched over -- optimistic for the stepwise methods by construction."""
+
+    estimator = model_cls(**model_kwargs).fit(X_train[features], y_train)
+    holdout_score = float(get_scorer(scoring)(estimator, X_test[features], y_test))
+    train_cv = _evaluate_feature_set(X_train, y_train, features, model_cls, model_kwargs, train_cv, scoring)
+    return {
+        "scoring": scoring,
+        "holdout_score": holdout_score,
+        "train_cv_score_mean": train_cv["cv_score_mean"],
+        "train_cv_score_std": train_cv["cv_score_std"],
+        "n_features": len(features),
+        "n_train": int(len(y_train)),
+        "n_test": int(len(y_test)),
+    }
+
+
 def _compute_incremental_cv_curve(
     X: pd.DataFrame,
     y: pd.Series,
@@ -467,7 +566,7 @@ def _compute_incremental_cv_curve(
     cv,
     scoring: str,
 ) -> list[float]:
-    """Held-out CV score after adding each successive feature along an
+    """In-train CV score after adding each successive feature along an
     already-fixed ranking. Unlike run_forward_stepwise_selection's own
     history, this doesn't search over candidate features at each step -- the
     order was already decided elsewhere (e.g. by reorder_by_mrmr) -- so it's
@@ -666,21 +765,26 @@ def build_common_evaluator_panel(random_state: int) -> list[tuple[str, Callable,
 
 
 def run_common_evaluation_panel(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
     method_feature_lists: dict[str, list[str]],
     evaluators: list[tuple[str, Callable, dict]],
-    cv,
+    train_cv,
     scoring: str,
 ) -> dict[str, dict[str, dict]]:
     """Evaluate every method's selected top-k features under every evaluator
-    in the panel, so methods are compared on equal footing regardless of which
-    model (if any) they used internally to select features, and regardless of
-    any single evaluator's own inductive bias."""
+    in the panel -- fit on the train rows, scored on the held-out test rows no
+    method saw while selecting -- so methods are compared on equal footing
+    regardless of which model (if any) they used internally to select features,
+    and regardless of any single evaluator's own inductive bias."""
 
     return {
         name: {
-            evaluator_name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+            evaluator_name: _evaluate_feature_set_holdout(
+                X_train, y_train, X_test, y_test, features, model_cls, model_kwargs, train_cv, scoring
+            )
             for evaluator_name, model_cls, model_kwargs in evaluators
         }
         for name, features in method_feature_lists.items()
@@ -711,27 +815,35 @@ def _build_comparison_table(method_feature_lists: dict[str, list[str]]) -> pd.Da
 
 
 def inject_redundant_duplicate(
-    X: pd.DataFrame,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
     source_feature: str,
     redundancy_corr: float,
     random_state: int,
-) -> tuple[pd.DataFrame, str]:
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """Add a correlated engineered duplicate of an existing real feature (not
     a synthetic ground-truth driver -- source_feature is whatever real column
     the caller chose). Requires no ground truth: the duplicate is
     substitutable for source_feature by construction, so any credit-sharing
     (or lack of it) a method exhibits between the two is directly
-    attributable to how it handles redundancy, not to unknown confounders."""
+    attributable to how it handles redundancy, not to unknown confounders.
+    The duplicate is added to both the train and test rows (the evaluator panel
+    needs the column on both); its noise scale comes from the train rows only."""
 
-    if source_feature not in X.columns:
+    if source_feature not in X_train.columns:
         raise ValueError(f"--inject-redundant-duplicate feature '{source_feature}' not found in X")
 
     dup_name = f"{source_feature}_dup"
     rng = np.random.default_rng(random_state)
-    dup_noise = rng.normal(0.0, X[source_feature].std(), size=len(X))
-    X = X.copy()
-    X[dup_name] = redundancy_corr * X[source_feature] + np.sqrt(1.0 - redundancy_corr**2) * dup_noise
-    return X, dup_name
+    noise_sd = X_train[source_feature].std()
+
+    def _with_duplicate(X: pd.DataFrame) -> pd.DataFrame:
+        dup_noise = rng.normal(0.0, noise_sd, size=len(X))
+        X = X.copy()
+        X[dup_name] = redundancy_corr * X[source_feature] + np.sqrt(1.0 - redundancy_corr**2) * dup_noise
+        return X
+
+    return _with_duplicate(X_train), _with_duplicate(X_test), dup_name
 
 
 def compute_credit_split_ratio_top_k(ranked_top_k: list[str], pair: tuple[str, str]) -> float | None:
@@ -785,27 +897,38 @@ def main() -> None:
     if args.rid_selection == "mrmr":
         logger.info(f"  mrmr_lambda:           {args.mrmr_lambda}")
     logger.info(f"  correlation_threshold: {args.correlation_threshold}")
+    logger.info(f"  holdout:               fraction={args.holdout_fraction} seed={args.holdout_seed}")
     logger.info(f"  use_curated_descriptors: {args.use_curated_descriptors}")
     logger.info(f"  rid_n_jobs:            {rid_n_jobs}")
     logger.info("=" * 70)
 
     start_time = time.time()
 
-    X, y, data_meta = _prepare_dataset(
+    X_train, X_test, y_train, y_test, data_meta = _prepare_dataset(
         data_path=Path(args.data),
         use_curated_descriptors=args.use_curated_descriptors,
         correlation_threshold=args.correlation_threshold,
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
     )
+    holdout_meta = data_meta["holdout"]
+    if not X_train.index.intersection(X_test.index).empty:
+        raise RuntimeError("Train and test rows overlap")
     logger.info(
         f"[data] rows={data_meta['n_rows']} "
         f"features={data_meta['n_features_after_corr']} "
         f"(raw={data_meta['n_features_raw']})"
     )
+    logger.info(
+        f"[holdout] train={holdout_meta['n_train']} {holdout_meta['train_class_counts']} "
+        f"test={holdout_meta['n_test']} {holdout_meta['test_class_counts']} "
+        f"(test rows sha256 {holdout_meta['test_rows_sha256']})"
+    )
 
     redundant_pair = None
     if args.inject_redundant_duplicate:
-        X, dup_name = inject_redundant_duplicate(
-            X, args.inject_redundant_duplicate, args.redundancy_corr, args.random_state
+        X_train, X_test, dup_name = inject_redundant_duplicate(
+            X_train, X_test, args.inject_redundant_duplicate, args.redundancy_corr, args.random_state
         )
         redundant_pair = (args.inject_redundant_duplicate, dup_name)
         logger.info(
@@ -813,6 +936,8 @@ def main() -> None:
             f"'{args.inject_redundant_duplicate}' (corr={args.redundancy_corr})"
         )
 
+    # Everything from here until the evaluator panel sees only the train rows; cv
+    # only ever splits them (stepwise selection, CV-gain curves, in-train CV diagnostic).
     cv = StratifiedKFold(
         n_splits=args.stepwise_cv_splits,
         shuffle=True,
@@ -824,7 +949,7 @@ def main() -> None:
     k_selection_results: dict[str, dict] = {}
 
     use_mrmr = args.rid_selection == "mrmr"
-    corr_matrix = X.corr().abs() if use_mrmr else None
+    corr_matrix = X_train.corr().abs() if use_mrmr else None
 
     def resolve_feature_count(
         method_name: str,
@@ -833,7 +958,7 @@ def main() -> None:
         signal_kind: str,
     ) -> list[str]:
         """When --top-k=auto, elbow-detect this method's own native signal curve
-        (prob_positive for RID methods, held-out CV gain for stepwise methods)
+        (prob_positive for RID methods, in-train CV gain for stepwise methods)
         over rank=1..top_k_max_sweep and truncate to the elbow rank. Otherwise a
         no-op (ranked_features is already exactly args.top_k long)."""
 
@@ -864,7 +989,7 @@ def main() -> None:
         """Applies --rid-selection=mrmr reordering (if enabled) to a RID
         method's ranking, then resolves k the same way resolve_feature_count
         does, but using whichever native signal curve matches the CURRENT
-        ordering: prob_positive for the untouched marginal ranking, held-out
+        ordering: prob_positive for the untouched marginal ranking, in-train
         CV gain for the mrmr reordering (mrmr breaks the sorted-by-importance
         assumption prob_positive-elbow relies on)."""
 
@@ -883,7 +1008,7 @@ def main() -> None:
             features = reordered
             signal_values = (
                 _compute_incremental_cv_curve(
-                    X, y, features, scaled_logistic_regression, logreg_kwargs, cv, args.stepwise_scoring
+                    X_train, y_train, features, scaled_logistic_regression, logreg_kwargs, cv, args.stepwise_scoring
                 )
                 if auto_k_selection
                 else None
@@ -905,8 +1030,8 @@ def main() -> None:
         "random_state": args.random_state,
     }
     stepwise_logreg_features, stepwise_logreg_history = run_forward_stepwise_selection(
-        X=X,
-        y=y,
+        X=X_train,
+        y=y_train,
         top_k=selection_top_k,
         model_cls=scaled_logistic_regression,
         model_kwargs=logreg_kwargs,
@@ -917,11 +1042,11 @@ def main() -> None:
     stepwise_logreg_features = resolve_feature_count(
         "stepwise_logreg",
         stepwise_logreg_features,
-        stepwise_logreg_history["cv_score_mean"].tolist(),
+        stepwise_logreg_history["train_cv_score_mean"].tolist(),
         "cv_gain",
     )
     stepwise_logreg_eval = _evaluate_feature_set(
-        X, y, stepwise_logreg_features, scaled_logistic_regression, logreg_kwargs, cv, args.stepwise_scoring
+        X_train, y_train, stepwise_logreg_features, scaled_logistic_regression, logreg_kwargs, cv, args.stepwise_scoring
     )
     stepwise_logreg_history.head(len(stepwise_logreg_features)).to_csv(
         output_dir / "stepwise_logreg_top_features.csv", index=False
@@ -936,8 +1061,8 @@ def main() -> None:
         "n_jobs": 1,
     }
     stepwise_rf_features, stepwise_rf_history = run_forward_stepwise_selection(
-        X=X,
-        y=y,
+        X=X_train,
+        y=y_train,
         top_k=selection_top_k,
         model_cls=RandomForestClassifier,
         model_kwargs=rf_kwargs,
@@ -948,11 +1073,11 @@ def main() -> None:
     stepwise_rf_features = resolve_feature_count(
         "stepwise_rf",
         stepwise_rf_features,
-        stepwise_rf_history["cv_score_mean"].tolist(),
+        stepwise_rf_history["train_cv_score_mean"].tolist(),
         "cv_gain",
     )
     stepwise_rf_eval = _evaluate_feature_set(
-        X, y, stepwise_rf_features, RandomForestClassifier, rf_kwargs, cv, args.stepwise_scoring
+        X_train, y_train, stepwise_rf_features, RandomForestClassifier, rf_kwargs, cv, args.stepwise_scoring
     )
     stepwise_rf_history.head(len(stepwise_rf_features)).to_csv(
         output_dir / "stepwise_rf_top_features.csv", index=False
@@ -964,8 +1089,8 @@ def main() -> None:
         f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
     )
     rid_tree_features, rid_tree_table, rid_tree_perf = run_single_family_tree_rid(
-        X=X,
-        y=y,
+        X=X_train,
+        y=y_train,
         top_k=selection_top_k,
         rid_metric=args.rid_metric,
         epsilon=args.rid_epsilon,
@@ -986,8 +1111,8 @@ def main() -> None:
             f"family_balance_mode={balance_mode}"
         )
         features, table, perf = run_cross_family_rid(
-            X=X,
-            y=y,
+            X=X_train,
+            y=y_train,
             top_k=selection_top_k,
             rid_metric=args.rid_metric,
             epsilon=args.rid_epsilon,
@@ -1016,11 +1141,12 @@ def main() -> None:
     ).to_csv(output_dir / "top_feature_overlap.csv", index=False)
     overlap_counts = _pairwise_overlap_counts(comparison, list(method_feature_lists.keys()))
 
-    # --- Common held-out CV evaluation: every method's features scored the same way,
-    # under a panel of evaluators spanning different inductive biases ---
+    # --- Common holdout evaluation: every method's features scored the same way (fit on
+    # train, scored on the untouched test rows), under a panel of evaluators spanning
+    # different inductive biases ---
     evaluator_panel = build_common_evaluator_panel(args.random_state)
     common_eval = run_common_evaluation_panel(
-        X, y, method_feature_lists, evaluator_panel, cv, args.stepwise_scoring
+        X_train, y_train, X_test, y_test, method_feature_lists, evaluator_panel, cv, args.stepwise_scoring
     )
 
     cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
@@ -1056,10 +1182,14 @@ def main() -> None:
                 for evaluator_name, model_cls, model_kwargs in evaluator_panel
             },
             "scoring": args.stepwise_scoring,
+            "protocol": holdout_meta["protocol"],
             "note": (
                 "Every method's selected top-k features scored under every evaluator in "
                 "this panel (spanning linear, bagged-tree, and kernel-margin inductive "
-                "biases), so no method's score is an artifact of one evaluator's blind spot."
+                "biases), so no method's score is an artifact of one evaluator's blind spot. "
+                "holdout_score: fit on the train rows, scored on the held-out test rows no "
+                "method selected on (primary). train_cv_score_*: CV within the train rows on "
+                "the folds stepwise selection maximized (optimistic for stepwise; diagnostic only)."
             ),
             "results": common_eval,
         },
@@ -1067,13 +1197,13 @@ def main() -> None:
             "scoring": args.stepwise_scoring,
             "model_kwargs": logreg_kwargs,
             "top_features": stepwise_logreg_features,
-            "search_model_evaluation": stepwise_logreg_eval,
+            "search_model_train_cv_evaluation": stepwise_logreg_eval,
         },
         "stepwise_rf": {
             "scoring": args.stepwise_scoring,
             "model_kwargs": rf_kwargs,
             "top_features": stepwise_rf_features,
-            "search_model_evaluation": stepwise_rf_eval,
+            "search_model_train_cv_evaluation": stepwise_rf_eval,
         },
         "rid_tree": {
             "metric": args.rid_metric,
@@ -1105,16 +1235,22 @@ def main() -> None:
         "dataset_path": data_meta["dataset_path"],
         "n_rows": data_meta["n_rows"],
         "n_features": data_meta["n_features_after_corr"],
+        "n_train": holdout_meta["n_train"],
+        "n_test": holdout_meta["n_test"],
+        "holdout_test_rows_sha256": holdout_meta["test_rows_sha256"],
         "common_eval_scoring": args.stepwise_scoring,
     }
     for name in method_feature_lists:
-        per_evaluator_means = []
+        holdout_scores, train_cv_means = [], []
         for evaluator_name, _, _ in evaluator_panel:
             evaluator_result = common_eval[name][evaluator_name]
-            overall_row[f"{name}_held_out_cv_score_mean__{evaluator_name}"] = evaluator_result["cv_score_mean"]
-            overall_row[f"{name}_held_out_cv_score_std__{evaluator_name}"] = evaluator_result["cv_score_std"]
-            per_evaluator_means.append(evaluator_result["cv_score_mean"])
-        overall_row[f"{name}_held_out_cv_score_mean_avg"] = float(np.mean(per_evaluator_means))
+            overall_row[f"{name}_holdout_score__{evaluator_name}"] = evaluator_result["holdout_score"]
+            overall_row[f"{name}_train_cv_score_mean__{evaluator_name}"] = evaluator_result["train_cv_score_mean"]
+            overall_row[f"{name}_train_cv_score_std__{evaluator_name}"] = evaluator_result["train_cv_score_std"]
+            holdout_scores.append(evaluator_result["holdout_score"])
+            train_cv_means.append(evaluator_result["train_cv_score_mean"])
+        overall_row[f"{name}_holdout_score_avg"] = float(np.mean(holdout_scores))
+        overall_row[f"{name}_train_cv_score_mean_avg"] = float(np.mean(train_cv_means))
         overall_row[f"{name}_n_features_selected"] = len(method_feature_lists[name])
     overall_row.update(
         {
@@ -1147,8 +1283,9 @@ def main() -> None:
         for evaluator_name, _, _ in evaluator_panel:
             evaluator_result = common_eval[name][evaluator_name]
             logger.info(
-                f"  held-out CV [{evaluator_name}] ({args.stepwise_scoring}): "
-                f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
+                f"  holdout [{evaluator_name}] ({args.stepwise_scoring}): {evaluator_result['holdout_score']:.4f}"
+                f"  (in-train CV {evaluator_result['train_cv_score_mean']:.4f} "
+                f"+- {evaluator_result['train_cv_score_std']:.4f})"
             )
     logger.info(f"overlap counts: {overlap_counts}")
     logger.info(f"Finished in {elapsed:.1f}s ({elapsed / 60:.1f} min)")

@@ -69,13 +69,17 @@ $PYTHON_ENV --version
 # instead of a flat top-40 (--top-k auto; see feature_count_selection.py):
 # RID-based methods elbow-detect prob_positive (P(phi>0) across the Rashomon
 # set, already computed by fitting -- no extra refit), stepwise methods
-# elbow-detect their own held-out CV-score-vs-step curve. --rid-metric is
+# elbow-detect their own in-train CV-score-vs-step curve. Selection (incl. the
+# k curves) uses only the train rows of an outer stratified holdout; the
+# evaluator panel scores on the held-out test rows (see the script docstring). --rid-metric is
 # pinned explicitly to sub_mr (also the script's default) since this pipeline
 # has previously had its default silently drift to iloco and back -- see
 # CLAUDE.md's rid/core.py section for why iloco isn't a safe drop-in replacement.
 $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --data experiments/falcon_cano/falcon_cano_featured.csv \
-    --output-dir experiments/falcon_cano/results/top40_feature_comparison_auto_k \
+    --output-dir experiments/falcon_cano/results/top40_feature_comparison_auto_k_holdout \
+    --holdout-fraction 0.2 \
+    --holdout-seed 42 \
     --top-k auto \
     --top-k-max-sweep 100 \
     --rid-metric sub_mr \

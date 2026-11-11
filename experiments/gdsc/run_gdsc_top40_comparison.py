@@ -21,12 +21,19 @@ Compares five top-k feature sets (METHODS):
    candidate search (candidate_search='truvarimp_joint', rid/truvarimp.py).
 The weighted cross-family variant was dropped, as in the nonlinear simulation.
 
-Every method's selected top-k feature set is scored with the SAME panel of
-held-out cross-validated evaluators so all methods are directly comparable.
-RID's own Rashomon-set performance stats (accuracy/AUPRC on each bootstrap's
-out-of-bag rows) are recorded in run_settings.json for diagnostics only; they
-come from a different protocol than the evaluator panel and are not used to
-rank methods.
+Evaluation protocol (outer stratified holdout): each task's rows are split once
+into train and test (--holdout-fraction, default 0.2; --holdout-seed). Feature
+selection never sees the test rows: the constant-column and correlation filters,
+standardization, stepwise selection (whose inner CV runs on the train rows only)
+and every RID fit use the train rows alone. Every method's selected top-k
+feature set is then scored with the SAME panel of evaluators, each fit on the
+train rows restricted to those features and scored once on the held-out test
+rows (holdout_score) -- the primary, comparable score for every method. The
+panel's in-train CV score (train_cv_score_*, the same folds stepwise selection
+maximized) is kept alongside only to show how much reusing selection folds for
+evaluation inflates the stepwise methods. RID's own Rashomon-set performance
+stats (accuracy/AUPRC on each bootstrap's out-of-bag train rows) are recorded in
+run_settings.json for diagnostics only and are not used to rank methods.
 
 Each method is checkpointed separately (<task>/<method>_result.json plus
 <method>_ranking.csv -- the k stepwise steps, or every feature for RID
@@ -40,10 +47,8 @@ Differences from the Staellert script: features are standardized once after
 correlation filtering (so the logistic and RBF-SVM evaluators see scaled
 inputs, which the Staellert SVM evaluator didn't); the correlation filter keeps
 the earlier column of a pair rather than the higher-variance one; and there are
-no PHATE columns to exclude. Standardization and filtering are fit on all of a
-task's rows, label-blind, before the evaluator panel's CV -- the same as
-compute_rid* scaling on all rows -- so held-out scores share column means and
-variances with their test folds, but never labels.
+no PHATE columns to exclude. Filtering and standardization are fit on the train
+rows only and then applied to the test rows.
 """
 
 from __future__ import annotations
@@ -62,7 +67,8 @@ import pandas as pd
 from joblib import Parallel, delayed
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.metrics import get_scorer
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -101,7 +107,8 @@ METHODS = (
 # Arguments that change a method's result. A checkpoint written under different
 # values is refused rather than silently reused (n_jobs/logging/paths don't count).
 _DATA_SETTING_KEYS = ("data_fingerprint", "top_k", "correlation_threshold", "random_state",
-                      "stepwise_cv_splits", "stepwise_scoring_classification")
+                      "stepwise_cv_splits", "stepwise_scoring_classification",
+                      "holdout_fraction", "holdout_seed")
 _STEPWISE_SETTING_KEYS = ("stepwise_n_estimators", "stepwise_max_depth", "stepwise_min_samples_leaf",
                           "stepwise_class_weight", "stepwise_logreg_C")
 _RID_SETTING_KEYS = ("rid_metric", "rid_epsilon", "rid_n_bootstraps")
@@ -154,8 +161,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(__file__).resolve().parent / "results" / "top40_feature_comparison"),
-        help="Directory for outputs (default: <script dir>/results/top40_feature_comparison)",
+        default=str(Path(__file__).resolve().parent / "results" / "top40_feature_comparison_holdout"),
+        help="Directory for outputs (default: <script dir>/results/top40_feature_comparison_holdout)",
+    )
+    parser.add_argument(
+        "--holdout-fraction",
+        type=float,
+        default=0.2,
+        help=(
+            "Fraction of each task's rows held out (stratified) as the test set the "
+            "evaluator panel scores on; feature selection only sees the rest (default: 0.2)"
+        ),
+    )
+    parser.add_argument(
+        "--holdout-seed",
+        type=int,
+        default=42,
+        help="Random seed for the outer stratified train/test split (default: 42)",
     )
 
     parser.add_argument(
@@ -171,7 +193,7 @@ def _parse_args() -> argparse.Namespace:
         "--stepwise-cv-splits",
         type=int,
         default=5,
-        help="CV folds for stepwise selection (default: 5)",
+        help="CV folds for stepwise selection and the in-train CV diagnostic, on the train rows only (default: 5)",
     )
     parser.add_argument(
         "--stepwise-n-estimators",
@@ -398,11 +420,46 @@ def _resolve_correlation_threshold(X: pd.DataFrame, correlation_threshold) -> tu
     return elbow, {"mode": "auto", "value": elbow, "n_features_at_elbow": n_at_elbow, "n_features_raw": int(X.shape[1])}
 
 
+def _make_holdout_split(y: pd.Series, holdout_fraction: float, holdout_seed: int) -> tuple[pd.Index, pd.Index, dict]:
+    """One outer stratified train/test split of a task's rows (original row order
+    kept within each part). Feature selection sees only the train rows; the
+    evaluator panel scores on the test rows. Also returns the split's metadata,
+    including a hash of the test rows so checkpoints from another split are refused."""
+
+    if not 0.0 < holdout_fraction < 1.0:
+        raise ValueError(f"--holdout-fraction must be in (0, 1), got {holdout_fraction}")
+    if not y.index.is_unique:
+        raise ValueError("Row index must be unique to define a holdout split")
+    train_pos, test_pos = train_test_split(
+        np.arange(len(y)), test_size=holdout_fraction, stratify=y.to_numpy(), random_state=holdout_seed
+    )
+    train_index, test_index = y.index[np.sort(train_pos)], y.index[np.sort(test_pos)]
+    test_ids = [str(i) for i in test_index]
+    metadata = {
+        "protocol": "outer_stratified_holdout",
+        "holdout_fraction": holdout_fraction,
+        "holdout_seed": holdout_seed,
+        "n_train": int(len(train_index)),
+        "n_test": int(len(test_index)),
+        "train_class_counts": {str(k): int(v) for k, v in y.loc[train_index].value_counts().items()},
+        "test_class_counts": {str(k): int(v) for k, v in y.loc[test_index].value_counts().items()},
+        "test_rows_sha256": hashlib.sha256("\n".join(test_ids).encode("utf-8")).hexdigest()[:16],
+        "test_rows": test_ids,
+    }
+    return train_index, test_index, metadata
+
+
 def _prepare_task_dataset(
     data_dir: Path,
     task_name: str,
     correlation_threshold,
-) -> tuple[pd.DataFrame, pd.Series, dict]:
+    holdout_fraction: float,
+    holdout_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, dict]:
+    """Load one task, split it into train/test rows, and fit every column filter
+    and the standardization on the train rows only. Returns
+    (X_train, X_test, y_train, y_test, metadata)."""
+
     features_path = data_dir / FEATURES_FILE
     responses_path = data_dir / RESPONSES_FILE
     for path in (features_path, responses_path):
@@ -420,16 +477,20 @@ def _prepare_task_dataset(
     # Integer 0/1, not strings: rid's AUPRC metric scores binary tasks with pos_label=1.
     y = responses.loc[model_ids, LABEL_COLUMN].astype(int)
 
-    # Binary panels can be all-zero within one task's cell lines.
-    constant_cols = [col for col in X.columns if X[col].nunique() <= 1]
+    train_index, test_index, holdout_meta = _make_holdout_split(y, holdout_fraction, holdout_seed)
+
+    # Binary panels can be all-zero within one task's (train) cell lines.
+    constant_cols = [col for col in X.columns if X.loc[train_index, col].nunique() <= 1]
     X = X.drop(columns=constant_cols)
 
     X_before_corr = X.shape[1]
-    resolved_threshold, threshold_info = _resolve_correlation_threshold(X, correlation_threshold)
-    X, removed_corr, corr_proxies = _remove_highly_correlated_features(X, resolved_threshold)
-    # Standardize once so the logistic/SVM evaluators and stepwise logreg see scaled
-    # inputs; RID rescales internally and trees are unaffected.
-    X = (X - X.mean()) / X.std(ddof=0)
+    resolved_threshold, threshold_info = _resolve_correlation_threshold(X.loc[train_index], correlation_threshold)
+    X_train, removed_corr, corr_proxies = _remove_highly_correlated_features(X.loc[train_index], resolved_threshold)
+    X = X[X_train.columns]
+    # Standardize with train-row statistics so the logistic/SVM evaluators and stepwise
+    # logreg see scaled inputs; RID rescales internally and trees are unaffected.
+    train_mean, train_std = X.loc[train_index].mean(), X.loc[train_index].std(ddof=0)
+    X = (X - train_mean) / train_std
 
     metadata = {
         "features_path": str(features_path),
@@ -446,8 +507,9 @@ def _prepare_task_dataset(
         "correlation_threshold_info": threshold_info,
         "n_classes": int(y.nunique()),
         "class_counts": y.value_counts().to_dict(),
+        "holdout": holdout_meta,
     }
-    return X, y, metadata
+    return X.loc[train_index], X.loc[test_index], y.loc[train_index], y.loc[test_index], metadata
 
 
 def _make_stepwise_cv_and_scoring(args: argparse.Namespace, y: pd.Series):
@@ -548,8 +610,8 @@ def run_forward_stepwise_selection(
             {
                 "rank": step_idx,
                 "feature": best_feature,
-                "cv_score_mean": best_mean,
-                "cv_score_std": best_std,
+                "train_cv_score_mean": best_mean,
+                "train_cv_score_std": best_std,
                 "n_features_in_model": len(selected_features),
             }
         )
@@ -755,6 +817,36 @@ def _evaluate_feature_set(
     }
 
 
+def _evaluate_feature_set_holdout(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    features: list[str],
+    model_cls,
+    model_kwargs: dict,
+    train_cv,
+    scoring: str,
+) -> dict:
+    """Fit on the train rows restricted to `features`, score once on the held-out
+    test rows (holdout_score, the primary score). Also report the same evaluator's
+    CV score within the train rows (train_cv_score_*), on the folds stepwise
+    selection searched over -- optimistic for the stepwise methods by construction."""
+
+    estimator = model_cls(**model_kwargs).fit(X_train[features], y_train)
+    holdout_score = float(get_scorer(scoring)(estimator, X_test[features], y_test))
+    train_cv = _evaluate_feature_set(X_train, y_train, features, model_cls, model_kwargs, train_cv, scoring)
+    return {
+        "scoring": scoring,
+        "holdout_score": holdout_score,
+        "train_cv_score_mean": train_cv["cv_score_mean"],
+        "train_cv_score_std": train_cv["cv_score_std"],
+        "n_features": len(features),
+        "n_train": int(len(y_train)),
+        "n_test": int(len(y_test)),
+    }
+
+
 def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dict]]:
     """Three fixed evaluators spanning distinct inductive biases, so a feature
     set's held-out score isn't an artifact of one model's blind spots (e.g. a
@@ -785,21 +877,26 @@ def build_common_evaluator_panel(random_state: int) -> list[tuple[str, type, dic
 
 
 def run_common_evaluation_panel(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
     method_feature_lists: dict[str, list[str]],
     evaluators: list[tuple[str, type, dict]],
-    cv,
+    train_cv,
     scoring: str,
 ) -> dict[str, dict[str, dict]]:
     """Evaluate every method's selected top-k features under every evaluator
-    in the panel, so methods are compared on equal footing regardless of which
-    model (if any) they used internally to select features, and regardless of
-    any single evaluator's own inductive bias."""
+    in the panel -- fit on the train rows, scored on the held-out test rows no
+    method saw while selecting -- so methods are compared on equal footing
+    regardless of which model (if any) they used internally to select features,
+    and regardless of any single evaluator's own inductive bias."""
 
     return {
         name: {
-            evaluator_name: _evaluate_feature_set(X, y, features, model_cls, model_kwargs, cv, scoring)
+            evaluator_name: _evaluate_feature_set_holdout(
+                X_train, y_train, X_test, y_test, features, model_cls, model_kwargs, train_cv, scoring
+            )
             for evaluator_name, model_cls, model_kwargs in evaluators
         }
         for name, features in method_feature_lists.items()
@@ -868,10 +965,14 @@ def _write_csv_atomic(df: pd.DataFrame, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def _method_settings(method: str, args: argparse.Namespace) -> dict:
+def _method_settings(method: str, args: argparse.Namespace, holdout_meta: dict) -> dict:
     settings = {key: getattr(args, key) for key in METHOD_SETTING_KEYS[method]}
     if method.startswith(("rid_", "cross_family_")):
         settings["rashomon_evaluation"] = "out_of_bag"
+    # Added 2026-11-11: checkpoints from the old protocol (selection and evaluation on
+    # the same rows/folds) lack these and are refused, as are ones from another split.
+    settings["evaluation_protocol"] = holdout_meta["protocol"]
+    settings["holdout_test_rows_sha256"] = holdout_meta["test_rows_sha256"]
     return settings
 
 
@@ -879,14 +980,16 @@ def _method_result_path(task_output_dir: Path, method: str) -> Path:
     return task_output_dir / f"{method}_result.json"
 
 
-def _load_method_checkpoint(task_output_dir: Path, method: str, args: argparse.Namespace) -> dict | None:
+def _load_method_checkpoint(
+    task_output_dir: Path, method: str, args: argparse.Namespace, holdout_meta: dict
+) -> dict | None:
     """Return a method's checkpoint, or None if absent. Refuse one written under different settings."""
 
     path = _method_result_path(task_output_dir, method)
     if not path.exists():
         return None
     checkpoint = json.loads(path.read_text(encoding="utf-8"))
-    expected = json.loads(json.dumps(_method_settings(method, args)))
+    expected = json.loads(json.dumps(_method_settings(method, args, holdout_meta)))
     if checkpoint.get("settings") != expected:
         raise SystemExit(
             f"{path} was written with settings {checkpoint.get('settings')}, but this run uses "
@@ -903,7 +1006,8 @@ def _run_method(
     cv,
     stepwise_scoring: str,
 ) -> tuple[list[str], pd.DataFrame, dict]:
-    """Run one method; return (top_features, per-feature table, method-specific info)."""
+    """Run one method on the train rows only (X, y are the holdout split's train
+    part); return (top_features, per-feature table, method-specific info)."""
 
     if method in ("stepwise_rf", "stepwise_logreg"):
         if method == "stepwise_rf":
@@ -931,7 +1035,7 @@ def _run_method(
         info = {
             "scoring": stepwise_scoring,
             "model_kwargs": model_kwargs,
-            "search_model_evaluation": search_eval,
+            "search_model_train_cv_evaluation": search_eval,
         }
         return features, history, info
 
@@ -1002,21 +1106,36 @@ def _run_single_task(
     logger.info(f"[task] {task_name}: {task_config['drug_name']} (GDSC2 drug {task_config['drug_id']}, "
                 f"target {task_config['target']})")
 
-    # Refuse mismatched checkpoints before spending hours on anything else.
-    checkpoints = {method: _load_method_checkpoint(task_output_dir, method, args) for method in METHODS}
-
-    X, y, data_meta = _prepare_task_dataset(
+    X_train, X_test, y_train, y_test, data_meta = _prepare_task_dataset(
         data_dir=data_dir,
         task_name=task_name,
         correlation_threshold=args.correlation_threshold,
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
     )
+    holdout_meta = data_meta["holdout"]
+    if not X_train.index.intersection(X_test.index).empty:
+        raise RuntimeError("Train and test rows overlap")
     logger.info(
         f"[data] rows={data_meta['n_rows']} "
         f"features={data_meta['n_features_after_corr']} "
         f"(removed_corr={data_meta['n_removed_corr']}) classes={data_meta['class_counts']}"
     )
+    logger.info(
+        f"[holdout] train={holdout_meta['n_train']} {holdout_meta['train_class_counts']} "
+        f"test={holdout_meta['n_test']} {holdout_meta['test_class_counts']} "
+        f"(test rows sha256 {holdout_meta['test_rows_sha256']})"
+    )
 
-    cv, stepwise_scoring = _make_stepwise_cv_and_scoring(args, y)
+    # Refuse mismatched checkpoints before spending hours on anything else (data prep
+    # comes first only because the settings include the holdout split's hash).
+    checkpoints = {
+        method: _load_method_checkpoint(task_output_dir, method, args, holdout_meta) for method in METHODS
+    }
+
+    # cv only ever splits the train rows: stepwise selection's inner CV and the
+    # in-train CV diagnostic. The test rows are touched only by the evaluator panel.
+    cv, stepwise_scoring = _make_stepwise_cv_and_scoring(args, y_train)
     evaluator_panel = build_common_evaluator_panel(args.random_state)
 
     for method in args.methods:
@@ -1025,19 +1144,20 @@ def _run_single_task(
             continue
 
         started = time.time()
-        features, table, info = _run_method(method, X, y, args, cv, stepwise_scoring)
+        features, table, info = _run_method(method, X_train, y_train, args, cv, stepwise_scoring)
         elapsed = time.time() - started
 
-        # Common held-out CV evaluation: every method's features scored the same way,
-        # under a panel of evaluators spanning different inductive biases.
+        # Common holdout evaluation: every method's features scored the same way (fit on
+        # train, scored on the untouched test rows), under a panel of evaluators
+        # spanning different inductive biases.
         common_eval = run_common_evaluation_panel(
-            X, y, {method: features}, evaluator_panel, cv, stepwise_scoring
+            X_train, y_train, X_test, y_test, {method: features}, evaluator_panel, cv, stepwise_scoring
         )[method]
 
         # Stepwise: the k selection steps. RID: every feature, ranked.
         _write_csv_atomic(table, task_output_dir / f"{method}_ranking.csv")
         checkpoint = {
-            "settings": json.loads(json.dumps(_method_settings(method, args))),
+            "settings": json.loads(json.dumps(_method_settings(method, args, holdout_meta))),
             "top_features": features,
             "ranking": table["feature"].tolist(),
             "elapsed_seconds": elapsed,
@@ -1053,13 +1173,16 @@ def _run_single_task(
         for evaluator_name, _, _ in evaluator_panel:
             evaluator_result = common_eval[evaluator_name]
             logger.info(
-                f"       held-out CV [{evaluator_name}] ({stepwise_scoring}): "
-                f"{evaluator_result['cv_score_mean']:.4f} +- {evaluator_result['cv_score_std']:.4f}"
+                f"       holdout [{evaluator_name}] ({stepwise_scoring}): {evaluator_result['holdout_score']:.4f}"
+                f"  (in-train CV {evaluator_result['train_cv_score_mean']:.4f} "
+                f"+- {evaluator_result['train_cv_score_std']:.4f})"
             )
 
     # Re-read: array tasks for this task's other methods run concurrently and may
     # have checkpointed since this invocation started.
-    checkpoints = {method: _load_method_checkpoint(task_output_dir, method, args) for method in METHODS}
+    checkpoints = {
+        method: _load_method_checkpoint(task_output_dir, method, args, holdout_meta) for method in METHODS
+    }
     completed = {method: checkpoint for method, checkpoint in checkpoints.items() if checkpoint is not None}
     missing = [method for method in METHODS if method not in completed]
     if missing:
@@ -1085,10 +1208,14 @@ def _run_single_task(
                 for evaluator_name, model_cls, model_kwargs in evaluator_panel
             },
             "scoring": stepwise_scoring,
+            "protocol": holdout_meta["protocol"],
             "note": (
                 "Every method's selected top-k features scored under every evaluator in "
                 "this panel (spanning linear, bagged-tree, and kernel-margin inductive "
-                "biases), so no method's score is an artifact of one evaluator's blind spot."
+                "biases), so no method's score is an artifact of one evaluator's blind spot. "
+                "holdout_score: fit on the train rows, scored on the held-out test rows no "
+                "method selected on (primary). train_cv_score_*: CV within the train rows on "
+                "the folds stepwise selection maximized (optimistic for stepwise; diagnostic only)."
             ),
             "results": {method: completed[method]["common_eval"] for method in METHODS},
         },
@@ -1114,16 +1241,22 @@ def _run_single_task(
         "drug_name": task_config["drug_name"],
         "n_rows": data_meta["n_rows"],
         "n_features": data_meta["n_features_after_corr"],
+        "n_train": holdout_meta["n_train"],
+        "n_test": holdout_meta["n_test"],
+        "holdout_test_rows_sha256": holdout_meta["test_rows_sha256"],
         "common_eval_scoring": stepwise_scoring,
     }
     for method in METHODS:
-        per_evaluator_means = []
+        holdout_scores, train_cv_means = [], []
         for evaluator_name, _, _ in evaluator_panel:
             evaluator_result = completed[method]["common_eval"][evaluator_name]
-            row[f"{method}_held_out_cv_score_mean__{evaluator_name}"] = evaluator_result["cv_score_mean"]
-            row[f"{method}_held_out_cv_score_std__{evaluator_name}"] = evaluator_result["cv_score_std"]
-            per_evaluator_means.append(evaluator_result["cv_score_mean"])
-        row[f"{method}_held_out_cv_score_mean_avg"] = float(np.mean(per_evaluator_means))
+            row[f"{method}_holdout_score__{evaluator_name}"] = evaluator_result["holdout_score"]
+            row[f"{method}_train_cv_score_mean__{evaluator_name}"] = evaluator_result["train_cv_score_mean"]
+            row[f"{method}_train_cv_score_std__{evaluator_name}"] = evaluator_result["train_cv_score_std"]
+            holdout_scores.append(evaluator_result["holdout_score"])
+            train_cv_means.append(evaluator_result["train_cv_score_mean"])
+        row[f"{method}_holdout_score_avg"] = float(np.mean(holdout_scores))
+        row[f"{method}_train_cv_score_mean_avg"] = float(np.mean(train_cv_means))
         row[f"{method}_elapsed_seconds"] = completed[method]["elapsed_seconds"]
 
     rid_tree_perf = completed["rid_tree"]["rashomon_oob_perf_stats"]
@@ -1163,6 +1296,7 @@ def main() -> None:
     logger.info(f"  methods:                  {args.methods}")
     logger.info(f"  top_k:                    {args.top_k}")
     logger.info(f"  correlation_threshold:    {args.correlation_threshold}")
+    logger.info(f"  holdout:                  fraction={args.holdout_fraction} seed={args.holdout_seed}")
     logger.info(f"  truvarimp_total_budget:   {args.truvarimp_total_budget}")
     logger.info(f"  output_dir:               {output_dir}")
     logger.info("=" * 70)
