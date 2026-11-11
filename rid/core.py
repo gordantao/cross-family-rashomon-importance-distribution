@@ -40,14 +40,14 @@ def compute_model_reliance(model, X, y, metric="sub_mr", rng=None):
 
     n_features = X.shape[1]
     y_prob = model.predict_proba(X)
-    e_orig = log_loss(y, y_prob)
+    e_orig = log_loss(y, y_prob, labels=model.classes_)
 
     importances = np.zeros(n_features)
     for j in range(n_features):
         X_permuted = X.copy()
         X_permuted[:, j] = rng.permutation(X_permuted[:, j])
         y_prob_perm = model.predict_proba(X_permuted)
-        e_switch = log_loss(y, y_prob_perm)
+        e_switch = log_loss(y, y_prob_perm, labels=model.classes_)
 
         if metric == "sub_mr":
             importances[j] = e_switch - e_orig
@@ -60,12 +60,12 @@ def compute_model_reliance(model, X, y, metric="sub_mr", rng=None):
 def compute_loco_importance(model, X, y):
     """Compute leave-one-covariate-out importance."""
 
-    e_orig = log_loss(y, model.predict_proba(X))
+    e_orig = log_loss(y, model.predict_proba(X), labels=model.classes_)
     importances = np.zeros(X.shape[1])
     for j in range(X.shape[1]):
         X_loco = X.copy()
         X_loco[:, j] = 0.0
-        importances[j] = log_loss(y, model.predict_proba(X_loco)) - e_orig
+        importances[j] = log_loss(y, model.predict_proba(X_loco), labels=model.classes_) - e_orig
     return importances
 
 
@@ -104,7 +104,7 @@ def compute_iloco_pairwise_importance(model, X, y, pairs):
     instead of being recomputed per pair.
     """
 
-    e_orig = log_loss(y, model.predict_proba(X))
+    e_orig = log_loss(y, model.predict_proba(X), labels=model.classes_)
 
     single_delta = {}
 
@@ -115,7 +115,7 @@ def compute_iloco_pairwise_importance(model, X, y, pairs):
         X_ablated = X.copy()
         for idx in indices:
             X_ablated[:, idx] = 0.0
-        delta = log_loss(y, model.predict_proba(X_ablated)) - e_orig
+        delta = log_loss(y, model.predict_proba(X_ablated), labels=model.classes_) - e_orig
         single_delta[key] = delta
         return delta
 
@@ -727,14 +727,23 @@ def _bootstrap_split(X_scaled, y, b):
     membership, VI metrics and performance metrics all use the OOB rows, so a
     model that memorizes its bootstrap can't win membership on training loss.
 
-    Returns ``None`` when the OOB rows hold fewer than two classes, since
-    log-loss-based membership and VI aren't meaningful there.
+    Returns ``None`` (an invalid bootstrap) unless both the in-bag and the OOB
+    rows contain every class in ``y``. A model fit on an in-bag sample missing a
+    class has fewer ``classes_``/``predict_proba`` columns than its peers, and
+    OOB rows missing a class break multiclass log-loss/AUPRC; rare classes hit
+    this (e.g. Staellert's 13-cell M phase loses all its OOB rows at seeds 227
+    and 416). Seeds are unchanged, so valid bootstraps are unaffected.
     """
 
     in_bag = resample(np.arange(len(y)), random_state=b)
     oob_mask = np.ones(len(y), dtype=bool)
     oob_mask[in_bag] = False
-    if np.unique(y[oob_mask]).size < 2:
+    n_classes = np.unique(y).size
+    if (
+        n_classes < 2
+        or np.unique(y[in_bag]).size < n_classes
+        or np.unique(y[oob_mask]).size < n_classes
+    ):
         return None
     return X_scaled[in_bag], y[in_bag], X_scaled[oob_mask], y[oob_mask]
 
