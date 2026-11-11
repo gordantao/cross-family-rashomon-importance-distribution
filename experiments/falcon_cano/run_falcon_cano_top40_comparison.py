@@ -604,12 +604,16 @@ def run_cross_family_rid(
 
 
 def _summarize_cross_family_perf(perf_summary: dict) -> dict:
+    # Families with no Rashomon members report NaN stats; average only the rest.
     family_perf_stats = perf_summary.get("family_perf_stats") or {}
-    accuracy_means = [stats["accuracy_mean"] for stats in family_perf_stats.values()]
-    auprc_means = [stats["auprc_mean"] for stats in family_perf_stats.values()]
+
+    def _mean_over_families(key: str) -> float | None:
+        values = [stats[key] for stats in family_perf_stats.values() if not np.isnan(stats[key])]
+        return float(np.mean(values)) if values else None
+
     return {
-        "accuracy_mean": float(np.mean(accuracy_means)) if accuracy_means else None,
-        "auprc_mean": float(np.mean(auprc_means)) if auprc_means else None,
+        "accuracy_mean": _mean_over_families("accuracy_mean"),
+        "auprc_mean": _mean_over_families("auprc_mean"),
     }
 
 
@@ -1075,19 +1079,19 @@ def main() -> None:
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
             "top_features": rid_tree_features,
-            "rashomon_train_perf_stats": rid_tree_perf,
+            "rashomon_oob_perf_stats": rid_tree_perf,
         },
         "cross_family_unweighted": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
             "top_features": cross_family_features["unweighted"],
-            "rashomon_train_perf_stats": cross_family_perf["unweighted"],
+            "rashomon_oob_perf_stats": cross_family_perf["unweighted"],
         },
         "cross_family_weighted": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
             "top_features": cross_family_features["weighted"],
-            "rashomon_train_perf_stats": cross_family_perf["weighted"],
+            "rashomon_oob_perf_stats": cross_family_perf["weighted"],
         },
         "overlap_counts": overlap_counts,
     }
@@ -1114,12 +1118,12 @@ def main() -> None:
         overall_row[f"{name}_n_features_selected"] = len(method_feature_lists[name])
     overall_row.update(
         {
-            "rid_tree_rashomon_train_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
-            "rid_tree_rashomon_train_auprc_mean": rid_tree_perf.get("auprc_mean"),
-            "cross_family_unweighted_rashomon_train_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
-            "cross_family_unweighted_rashomon_train_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
-            "cross_family_weighted_rashomon_train_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],
-            "cross_family_weighted_rashomon_train_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
+            "rid_tree_rashomon_oob_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
+            "rid_tree_rashomon_oob_auprc_mean": rid_tree_perf.get("auprc_mean"),
+            "cross_family_unweighted_rashomon_oob_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
+            "cross_family_unweighted_rashomon_oob_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
+            "cross_family_weighted_rashomon_oob_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],
+            "cross_family_weighted_rashomon_oob_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
         }
     )
     if credit_split_ratios is not None:
