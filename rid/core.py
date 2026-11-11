@@ -498,7 +498,7 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
         raw_importances = {feature_name: [] for feature_name in feature_names}
         raw_weights = {feature_name: [] for feature_name in feature_names}
         for i, boot_importances in enumerate(per_bootstrap_importances):
-            boot_weights = per_bootstrap_weights[i] if per_bootstrap_weights is not None else None
+            boot_weights = per_bootstrap_weights[i][metric] if per_bootstrap_weights is not None else None
             for feature_name in feature_names:
                 values = boot_importances[metric][feature_name]
                 raw_importances[feature_name].extend(values)
@@ -524,7 +524,7 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
             if not boot_importances[metric][feature_names[0]]:
                 continue
             valid_count += 1
-            boot_weights = per_bootstrap_weights[i] if per_bootstrap_weights is not None else None
+            boot_weights = per_bootstrap_weights[i][metric] if per_bootstrap_weights is not None else None
             for feature_name in feature_names:
                 values = boot_importances[metric][feature_name]
                 if len(values) == 0:
@@ -907,18 +907,6 @@ def _run_single_bootstrap_cross_family(
             rashomon_models.append(model)
             rashomon_labels.append(name)
 
-    if family_balance_mode == "weighted":
-        family_sizes = {name: len(family_rashomon[name]) for name in non_empty_families}
-        inv_prop_sum = sum(1.0 / s for s in family_sizes.values())
-        model_weights = []
-        for name in non_empty_families:
-            size = family_sizes[name]
-            per_model_w = 1.0 / (size * size * inv_prop_sum)
-            for _ in family_rashomon[name]:
-                model_weights.append(per_model_w)
-    else:
-        model_weights = None
-
     if not rashomon_models:
         return empty_result, stats
 
@@ -935,6 +923,10 @@ def _run_single_bootstrap_cross_family(
         name: {metric_name: [] for metric_name, _ in performance_metric_specs}
         for name in model_configs
     }
+    # Family label of each model that produced values, per metric (a metric
+    # may return None for some families, e.g. ``coef`` on trees), so weights
+    # stay aligned with that metric's pooled values.
+    metric_labels = {metric_name: [] for metric_name, _ in vi_metric_specs}
 
     for model, label in zip(rashomon_models, rashomon_labels):
         metric_values = {}
@@ -951,6 +943,9 @@ def _run_single_bootstrap_cross_family(
                     boot_importances[metric_name][feature_name].append(
                         float(metric_values[metric_name][index])
                     )
+        for metric_name, _ in vi_metric_specs:
+            if metric_values[metric_name] is not None:
+                metric_labels[metric_name].append(label)
 
         y_pred = model.predict(X_oob)
         y_prob = model.predict_proba(X_oob)
@@ -969,6 +964,20 @@ def _run_single_bootstrap_cross_family(
             )
             if metric_value is not None:
                 boot_family_perf[label][metric_name].append(metric_value)
+
+    if family_balance_mode == "weighted":
+        # Per metric, each family with >=1 scored Rashomon member gets total
+        # mass 1/K (K = such families), split evenly over its s_f members:
+        # per-model weight 1/(K * s_f). Weights sum to 1 within this bootstrap.
+        model_weights = {}
+        for metric_name, labels in metric_labels.items():
+            family_sizes = {name: labels.count(name) for name in set(labels)}
+            n_families = len(family_sizes)
+            model_weights[metric_name] = [
+                1.0 / (n_families * family_sizes[name]) for name in labels
+            ]
+    else:
+        model_weights = None
 
     return (boot_importances, boot_family_counts, boot_family_perf, model_weights), stats
 
@@ -1418,7 +1427,9 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
 
         - ``"unweighted"``: each Rashomon model contributes equally.
         - ``"weighted"``: each family contributes equal total mass per
-          bootstrap (models are reweighted inversely by family Rashomon count).
+          bootstrap: each model gets weight ``1 / (K * s_f)``, where ``s_f``
+          is its family's Rashomon count and ``K`` the number of families
+          with at least one Rashomon member in that bootstrap.
 
         If ``None``, this is normalized to ``"unweighted"``.
 
