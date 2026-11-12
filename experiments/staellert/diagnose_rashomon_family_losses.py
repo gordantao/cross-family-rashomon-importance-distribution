@@ -602,8 +602,9 @@ def plot_rf_heatmaps(df, epsilon, plt, path):
     rf = df[df["family"] == "RandomForest"]
     if not rf.empty and "cfg_n_estimators" in rf:
         # Shared-pool configs are continuous draws, so bin them for the heatmap.
+        # Left-closed so exactly 100/200 trees land in "100-199"/">=200".
         rf = rf.assign(
-            n_estimators=pd.cut(rf["cfg_n_estimators"], [0, 100, 200, np.inf],
+            n_estimators=pd.cut(rf["cfg_n_estimators"], [0, 100, 200, np.inf], right=False,
                                 labels=["<100", "100-199", ">=200"]).astype(str),
             max_depth=pd.cut(rf["cfg_max_depth"], [0, 3, 5, 8, 12, np.inf],
                              labels=["2-3", "4-5", "6-8", "9-12", "13-20"]).astype(str),
