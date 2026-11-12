@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import pickle
@@ -389,6 +390,11 @@ def main():
     logger.info(f"  Cross-family balance modes: {args.cross_family_balance_modes}")
     logger.info(f"  Curated descriptors: {args.use_curated_descriptors}")
     logger.info(f"{'=' * 60}\n")
+
+    # Record every RID setting (n_bootstraps, epsilon, n_models_pool, ...) next
+    # to the pickled results so runs with different settings can be told apart.
+    with open(os.path.join(args.output_dir, "run_settings.json"), "w", encoding="utf-8") as handle:
+        json.dump({"args": vars(args)}, handle, indent=2, default=str)
 
     df = pd.read_csv(args.data)
     if "Unnamed: 0" in df.columns:
