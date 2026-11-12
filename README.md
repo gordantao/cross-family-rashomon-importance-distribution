@@ -80,7 +80,6 @@ Varma, M. V. S., Obach, R. S., Rotter, C. *et al.* “Physicochemical Space for 
 ## Repository Layout
 
 - `rid/` — the shared `CrossFamilyRashomonImportanceDistribution` package used by every experiment below.
-- `docs/` — model write-up and diagrams for the cross-family RID methodology.
 - `experiments/falcon_cano/` — the bioavailability study (this README), driven by `run_rashomon_falcon_cano.py`.
 - `experiments/staellert/` — the Staellert single-cell manifold top-40 feature comparison, driven by `run_staellert_top40_comparison.py`.
 - `experiments/nonlinear_interaction_simulation/` — the synthetic simulation study that validates RID against known ground-truth DGPs, driven by `run_nonlinear_interaction_simulation.py`.

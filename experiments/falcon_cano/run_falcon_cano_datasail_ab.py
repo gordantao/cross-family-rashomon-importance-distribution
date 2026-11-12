@@ -3,7 +3,7 @@
 comparison between methods, versus the current StratifiedKFold evaluator
 which is blind to compound structure?
 
-Motivation (see docs/findings_summary.md \\S11): Falcon-Cano's raw compound
+Motivation: Falcon-Cano's raw compound
 list contains substantial congeneric families (e.g. 26 "-azole" antifungals,
 25 "-pril" ACE inhibitors). Plain StratifiedKFold can put near-identical
 analogs on both sides of a fold, inflating held_out_cv_score. DataSAIL's

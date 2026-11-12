@@ -1,8 +1,7 @@
 """Choose how many top-ranked features to report via elbow detection on each
 method's own already-computed signal curve, instead of an arbitrary fixed
-top-k or a deviance-based BIC/AIC refit sweep (this file's earlier approach --
-see `docs/aic_bic_feature_count_selection.md`, local-only, for that rationale
-and results, now superseded by this one).
+top-k or a deviance-based BIC/AIC refit sweep (this file's earlier approach,
+now superseded by this one).
 
 RID-based methods (rid_tree, cross_family_unweighted, cross_family_weighted)
 already compute, as a side effect of fitting, each feature's `prob_positive`

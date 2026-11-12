@@ -2,11 +2,10 @@
 """Test whether RID's own reported uncertainty predicts genuine single-model
 instability under resampling.
 
-RID's stated purpose (see docs/cross_family_rashomon_importance_distribution.md)
-is answering "how stable is importance across many near-optimal models" -- not
-"which top-k subset predicts best" (that's what the *_top40_comparison.py
-scripts and the ground-truth precision/recall metrics in
-run_nonlinear_interaction_simulation.py already test). This script targets
+RID's stated purpose is answering "how stable is importance across many
+near-optimal models" -- not "which top-k subset predicts best" (that's what
+the *_top40_comparison.py scripts and the ground-truth precision/recall
+metrics in run_nonlinear_interaction_simulation.py already test). This script targets
 the stability claim directly:
 
 1) Repeatedly bootstrap-refit ONE single model (no Rashomon epsilon
