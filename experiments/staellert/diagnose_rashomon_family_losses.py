@@ -6,7 +6,14 @@ all 100 bootstraps. compute_rid_cross_family discards every candidate's loss onc
 membership is decided, so this script re-runs the grid cross-family candidate
 search (same data prep, scaler, bootstrap splits, grids and seeds as the
 cross_family_unweighted method of run_staellert_top40_comparison.py) and records
-one row per candidate instead of a Rashomon set:
+one row per candidate instead of a Rashomon set.
+
+It mirrors the comparison's outer stratified holdout protocol: the labelled rows
+are split once (--holdout-fraction, --holdout-seed; same defaults as the
+comparison), imputation and column filters are fit on the train rows, and the
+candidate search runs on the train rows only -- exactly the X, y that
+run_cross_family_rid receives there. The held-out test rows are never touched.
+Each candidate row records:
 
 - OOB log-loss (exactly rid.models.candidate_loss, the membership loss),
   accuracy, balanced accuracy, Brier score, top-label ECE, per-class mean loss,
@@ -81,7 +88,8 @@ PROBE_RF_SEED_MULTIPLIER = 3500
 PROB_CLIP = np.finfo(np.float64).eps
 ECE_BINS = 15
 # Settings that change collected rows; a results dir written under others is refused.
-SETTING_KEYS = ("task", "correlation_threshold", "n_models_pool", "rf_probe", "families")
+SETTING_KEYS = ("task", "correlation_threshold", "holdout_fraction", "holdout_seed", "n_models_pool",
+                "rf_probe", "families")
 
 
 # --------------------------------------------------------------------------- collect
@@ -271,13 +279,17 @@ def _check_settings(output_dir, settings):
 
 def run_collect(args):
     task_config = TASK_REGISTRY[args.task]
-    X, y, meta = _prepare_task_dataset(
+    # Train rows only, as in the comparison; the test rows are discarded unseen.
+    X, _, y, _, meta = _prepare_task_dataset(
         csv_path=Path(args.data_dir) / task_config["file"],
         target_column=task_config["target_column"],
         correlation_threshold=args.correlation_threshold,
         include_phate_features=False,
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
     )
-    # Same preprocessing as compute_rid_cross_family: scale on all rows once.
+    holdout_meta = meta["holdout"]
+    # Same preprocessing as compute_rid_cross_family: scale on all (train) rows once.
     X_values, y_values, _ = _prepare_inputs(X, y)
     X_scaled = StandardScaler().fit_transform(X_values)
     classes = sorted(np.unique(y_values))
@@ -299,19 +311,27 @@ def run_collect(args):
     settings = {
         "task": args.task,
         "correlation_threshold": args.correlation_threshold,
+        "holdout_fraction": args.holdout_fraction,
+        "holdout_seed": args.holdout_seed,
         "n_models_pool": args.n_models_pool,
         "rf_probe": args.rf_probe,
         "families": list(families),
+        "evaluation_protocol": holdout_meta["protocol"],
+        "holdout_test_rows_sha256": holdout_meta["test_rows_sha256"],
         "n_rows": meta["n_rows"],
+        "n_train_rows": int(X.shape[0]),
         "n_features": meta["n_features_after_corr"],
         "class_counts": meta["class_counts"],
+        "train_class_counts": holdout_meta["train_class_counts"],
         "rashomon_evaluation": "out_of_bag",
     }
     _check_settings(output_dir, settings)
 
     bootstraps = args.bootstraps if args.bootstraps else list(range(args.n_bootstraps))
     todo = [b for b in bootstraps if not _bootstrap_done(per_bootstrap_dir, b)]
-    logger.info(f"{X.shape[0]} rows x {X.shape[1]} features, classes {meta['class_counts']}")
+    logger.info(f"{X.shape[0]} train rows (of {meta['n_rows']}; test rows sha256 "
+                f"{holdout_meta['test_rows_sha256']}) x {X.shape[1]} features, "
+                f"classes {holdout_meta['train_class_counts']}")
     logger.info(f"families: {list(families)} (+{PROBE_FAMILY})" if args.rf_probe else f"families: {list(families)}")
     logger.info(f"bootstraps: {len(bootstraps)} requested, {len(bootstraps) - len(todo)} already done, "
                 f"{len(todo)} to run on {args.n_jobs} workers")
@@ -721,9 +741,13 @@ def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("command", choices=["collect", "plot"])
     parser.add_argument("--data-dir", default=str(SCRIPT_DIR / "data" / "staellert_et_al"))
-    parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results" / "rashomon_family_diagnostics"))
+    parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results" / "rashomon_family_diagnostics_holdout"))
     parser.add_argument("--task", default="annotated_phase", choices=list(TASK_REGISTRY))
     parser.add_argument("--correlation-threshold", type=float, default=0.8)
+    parser.add_argument("--holdout-fraction", type=float, default=0.2,
+                        help="Outer stratified test fraction, as in the comparison script (default: 0.2)")
+    parser.add_argument("--holdout-seed", type=int, default=42,
+                        help="Outer train/test split seed, as in the comparison script (default: 42)")
     parser.add_argument("--n-bootstraps", type=int, default=100)
     parser.add_argument("--bootstraps", type=int, nargs="+", default=None,
                         help="Run only these bootstrap indices (e.g. for a smoke test)")

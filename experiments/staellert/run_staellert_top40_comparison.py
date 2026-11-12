@@ -327,18 +327,22 @@ def _drop_index_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep_cols].copy()
 
 
-def _sanitize_features(X: pd.DataFrame, fit_index: pd.Index) -> pd.DataFrame:
+def _sanitize_features(X: pd.DataFrame, fit_index: pd.Index | None = None) -> pd.DataFrame:
     """Numeric columns, inf -> NaN, then drop all-NaN columns, median-impute and drop
-    constant columns -- each judged on the fit_index (train) rows only."""
+    constant columns -- each judged on the fit_index (train) rows only, or on all
+    rows when fit_index is None."""
+
+    def _fit_rows(frame: pd.DataFrame) -> pd.DataFrame:
+        return frame if fit_index is None else frame.loc[fit_index]
 
     X = X.select_dtypes(include=[np.number]).copy()
     X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.loc[:, X.loc[fit_index].notna().any()]
+    X = X.loc[:, _fit_rows(X).notna().any()]
 
     if X.isna().any().any():
-        X = X.fillna(X.loc[fit_index].median())
+        X = X.fillna(_fit_rows(X).median())
 
-    constant_cols = [col for col in X.columns if X.loc[fit_index, col].nunique(dropna=False) <= 1]
+    constant_cols = [col for col in X.columns if _fit_rows(X)[col].nunique(dropna=False) <= 1]
     if constant_cols:
         X = X.drop(columns=constant_cols)
     return X

@@ -378,16 +378,18 @@ def _make_holdout_split(y: pd.Series, holdout_fraction: float, holdout_seed: int
     return train_index, test_index, metadata
 
 
-def _prepare_dataset(
+def _load_filtered_dataset(
     data_path: Path,
     use_curated_descriptors: bool,
     correlation_threshold: float,
-    holdout_fraction: float,
-    holdout_seed: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, dict]:
-    """Load the data, split it into train/test rows, and fit the correlation
-    filter on the train rows only. Returns (X_train, X_test, y_train, y_test,
-    metadata); row ids are the CSV's row numbers."""
+    holdout_fraction: float | None = None,
+    holdout_seed: int | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Index | None, pd.Index | None, dict]:
+    """Shared loader: read the CSV and curate descriptors, then fit the
+    correlation filter on the train rows of an outer holdout split, or on all
+    rows when holdout_fraction is None. Returns (X, y, train_index, test_index,
+    metadata) over all rows (indices None when unsplit); row ids are the CSV's
+    row numbers."""
 
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {data_path}")
@@ -399,16 +401,19 @@ def _prepare_dataset(
     X = df.drop(columns=["target"])
     y = df["target"].astype(int)
 
-    train_index, test_index, holdout_meta = _make_holdout_split(y, holdout_fraction, holdout_seed)
+    train_index = test_index = holdout_meta = None
+    if holdout_fraction is not None:
+        train_index, test_index, holdout_meta = _make_holdout_split(y, holdout_fraction, holdout_seed)
 
     n_features_raw = X.shape[1]
     if use_curated_descriptors:
         X = select_curated_descriptors(X)  # a fixed descriptor list; looks at no rows
     n_features_curated = X.shape[1]
 
-    resolved_threshold, threshold_info = _resolve_correlation_threshold(X.loc[train_index], correlation_threshold)
-    X_train = remove_highly_correlated_features(X.loc[train_index], correlation_threshold=resolved_threshold)
-    X = X[X_train.columns]
+    X_fit = X if train_index is None else X.loc[train_index]
+    resolved_threshold, threshold_info = _resolve_correlation_threshold(X_fit, correlation_threshold)
+    X_fit = remove_highly_correlated_features(X_fit, correlation_threshold=resolved_threshold)
+    X = X_fit if train_index is None else X[X_fit.columns]
 
     metadata = {
         "dataset_path": str(data_path),
@@ -419,8 +424,38 @@ def _prepare_dataset(
         "n_features_after_corr": int(X.shape[1]),
         "class_counts": y.value_counts().to_dict(),
         "correlation_threshold_info": threshold_info,
-        "holdout": holdout_meta,
     }
+    if holdout_meta is not None:
+        metadata["holdout"] = holdout_meta
+    return X, y, train_index, test_index, metadata
+
+
+def _prepare_dataset_unsplit(
+    data_path: Path,
+    use_curated_descriptors: bool,
+    correlation_threshold: float,
+) -> tuple[pd.DataFrame, pd.Series, dict]:
+    """All rows, correlation filter fit on all rows (the pre-holdout loader). For
+    callers with no evaluation step, e.g. run_stability_analysis.py."""
+
+    X, y, _, _, metadata = _load_filtered_dataset(data_path, use_curated_descriptors, correlation_threshold)
+    return X, y, metadata
+
+
+def _prepare_dataset(
+    data_path: Path,
+    use_curated_descriptors: bool,
+    correlation_threshold: float,
+    holdout_fraction: float,
+    holdout_seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, dict]:
+    """Load the data, split it into train/test rows, and fit the correlation
+    filter on the train rows only. Returns (X_train, X_test, y_train, y_test,
+    metadata); row ids are the CSV's row numbers."""
+
+    X, y, train_index, test_index, metadata = _load_filtered_dataset(
+        data_path, use_curated_descriptors, correlation_threshold, holdout_fraction, holdout_seed
+    )
     return X.loc[train_index], X.loc[test_index], y.loc[train_index], y.loc[test_index], metadata
 
 
