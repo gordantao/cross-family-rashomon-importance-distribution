@@ -216,7 +216,7 @@ def _config_columns(config):
     return {"cfg_0": config}
 
 
-def _collect_bootstrap(b, X_scaled, y, all_families, search_spaces, families, n_models_pool,
+def _collect_bootstrap(b, X_scaled, y, families, search_spaces, n_models_pool,
                        n_candidates_per_family, rf_probe, classes, out_dir):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -230,9 +230,9 @@ def _collect_bootstrap(b, X_scaled, y, all_families, search_spaces, families, n_
             raise RuntimeError(f"bootstrap {b}: _oob_rows no longer matches rid.core._bootstrap_split")
         folds = list(KFold(n_splits=2, shuffle=True, random_state=b).split(X_oob))
 
-        # Built over every family so each keeps its family position (and hence its
-        # pool draws and seeds) when --families selects a subset.
-        pool = build_candidate_pool(all_families, search_spaces, b, n_candidates_per_family)
+        # A family's pool draws and seeds depend only on (b, family name), so a
+        # --families subset sees the same candidates as the full comparison run.
+        pool = build_candidate_pool(families, search_spaces, b, n_candidates_per_family)
         sources = [(name, "standard",
                     _family_candidates(name, trainer, kwargs, pool.get(name), n_models_pool, b))
                    for name, (trainer, kwargs) in families.items()]
@@ -317,14 +317,14 @@ def run_collect(args):
     unknown = set(args.families or []) - set(all_families)
     if unknown:
         raise SystemExit(f"unknown --families {sorted(unknown)}; choose from {list(all_families)}")
-    resolved_families = {}
+    families = {}
     search_spaces = {}
     for name, model_config in all_families.items():
+        if args.families and name not in args.families:
+            continue
         model_class, trainer, kwargs = resolve_model_config(model_config)
-        resolved_families[name] = (trainer, kwargs)
+        families[name] = (trainer, kwargs)
         search_spaces[name] = resolve_default_search_space(model_class)
-    families = {name: value for name, value in resolved_families.items()
-                if not args.families or name in args.families}
 
     output_dir = Path(args.output_dir)
     per_bootstrap_dir = output_dir / "per_bootstrap"
@@ -361,9 +361,9 @@ def run_collect(args):
     start = time.perf_counter()
     done = 0
     results = Parallel(n_jobs=args.n_jobs, return_as="generator_unordered")(
-        delayed(_collect_bootstrap)(b, X_scaled, y_values, resolved_families, search_spaces, families,
-                                    args.n_models_pool, DEFAULT_N_CANDIDATES_PER_FAMILY,
-                                    args.rf_probe, classes, per_bootstrap_dir)
+        delayed(_collect_bootstrap)(b, X_scaled, y_values, families, search_spaces, args.n_models_pool,
+                                    DEFAULT_N_CANDIDATES_PER_FAMILY, args.rf_probe, classes,
+                                    per_bootstrap_dir)
         for b in todo
     )
     for b, n_rows, seconds in results:

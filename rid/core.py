@@ -1156,7 +1156,7 @@ def compute_rid_cross_family(
     ``"search_space"`` / ``"truvarimp_search_space"`` key in a family's config
     mapping), split evenly across its categorical sub-families and deduplicated
     after integer rounding. Each candidate's ``random_state`` is fixed by
-    (bootstrap, family position, candidate index), so a candidate fits to the
+    (bootstrap, family name, candidate index), so a candidate fits to the
     identical model in either mode. Any hyperparameter a family pins through its
     model kwargs is held fixed rather than searched. ``candidate_search`` then
     selects which pool candidates get fit:

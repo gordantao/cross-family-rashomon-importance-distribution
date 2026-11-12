@@ -17,15 +17,19 @@ Configs that collide after integer rounding (``max_depth``, ``n_estimators``,
 slightly fewer than its quota.
 
 Every candidate carries its own ``random_state``, a deterministic function of
-(bootstrap, family position, candidate index) -- see :func:`pool_random_state`
--- so the same candidate yields the identical fitted model and loss in either
-search mode. The draws themselves are seeded per (bootstrap, family position),
-so both modes see the identical pool for a given ``b``.
+(bootstrap, family name, candidate index) -- see :func:`pool_random_state` --
+so the same candidate yields the identical fitted model and loss in either
+search mode. The draws themselves are seeded per (bootstrap, family name), so
+both modes see the identical pool for a given ``b``. Keying by the family's
+name (via :func:`family_seed_key`, a CRC32, not Python's salted ``hash``)
+rather than its position in ``model_configs`` means adding, dropping or
+reordering other families leaves a family's pool and seeds unchanged.
 """
 
 from __future__ import annotations
 
 import itertools
+import zlib
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -199,27 +203,47 @@ def drop_pinned_dimensions(search_space, model_kwargs):
 # Per-candidate random_state
 # ---------------------------------------------------------------------------
 
-# random_state = (b * _POOL_MAX_FAMILIES + family_index) * _POOL_MAX_CANDIDATES + candidate_index.
-# Each bound is enforced, so distinct (b, family, candidate) triples never share a
-# seed; the product keeps every seed below 2**32 (sklearn's limit) for b < 13422.
-_POOL_MAX_FAMILIES = 32
+# random_state = (family_seed_key(family) + b * _POOL_MAX_CANDIDATES + candidate_index) mod 2**32.
+# Within a family, distinct (b, candidate) pairs never share a seed: the offset
+# b * _POOL_MAX_CANDIDATES + candidate_index is unique and kept below 2**32 (an
+# error otherwise), which every candidate satisfies for b < 429496.
+# Two *different* families may occasionally coincide on a seed; that is harmless,
+# since a seed only fixes randomness together with its family's estimator and config.
 _POOL_MAX_CANDIDATES = 10_000
-_MAX_RANDOM_STATE = 2**32 - 1
+_SEED_MODULUS = 2**32  # sklearn accepts random_state in [0, 2**32 - 1]
 
 
-def pool_random_state(b, family_index, candidate_index):
+def family_seed_key(family_name):
+    """Stable 32-bit key for a family name (CRC32; unlike ``hash``, not salted per process)."""
+
+    return zlib.crc32(str(family_name).encode("utf-8"))
+
+
+def pool_random_state(b, family_name, candidate_index):
     """The ``random_state`` a pool candidate is fit with, in either search mode."""
 
-    if not 0 <= family_index < _POOL_MAX_FAMILIES:
-        raise ValueError(f"The shared candidate pool supports at most {_POOL_MAX_FAMILIES} families")
     if not 0 <= candidate_index < _POOL_MAX_CANDIDATES:
         raise ValueError(
             f"The shared candidate pool supports at most {_POOL_MAX_CANDIDATES} candidates per family"
         )
-    seed = (b * _POOL_MAX_FAMILIES + family_index) * _POOL_MAX_CANDIDATES + candidate_index
-    if not 0 <= seed <= _MAX_RANDOM_STATE:
+    offset = b * _POOL_MAX_CANDIDATES + candidate_index
+    if not 0 <= offset < _SEED_MODULUS:
         raise ValueError(f"Bootstrap index {b} is too large for a valid candidate random_state")
-    return int(seed)
+    return int((family_seed_key(family_name) + offset) % _SEED_MODULUS)
+
+
+def _check_family_seed_keys(family_names):
+    """Two family names with the same CRC32 would get identical pool draws; refuse that."""
+
+    owners = {}
+    for name in family_names:
+        key = family_seed_key(name)
+        if key in owners:
+            raise ValueError(
+                f"Families {owners[key]!r} and {name!r} have the same seed key (CRC32 {key}) and "
+                "would draw identical candidate pools; rename one of them"
+            )
+        owners[key] = name
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +294,9 @@ def build_candidate_pool(resolved_model_configs, search_spaces, b, n_candidates_
     Parameters
     ----------
     resolved_model_configs : dict[str, (trainer, model_kwargs)]
-        Families in their declared order; a family's position in this mapping
-        (counting every family, pooled or not) is its ``family_index`` for
-        seeding, so the same configs always give the same pool.
+        Families keyed by name. Each family's draws and seeds depend only on
+        (``b``, its name), never on which other families are present or their
+        order, so the same family always gets the same pool.
     search_spaces : dict[str, ContinuousSearchSpace or None]
         Search space per family name.
     b : int
@@ -293,10 +317,9 @@ def build_candidate_pool(resolved_model_configs, search_spaces, b, n_candidates_
     if n_candidates_per_family < 1:
         raise ValueError("n_candidates_per_family must be at least 1")
 
+    _check_family_seed_keys(resolved_model_configs)
     pools = {}
-    for family_index, (family_name, (trainer, model_kwargs)) in enumerate(
-        resolved_model_configs.items()
-    ):
+    for family_name, (trainer, model_kwargs) in resolved_model_configs.items():
         search_space = search_spaces.get(family_name)
         # Only a GridCandidateTrainer's build_estimator takes the
         # (config, random_state, model_kwargs) signature used here.
@@ -309,7 +332,7 @@ def build_candidate_pool(resolved_model_configs, search_spaces, b, n_candidates_
         search_space, pinned = drop_pinned_dimensions(search_space, model_kwargs)
         log_flags = {name: dim.log for name, dim in search_space.continuous_dimensions().items()}
         subspaces = split_categorical_subspaces(search_space)
-        rng = np.random.default_rng([b, family_index])
+        rng = np.random.default_rng([b, family_seed_key(family_name)])
 
         subfamilies = []
         candidate_index = 0
@@ -332,7 +355,7 @@ def build_candidate_pool(resolved_model_configs, search_spaces, b, n_candidates_
                     continue
                 seen.add(key)
                 configs.append(point)
-                random_states.append(pool_random_state(b, family_index, candidate_index))
+                random_states.append(pool_random_state(b, family_name, candidate_index))
                 candidate_index += 1
             if not configs:
                 continue
