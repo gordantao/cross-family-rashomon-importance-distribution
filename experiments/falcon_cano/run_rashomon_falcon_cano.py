@@ -2,6 +2,14 @@
 """
 Rashomon Importance Distribution (RID) analysis - SLURM-compatible script.
 
+Runs single-family RID for every model family, then one cross-family RID
+(family_balance_mode='unweighted') whose candidates are chosen by joint
+TruVaRImp search (candidate_search='truvarimp_joint', rid/truvarimp.py), which
+spends --truvarimp-total-budget real fits per bootstrap on the shared candidate
+pool. The exhaustive grid cross-family search (and with it the weighted balance
+mode) was dropped as too expensive on real data; grid search is kept only in
+the nonlinear simulation, where it validates TruVaRImp.
+
 NUM_WORKERS is automatically synced with SLURM's --cpus-per-task via the
 SLURM_CPUS_PER_TASK environment variable. Falls back to os.cpu_count() for
 local runs.
@@ -37,7 +45,6 @@ from rid import (
     LinearClassifier,
     RashomonImportanceDistribution,
     RidgeClassifier,
-    VALID_CROSS_FAMILY_BALANCE_MODES,
     add_logging_arguments,
     configure_logging,
     silence_warnings,
@@ -261,23 +268,23 @@ def save_metric_plots(estimator, output_dir, filename_prefix, title_prefix):
         logger.info(f"  Saved: {filename_prefix}_{metric}.png")
 
 
-def save_family_composition_plot(output_dir, family_counts, balance_mode):
+def save_family_composition_plot(output_dir, family_counts, suffix, label):
     """Persist the cross-family Rashomon composition plot."""
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.bar(family_counts.keys(), family_counts.values())
     ax.set_title(
-        f"Model Family Representation in Cross-Family Rashomon Sets ({balance_mode})"
+        f"Model Family Representation in Cross-Family Rashomon Sets ({label})"
     )
     ax.set_ylabel("Total models across all bootstraps")
     plt.xticks(rotation=15)
     plt.tight_layout()
     fig.savefig(
-        os.path.join(output_dir, f"rid_family_composition_{balance_mode}.png"),
+        os.path.join(output_dir, f"rid_family_composition_{suffix}.png"),
         dpi=150,
     )
     plt.close(fig)
-    logger.info(f"  Saved: rid_family_composition_{balance_mode}.png")
+    logger.info(f"  Saved: rid_family_composition_{suffix}.png")
 
 
 def build_model_configs():
@@ -293,8 +300,8 @@ def build_model_configs():
         "Linear": (LinearClassifier, {}),
     }
 
-    # Example custom grid override (in cross-family "grid" mode a family with its
-    # own search_grid fits that grid instead of drawing from the shared pool):
+    # Example custom grid override (per-family RID fits this grid; cross-family
+    # TruVaRImp ignores search_grid and draws from the shared pool):
     # model_configs["SVM"] = {
     #     "model": SVC,
     #     "kwargs": {},
@@ -350,7 +357,11 @@ def main():
         "--n-models-pool",
         type=int,
         default=50,
-        help="Candidate models per bootstrap (default: 50)",
+        help=(
+            "Per-family RID n_models_pool (default: 50): seed refits per config for "
+            "seed-sensitive grids (RandomForest). Unused by cross-family RID, which "
+            "searches the shared candidate pool with TruVaRImp"
+        ),
     )
     parser.add_argument(
         "--cross-family-only",
@@ -359,11 +370,14 @@ def main():
         help="Skip per-family RID and run only the cross-family RID (faster)",
     )
     parser.add_argument(
-        "--cross-family-balance-modes",
-        nargs="+",
-        default=["unweighted", "weighted"],
-        choices=list(VALID_CROSS_FAMILY_BALANCE_MODES),
-        help="Cross-family balancing modes to run (default: unweighted weighted)",
+        "--truvarimp-total-budget",
+        type=int,
+        default=300,
+        help=(
+            "Shared per-bootstrap real-fit budget across all families for the "
+            "cross-family RID's TruVaRImp search (default: 300), spent on a shared pool "
+            "of rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY candidates per family"
+        ),
     )
     parser.add_argument(
         "--use-curated-descriptors",
@@ -389,7 +403,7 @@ def main():
     logger.info(f"  Epsilon:      {args.epsilon}")
     logger.info(f"  Models/pool:  {args.n_models_pool}")
     logger.info(f"  Cross-family only: {args.cross_family_only}")
-    logger.info(f"  Cross-family balance modes: {args.cross_family_balance_modes}")
+    logger.info(f"  TruVaRImp total budget: {args.truvarimp_total_budget}")
     logger.info(f"  Curated descriptors: {args.use_curated_descriptors}")
     logger.info(f"{'=' * 60}\n")
 
@@ -398,9 +412,12 @@ def main():
     with open(os.path.join(args.output_dir, "run_settings.json"), "w", encoding="utf-8") as handle:
         settings = {
             "args": vars(args),
-            # Cross-family RID fits every candidate of a shared pool of this many per
-            # family (rid.candidate_pool); per-family RID fits each grid config once
-            # (seed refits only for RandomForest).
+            # Cross-family RID: unweighted, TruVaRImp spending truvarimp_total_budget
+            # fits per bootstrap on a shared pool of n_candidates_per_family per family
+            # (rid.candidate_pool). Per-family RID fits each grid config once (seed
+            # refits only for RandomForest).
+            "cross_family_candidate_search": "truvarimp_joint",
+            "cross_family_balance_mode": "unweighted",
             "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
             "grid_refits": "seed_sensitive_only",
         }
@@ -459,23 +476,25 @@ def main():
             continue
         save_metric_plots(estimator, args.output_dir, f"rid_{name}", f"RID - {name}")
 
-    for balance_mode in args.cross_family_balance_modes:
-        logger.info(f"{'=' * 60}")
-        logger.info(f"Running cross-family RID... mode={balance_mode}")
-        estimator = CrossFamilyRashomonImportanceDistribution(
-            model_configs=cross_family_model_configs,
-            epsilon=args.epsilon,
-            n_bootstraps=args.n_bootstraps,
-            n_models_per_class=args.n_models_pool,
-            family_balance_mode=balance_mode,
-            n_jobs=num_workers,
-        )
-        estimator.fit(X_filtered, y)
+    suffix = "cross_family_unweighted_truvarimp"
+    label = "unweighted, TruVaRImp"
+    logger.info(f"{'=' * 60}")
+    logger.info(
+        f"Running cross-family RID... mode=unweighted candidate_search=truvarimp_joint "
+        f"total_budget={args.truvarimp_total_budget}"
+    )
+    estimator = CrossFamilyRashomonImportanceDistribution(
+        model_configs=cross_family_model_configs,
+        epsilon=args.epsilon,
+        n_bootstraps=args.n_bootstraps,
+        family_balance_mode="unweighted",
+        n_jobs=num_workers,
+        candidate_search="truvarimp_joint",
+        truvarimp_config={"total_budget": args.truvarimp_total_budget},
+    )
+    estimator.fit(X_filtered, y)
 
-        if estimator.metric_results_ is None:
-            continue
-
-        suffix = f"cross_family_{balance_mode}"
+    if estimator.metric_results_ is not None:
         data_path = os.path.join(args.output_dir, f"rid_{suffix}_data.pkl")
         with open(data_path, "wb") as handle:
             pickle.dump(
@@ -483,7 +502,9 @@ def main():
                     "metrics": estimator.metric_results_,
                     "family_counts": estimator.family_counts_,
                     "family_perf": estimator.family_perf_stats_,
-                    "family_balance_mode": balance_mode,
+                    "family_balance_mode": "unweighted",
+                    "candidate_search": "truvarimp_joint",
+                    "truvarimp_total_budget": args.truvarimp_total_budget,
                 },
                 handle,
                 protocol=pickle.HIGHEST_PROTOCOL,
@@ -491,7 +512,7 @@ def main():
         logger.info(f"  Saved: rid_{suffix}_data.pkl")
 
         logger.info(f"{'=' * 60}")
-        logger.info(f"Cross-family RID results ({balance_mode}):")
+        logger.info(f"Cross-family RID results ({label}):")
         logger.info(f"  Family representation: {estimator.family_counts_}")
         if estimator.family_perf_stats_:
             logger.info("  Accuracy and AUPRC by model family (Rashomon models):")
@@ -501,16 +522,16 @@ def main():
                     f"AUPRC={perf_stats['auprc_mean']:.3f}\u00b1{perf_stats['auprc_std']:.3f}"
                 )
         print_metric_rankings(
-            f"Cross-family RID ({balance_mode})",
+            f"Cross-family RID ({label})",
             estimator,
         )
         save_metric_plots(
             estimator,
             args.output_dir,
             f"rid_{suffix}",
-            f"Cross-Family RID (mode={balance_mode})",
+            f"Cross-Family RID ({label})",
         )
-        save_family_composition_plot(args.output_dir, estimator.family_counts_, balance_mode)
+        save_family_composition_plot(args.output_dir, estimator.family_counts_, suffix, label)
 
     elapsed = time.time() - start_time
     logger.info(f"{'=' * 60}")
