@@ -976,6 +976,16 @@ def _method_settings(method: str, args: argparse.Namespace, holdout_meta: dict) 
     return settings
 
 
+def _run_key(args: argparse.Namespace) -> dict:
+    """Every result-changing argument across methods. A task_summary_row.json written
+    under a different key (or none, i.e. before this was recorded) is left out of
+    overall_task_summary.csv, so it never mixes rows from different settings or splits
+    (the test-row hash is determined by data_fingerprint, holdout_* and the task)."""
+
+    keys = sorted(set().union(*METHOD_SETTING_KEYS.values()))
+    return json.loads(json.dumps({key: getattr(args, key) for key in keys}))
+
+
 def _method_result_path(task_output_dir: Path, method: str) -> Path:
     return task_output_dir / f"{method}_result.json"
 
@@ -1274,7 +1284,7 @@ def _run_single_task(
     row.update(overlap_counts)
 
     # Saved so whichever invocation finishes last can assemble every task's row.
-    _write_json_atomic(row, task_output_dir / "task_summary_row.json")
+    _write_json_atomic({**row, "run_key": _run_key(args)}, task_output_dir / "task_summary_row.json")
     logger.info(f"[task] combined outputs saved in {task_output_dir}")
     return row
 
@@ -1311,16 +1321,24 @@ def main() -> None:
 
     # An array task runs one (task, method) pair, so collect every task that any
     # invocation has finished, not only the ones this invocation ran.
-    finished = [name for name in TASK_REGISTRY if (output_dir / name / "task_summary_row.json").exists()]
+    run_key = _run_key(args)
+    finished, overall_rows = [], []
+    for name in TASK_REGISTRY:
+        row_path = output_dir / name / "task_summary_row.json"
+        if not row_path.exists():
+            continue
+        row = json.loads(row_path.read_text(encoding="utf-8"))
+        if row.pop("run_key", None) != run_key:
+            logger.warning(f"[task] {name}: {row_path} was written under other settings; leaving it out")
+            continue
+        finished.append(name)
+        overall_rows.append(row)
     if not finished:
         logger.info("=" * 70)
         logger.info("Checkpoints saved; no task has every method checkpointed yet")
         logger.info("=" * 70)
         return
 
-    overall_rows = [
-        json.loads((output_dir / name / "task_summary_row.json").read_text(encoding="utf-8")) for name in finished
-    ]
     overall_summary_path = output_dir / "overall_task_summary.csv"
     _write_csv_atomic(pd.DataFrame(overall_rows), overall_summary_path)
 
