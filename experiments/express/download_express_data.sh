@@ -68,7 +68,14 @@ elif [[ "$(head -c 2 "$S9")" != "PK" ]]; then
     echo "ERROR: $S9 isn't an xlsx (zip) file; it's probably a saved challenge page." >&2
     exit 1
 else
-    echo "ok    $(basename "$S9") (manual download)"
+    # sha256 of the copy downloaded 2026-11-12 (4,243,458 bytes). A mismatch only
+    # warns, since the publisher may reissue the file; check the column layout then.
+    S9_SHA=3090edf4e1e76ea35bd5e58a851b225b07ffbd87783672a12fdd3af7d166bc1b
+    if echo "$S9_SHA  $S9" | shasum -a 256 -c - >/dev/null 2>&1; then
+        echo "ok    $(basename "$S9") (manual download, sha256 matches)"
+    else
+        echo "WARN  $(basename "$S9") is an xlsx but its sha256 differs from the 2026-11-12 copy" >&2
+    fi
 fi
 
 echo "Downloaded to $RAW_DIR:"
