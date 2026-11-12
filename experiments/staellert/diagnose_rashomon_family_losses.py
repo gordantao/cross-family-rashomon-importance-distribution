@@ -54,7 +54,6 @@ from scipy.optimize import minimize_scalar
 from scipy.special import log_softmax
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import KFold
-from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -62,7 +61,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parents[1]))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from rid import add_logging_arguments, configure_logging, silence_warnings  # noqa: E402
-from rid.core import _bootstrap_split, _prepare_inputs  # noqa: E402
+from rid.core import _bootstrap_split, _prepare_inputs, _scale_in_bag  # noqa: E402
 from rid.candidate_pool import (  # noqa: E402
     DEFAULT_N_CANDIDATES_PER_FAMILY,
     build_candidate_pool,
@@ -84,7 +83,7 @@ ECE_BINS = 15
 # Settings that change collected rows; a results dir written under others is refused.
 SETTING_KEYS = ("task", "correlation_threshold", "holdout_fraction", "holdout_seed", "n_models_pool",
                 "n_candidates_per_family", "families", "evaluation_protocol",
-                "holdout_test_rows_sha256")
+                "holdout_test_rows_sha256", "scaling")
 
 
 # --------------------------------------------------------------------------- collect
@@ -198,15 +197,16 @@ def _config_columns(config):
     return {"cfg_0": config}
 
 
-def _collect_bootstrap(b, X_scaled, y, families, search_spaces, n_models_pool,
+def _collect_bootstrap(b, X_values, y, families, search_spaces, n_models_pool,
                        n_candidates_per_family, classes, out_dir):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         start = time.perf_counter()
-        split = _bootstrap_split(X_scaled, y, b)
+        split = _bootstrap_split(X_values, y, b)
         if split is None:
             return b, 0, 0.0
         X_boot, y_boot, X_oob, y_oob = split
+        X_boot, X_oob = _scale_in_bag(X_boot, X_oob)
         oob_rows = _oob_rows(len(y), b)
         if len(oob_rows) != len(y_oob) or not np.array_equal(y[oob_rows], y_oob):
             raise RuntimeError(f"bootstrap {b}: _oob_rows no longer matches rid.core._bootstrap_split")
@@ -292,9 +292,9 @@ def run_collect(args):
         holdout_seed=args.holdout_seed,
     )
     holdout_meta = meta["holdout"]
-    # Same preprocessing as compute_rid_cross_family: scale on all (train) rows once.
+    # Same preprocessing as compute_rid_cross_family: unscaled here, each bootstrap
+    # standardizes on its own in-bag rows (_collect_bootstrap).
     X_values, y_values, _ = _prepare_inputs(X, y)
-    X_scaled = StandardScaler().fit_transform(X_values)
     classes = sorted(np.unique(y_values))
 
     all_families = _build_cross_family_model_configs()
@@ -329,6 +329,8 @@ def run_collect(args):
         "class_counts": meta["class_counts"],
         "train_class_counts": holdout_meta["train_class_counts"],
         "rashomon_evaluation": "out_of_bag",
+        # Collections scaled once on all train rows lack this key and are refused.
+        "scaling": "in_bag_per_bootstrap",
     }
     _check_settings(output_dir, settings)
 
@@ -344,7 +346,7 @@ def run_collect(args):
     start = time.perf_counter()
     done = 0
     results = Parallel(n_jobs=args.n_jobs, return_as="generator_unordered")(
-        delayed(_collect_bootstrap)(b, X_scaled, y_values, families, search_spaces, args.n_models_pool,
+        delayed(_collect_bootstrap)(b, X_values, y_values, families, search_spaces, args.n_models_pool,
                                     DEFAULT_N_CANDIDATES_PER_FAMILY, classes,
                                     per_bootstrap_dir)
         for b in todo
