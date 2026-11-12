@@ -268,7 +268,11 @@ def _check_settings(output_dir, settings):
     path = output_dir / "settings.json"
     if path.exists():
         existing = json.loads(path.read_text(encoding="utf-8"))
-        if {k: existing.get(k) for k in SETTING_KEYS} != {k: settings[k] for k in SETTING_KEYS}:
+        # Collections from before the RF probe was removed record rf_probe (default on)
+        # and hold probe rows; resuming one would mix in probe-less bootstraps.
+        if existing.get("rf_probe") or (
+            {k: existing.get(k) for k in SETTING_KEYS} != {k: settings[k] for k in SETTING_KEYS}
+        ):
             raise SystemExit(
                 f"{path} was written with {existing}, but this run uses {settings}. "
                 "Use a different --output-dir, or delete it to recompute."
