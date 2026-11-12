@@ -90,6 +90,13 @@ def _eligible_interaction_pairs(X, correlation_threshold=0.8):
         return [], n_total_pairs
 
     corr = np.corrcoef(X, rowvar=False)
+    # A column constant over these rows has undefined correlation (NaN, so its
+    # pairs are skipped). Mark it explicitly: np.corrcoef's mean of n equal
+    # nonzero values can be off by rounding, giving a garbage finite value that
+    # would make eligibility depend on the column's offset/scale.
+    constant = np.ptp(X, axis=0) == 0
+    corr[constant, :] = np.nan
+    corr[:, constant] = np.nan
     eligible_pairs = [
         (j, k)
         for j in range(n_features)
