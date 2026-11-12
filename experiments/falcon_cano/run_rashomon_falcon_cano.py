@@ -29,6 +29,7 @@ from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from rid.candidate_pool import DEFAULT_N_CANDIDATES_PER_FAMILY
 from rid import (
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -292,7 +293,8 @@ def build_model_configs():
         "Linear": (LinearClassifier, {}),
     }
 
-    # Example custom grid override:
+    # Example custom grid override (in cross-family "grid" mode a family with its
+    # own search_grid fits that grid instead of drawing from the shared pool):
     # model_configs["SVM"] = {
     #     "model": SVC,
     #     "kwargs": {},
@@ -394,7 +396,15 @@ def main():
     # Record every RID setting (n_bootstraps, epsilon, n_models_pool, ...) next
     # to the pickled results so runs with different settings can be told apart.
     with open(os.path.join(args.output_dir, "run_settings.json"), "w", encoding="utf-8") as handle:
-        json.dump({"args": vars(args)}, handle, indent=2, default=str)
+        settings = {
+            "args": vars(args),
+            # Cross-family RID fits every candidate of a shared pool of this many per
+            # family (rid.candidate_pool); per-family RID fits each grid config once
+            # (seed refits only for RandomForest).
+            "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
+            "grid_refits": "seed_sensitive_only",
+        }
+        json.dump(settings, handle, indent=2, default=str)
 
     df = pd.read_csv(args.data)
     if "Unnamed: 0" in df.columns:

@@ -78,6 +78,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from correlation_threshold_sweep import find_elbow, sweep_thresholds  # noqa: E402
 from feature_count_selection import select_k_by_cv_gain, select_k_by_prob_positive  # noqa: E402
 from mrmr_selection import reorder_by_mrmr  # noqa: E402
+from rid.candidate_pool import DEFAULT_N_CANDIDATES_PER_FAMILY  # noqa: E402
 from rid import (  # noqa: E402
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -312,7 +313,12 @@ def _parse_args() -> argparse.Namespace:
         "--rid-n-models-pool",
         type=int,
         default=50,
-        help="Candidate refits per grid point, per bootstrap, for the tree Rashomon set (default: 50)",
+        help=(
+            "RID n_models_pool / n_models_per_class (default: 50). Only sets seed refits for "
+            "seed-sensitive grids and custom trainers: the tree grid fits each config once, and "
+            "cross-family RID draws a shared candidate pool of "
+            "rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY per family instead"
+        ),
     )
     parser.add_argument(
         "--rid-n-jobs",
@@ -1242,18 +1248,26 @@ def main() -> None:
         "rid_tree": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
+            # Each grid config fit once per bootstrap; no criterion="log_loss" duplicates.
+            "grid_refits": "seed_sensitive_only",
             "top_features": rid_tree_features,
             "rashomon_oob_perf_stats": rid_tree_perf,
         },
         "cross_family_unweighted": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
+            # Grid search = every candidate of the shared pool fit once (rid.candidate_pool).
+            "candidate_search": "grid",
+            "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
             "top_features": cross_family_features["unweighted"],
             "rashomon_oob_perf_stats": cross_family_perf["unweighted"],
         },
         "cross_family_weighted": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
+            # Grid search = every candidate of the shared pool fit once (rid.candidate_pool).
+            "candidate_search": "grid",
+            "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
             "top_features": cross_family_features["weighted"],
             "rashomon_oob_perf_stats": cross_family_perf["weighted"],
         },

@@ -48,6 +48,7 @@ from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from rid.candidate_pool import DEFAULT_N_CANDIDATES_PER_FAMILY  # noqa: E402
 from rid import (
     CrossFamilyRashomonImportanceDistribution,
     FullyEnumeratedTreeClassifier,
@@ -1273,7 +1274,12 @@ def parse_args():
         "--models-per-class",
         type=int,
         default=DEFAULT_MODELS_PER_CLASS,
-        help="Candidate models per class/grid-point per bootstrap, shared by cross-family RID and single-family tree RID",
+        help=(
+            "RID n_models_per_class / n_models_pool. Only sets seed refits for seed-sensitive "
+            "grids and custom trainers: rid_tree fits each tree config once, and cross-family "
+            "RID fits a shared candidate pool of rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY "
+            "per family"
+        ),
     )
     parser.add_argument(
         "--beta-grid",
@@ -1391,6 +1397,10 @@ def main():
 
     study_settings = {
         "rashomon_evaluation": "out_of_bag",
+        # Added 2026-11-12: cross-family grid search fits every candidate of the shared
+        # pool (rid.candidate_pool) once; rid_tree fits each grid config once.
+        "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
+        "grid_refits": "seed_sensitive_only",
         "sample_size": args.sample_size,
         "repetitions_per_beta": args.repetitions,
         "bootstraps": args.bootstraps,

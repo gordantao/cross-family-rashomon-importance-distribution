@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from rid.candidate_pool import DEFAULT_N_CANDIDATES_PER_FAMILY  # noqa: E402
 from rid import (
     CrossFamilyRashomonImportanceDistribution,
     add_logging_arguments,
@@ -167,9 +168,9 @@ def parse_args():
         type=int,
         default=base.DEFAULT_MODELS_PER_CLASS,
         help=(
-            "Candidate models per grid-point per bootstrap for rid_tree (single-family RID) "
-            "only -- compute_rid has no candidate_search option, so the tree family always "
-            "uses the grid path regardless of --truvarimp-total-budget."
+            "n_models_pool for rid_tree (single-family RID) only -- compute_rid has no "
+            "candidate_search option, so the tree family always uses its hand-made grid. "
+            "Each tree config is fit once, so this currently has no effect."
         ),
     )
     parser.add_argument(
@@ -258,6 +259,10 @@ def main():
         "repetitions_per_beta": args.repetitions,
         "bootstraps": args.bootstraps,
         "truvarimp_total_budget": args.truvarimp_total_budget,
+        # Added 2026-11-12: TruVaRImp searches the shared pool (rid.candidate_pool) of
+        # this many candidates per family; rid_tree fits each grid config once.
+        "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
+        "grid_refits": "seed_sensitive_only",
         "models_per_class_rid_tree_only": args.models_per_class,
         "beta_grid": args.beta_grid,
         "noise_std": args.noise_std,
