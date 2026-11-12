@@ -51,16 +51,32 @@ def candidate_loss(model, X_eval, y_eval):
 
 @dataclass(frozen=True)
 class GridCandidateTrainer:
-    """Trainer for model families explored through a hyperparameter grid."""
+    """Trainer for model families explored through a hyperparameter grid.
+
+    Used directly by single-family RID (``compute_rid``) and by cross-family RID
+    for families outside the shared candidate pool (no search space, or a custom
+    ``search_grid``); pooled cross-family families only use ``build_estimator``
+    (see ``rid.candidate_pool``).
+
+    ``refit_seeds=False`` (default) fits each config once, with
+    ``random_state = b * random_state_multiplier``: for deterministic or
+    near-deterministic fits (lbfgs/SAGA logistic, CART, GBM without subsampling,
+    SVC whose seed only drives Platt-scaling CV) extra seeds only add
+    (near-)identical copies that act as hidden weights. ``refit_seeds=True``
+    (genuinely seed-dependent families, i.e. RandomForest) refits each config
+    ``max(1, n_models_pool // len(configs))`` times with seeds
+    ``b * random_state_multiplier + i``.
+    """
 
     configs: Sequence[Any]
     random_state_multiplier: int
     build_estimator: Callable[..., Any]
+    refit_seeds: bool = False
 
     def train(self, X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs):
         models = []
         losses = []
-        per = max(1, n_models_pool // len(self.configs))
+        per = max(1, n_models_pool // len(self.configs)) if self.refit_seeds else 1
 
         for config in self.configs:
             for i in range(per):
@@ -301,6 +317,9 @@ TRAINER_REGISTRY = {
         ],
         random_state_multiplier=3000,
         build_estimator=_build_random_forest_estimator,
+        # Bootstrap rows and feature subsets are drawn from random_state, so
+        # different seeds give genuinely different forests.
+        refit_seeds=True,
     ),
     GradientBoostingClassifier: GridCandidateTrainer(
         configs=[
@@ -349,15 +368,17 @@ TRAINER_REGISTRY = {
         # bootstrap sample in earlier experiments, degenerating the Rashomon
         # set into just the most overfit trees. min_samples_leaf and criterion
         # are the two axes safe to widen for more grid diversity: this family's
-        # refits are deterministic CART (no bagging/subsampling), so every
-        # fit at a given grid point returns the same tree regardless of
-        # random_state -- distinct grid points are the only real source of
-        # diversity in this family's Rashomon set, unlike RandomForest.
+        # fits are deterministic CART (no bagging/subsampling; random_state only
+        # breaks ties), so each grid point is fit once (refit_seeds=False) --
+        # distinct grid points are the only real source of diversity in this
+        # family's Rashomon set, unlike RandomForest. "log_loss" is not listed:
+        # sklearn maps it to the same Entropy criterion as "entropy", so it
+        # only duplicated every entropy tree.
         configs=[
             (max_depth, min_samples_leaf, criterion)
             for max_depth in [2, 3, 4, 5, 6]
             for min_samples_leaf in [1, 2, 5, 10, 20, 50]
-            for criterion in ["gini", "entropy", "log_loss"]
+            for criterion in ["gini", "entropy"]
         ],
         random_state_multiplier=9000,
         build_estimator=_build_decision_tree_estimator,
@@ -462,7 +483,11 @@ def resolve_model_config(model_config):
 
 
 def train_candidate_models(model_trainer, X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs):
-    """Fit the candidate model pool for a single bootstrap on ``X_boot``/``y_boot``,
-    scoring each candidate's loss on the held-out ``X_eval``/``y_eval``."""
+    """Fit a trainer's candidate models for a single bootstrap on ``X_boot``/``y_boot``,
+    scoring each candidate's loss on the held-out ``X_eval``/``y_eval``.
+
+    ``n_models_pool`` only matters to trainers that use it: a
+    ``GridCandidateTrainer`` with ``refit_seeds=True`` and custom trainers.
+    """
 
     return model_trainer.train(X_boot, y_boot, X_eval, y_eval, n_models_pool, b, model_kwargs)

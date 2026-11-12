@@ -11,12 +11,17 @@ that competes every family's best next candidate against each other.
 Design choice -- this module only decides WHICH hyperparameter configuration to
 spend a real model fit on next. Every evaluated candidate is actually fit on
 X_boot/y_boot and scored with its real log-loss on the bootstrap's out-of-bag
-rows (X_eval/y_eval), exactly like GridCandidateTrainer -- so the GP surrogate
+rows (X_eval/y_eval), exactly like the exhaustive search -- so the GP surrogate
 and the implicit threshold track the same held-out loss the exact filter uses.
 Rashomon-set membership downstream in rid/core.py is still decided from that
 exact observed loss (`loss <= global_min_loss + epsilon`), never
 from a GP posterior -- TruVaRImp here is an adaptive *search policy* over a much
 larger/continuous hyperparameter space, not a replacement for the exact filter.
+
+The candidates it chooses among are the bootstrap's shared pool from
+rid.candidate_pool -- the same pool candidate_search="grid" fits exhaustively,
+with the same per-candidate random_state -- so any candidate TruVaRImp fits is
+bit-for-bit the model the exhaustive search would have fit.
 
 Math note on why "joint" reduces to independent per-family GPs: the paper's CASH
 kernel is block-diagonal, k(lambda_m, lambda_m') = delta_mm' k_m(lambda_m, lambda_m'),
@@ -31,177 +36,41 @@ best next candidate is computed independently and cheaply, and only the final
 
 from __future__ import annotations
 
-import itertools
 import logging
-from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
 
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
-from .models import GridCandidateTrainer, candidate_loss
+
+# The search-space specs live in rid.candidate_pool (shared with the exhaustive
+# "grid" mode) and are re-exported here so ``rid.truvarimp.<name>`` keeps working.
+from .candidate_pool import (
+    DEFAULT_CONTINUOUS_SEARCH_SPACES_BY_NAME,
+    DEFAULT_N_CANDIDATES_PER_FAMILY,
+    Categorical,
+    Continuous,
+    ContinuousSearchSpace,
+    build_candidate_pool,
+    drop_pinned_dimensions,
+    fit_pool_candidate,
+    resolve_default_search_space,
+    split_categorical_subspaces,
+)
+
+__all__ = [
+    "Categorical",
+    "Continuous",
+    "ContinuousSearchSpace",
+    "DEFAULT_CONTINUOUS_SEARCH_SPACES_BY_NAME",
+    "DEFAULT_TRUVARIMP_CONFIG",
+    "drop_pinned_dimensions",
+    "resolve_default_search_space",
+    "resolve_truvarimp_config",
+    "run_joint_truvarimp",
+    "split_categorical_subspaces",
+]
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Search-space specification
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Continuous:
-    """A continuous hyperparameter dimension, optionally searched on a log scale."""
-
-    low: float
-    high: float
-    log: bool = False
-
-    def sample(self, rng, n):
-        if self.log:
-            return np.exp(rng.uniform(np.log(self.low), np.log(self.high), size=n))
-        return rng.uniform(self.low, self.high, size=n)
-
-
-@dataclass(frozen=True)
-class Categorical:
-    """A categorical hyperparameter dimension -- split into independent sub-families."""
-
-    choices: Sequence[Any]
-
-
-@dataclass(frozen=True)
-class ContinuousSearchSpace:
-    """A family's hyperparameter search space for joint TruVaRImp.
-
-    ``dimensions`` maps a hyperparameter name (matching the keyword the family's
-    ``build_estimator`` accepts in its dict/Mapping config form) to a
-    :class:`Continuous` or :class:`Categorical` spec.
-    """
-
-    dimensions: Mapping[str, Any]
-
-    def categorical_dimensions(self):
-        return {name: dim for name, dim in self.dimensions.items() if isinstance(dim, Categorical)}
-
-    def continuous_dimensions(self):
-        return {name: dim for name, dim in self.dimensions.items() if isinstance(dim, Continuous)}
-
-
-def split_categorical_subspaces(search_space):
-    """Expand a search space's categorical axes into (fixed_assignment, continuous_names) pairs.
-
-    Returns a list of ``(fixed_values, continuous_names)`` tuples, one per
-    combination of categorical choices, where ``fixed_values`` is a dict of
-    categorical hyperparameter -> chosen value and ``continuous_names`` is the
-    ordered list of continuous hyperparameter names to sample/encode for the GP.
-    """
-
-    categorical = search_space.categorical_dimensions()
-    continuous_names = list(search_space.continuous_dimensions().keys())
-
-    if not categorical:
-        return [({}, continuous_names)]
-
-    names = list(categorical.keys())
-    choice_lists = [categorical[name].choices for name in names]
-    combos = []
-    for combo in itertools.product(*choice_lists):
-        combos.append((dict(zip(names, combo)), continuous_names))
-    return combos
-
-
-# ---------------------------------------------------------------------------
-# Default continuous search spaces for the model classes already registered in
-# rid/models.py's TRAINER_REGISTRY. These mirror each family's existing
-# discrete grid's *range*, just searched continuously instead of at a handful
-# of fixed points. Opt-in: only consulted when candidate_search="truvarimp_joint".
-# ---------------------------------------------------------------------------
-
-
-def _logistic_search_space(penalty_choices):
-    dims = {"C": Continuous(1e-4, 1e3, log=True)}
-    if len(penalty_choices) > 1:
-        dims["penalty"] = Categorical(penalty_choices)
-    return ContinuousSearchSpace(dims)
-
-
-DEFAULT_CONTINUOUS_SEARCH_SPACES_BY_NAME = {
-    "LogisticRegression": _logistic_search_space(["l1", "l2", "elasticnet"]),
-    "LassoClassifier": _logistic_search_space(["l1"]),
-    "RidgeClassifier": _logistic_search_space(["l2"]),
-    "ElasticNetClassifier": ContinuousSearchSpace(
-        {
-            "C": Continuous(1e-3, 1e2, log=True),
-            "l1_ratio": Continuous(0.05, 0.95, log=False),
-        }
-    ),
-    "RandomForestClassifier": ContinuousSearchSpace(
-        {
-            "n_estimators": Continuous(50, 300, log=True),
-            "max_depth": Continuous(2, 20, log=True),
-            "max_features": Categorical(["sqrt", "log2"]),
-        }
-    ),
-    "GradientBoostingClassifier": ContinuousSearchSpace(
-        {
-            "n_estimators": Continuous(50, 300, log=True),
-            "learning_rate": Continuous(1e-2, 0.5, log=True),
-            "max_depth": Continuous(2, 5, log=True),
-        }
-    ),
-    "SVC": ContinuousSearchSpace(
-        {
-            "C": Continuous(1e-3, 1e4, log=True),
-            "gamma": Continuous(1e-3, 1e1, log=True),
-        }
-    ),
-    "FullyEnumeratedTreeClassifier": ContinuousSearchSpace(
-        {
-            "max_depth": Continuous(2, 6, log=False),
-            "min_samples_leaf": Continuous(1, 20, log=True),
-            "criterion": Categorical(["gini", "entropy"]),
-        }
-    ),
-}
-
-
-def resolve_default_search_space(model_class):
-    """Look up the built-in continuous search space for a model class, if any."""
-
-    return DEFAULT_CONTINUOUS_SEARCH_SPACES_BY_NAME.get(getattr(model_class, "__name__", None))
-
-
-def _round_integer_like(name, value):
-    """Round hyperparameters that must be integers (sampled continuously above)."""
-
-    if name in ("n_estimators", "max_depth", "min_samples_leaf", "minbucket", "minsplit"):
-        return int(round(value))
-    return value
-
-
-def drop_pinned_dimensions(search_space, model_kwargs):
-    """Remove search dimensions the caller already pinned via ``model_kwargs``.
-
-    A family declared as ``(RandomForestClassifier, {"max_depth": 5})`` is
-    asking for that value, so searching ``max_depth`` anyway would silently
-    override it (the grid path lets ``model_kwargs`` win, or raises on the
-    duplicate keyword -- it never discards the caller's value). Dropping the
-    dimension honors the pin AND keeps the GP from carrying a constant,
-    uninformative input column. Returns ``(search_space, pinned_names)``.
-    """
-
-    if not model_kwargs:
-        return search_space, ()
-
-    pinned = tuple(name for name in search_space.dimensions if name in model_kwargs)
-    if not pinned:
-        return search_space, ()
-
-    remaining = {
-        name: dim for name, dim in search_space.dimensions.items() if name not in model_kwargs
-    }
-    return ContinuousSearchSpace(remaining), pinned
-
 
 # ---------------------------------------------------------------------------
 # Per-(sub)family active-search state
@@ -212,23 +81,28 @@ def drop_pinned_dimensions(search_space, model_kwargs):
 # starting point for the next MLE (see _refit_gp).
 _WARM_START_MIN_OBSERVATIONS = 8
 
-# Per-bootstrap stride for derived model random_states. Must exceed any
-# plausible per-bootstrap evaluation budget so that bootstrap b's seeds cannot
-# overlap bootstrap b+1's.
-_RANDOM_STATE_STRIDE = 100003
-
 
 class _FamilySearchState:
     """TruVaRImp state (GP + L/H/U/M sets) for one family or categorical sub-family."""
 
     def __init__(
-        self, name, build_estimator, continuous_names, log_flags, categorical_fixed, candidates
+        self,
+        name,
+        build_estimator,
+        continuous_names,
+        log_flags,
+        categorical_fixed,
+        candidates,
+        random_states,
     ):
         self.name = name
         self.build_estimator = build_estimator
         self.continuous_names = continuous_names
         self.categorical_fixed = categorical_fixed
         self.candidate_configs = candidates  # list[dict] -- full kwargs dict per candidate
+        # Fixed per candidate by the shared pool (rid.candidate_pool.pool_random_state),
+        # so a candidate fit here is identical to the same candidate fit by "grid".
+        self.candidate_random_states = random_states
         self.n_candidates = len(candidates)
 
         if continuous_names:
@@ -343,12 +217,16 @@ class _FamilySearchState:
         # y units as self.sigma2 (see the docstring's point 2).
         self._K_post_full = (kernel(self._X_gp) - K_cross_all.T @ K_inv_cross) * y_var_scale
 
-    def evaluate(self, idx, X_boot, y_boot, X_eval, y_eval, b, seed_offset, refit=True):
-        config = dict(self.candidate_configs[idx])
-        random_state = b * _RANDOM_STATE_STRIDE + seed_offset
-        model = self.build_estimator(config, random_state, {})
-        model.fit(X_boot, y_boot)
-        loss = candidate_loss(model, X_eval, y_eval)
+    def evaluate(self, idx, X_boot, y_boot, X_eval, y_eval, refit=True):
+        model, loss = fit_pool_candidate(
+            self.build_estimator,
+            self.candidate_configs[idx],
+            self.candidate_random_states[idx],
+            X_boot,
+            y_boot,
+            X_eval,
+            y_eval,
+        )
 
         self.evaluated_idx.append(idx)
         self._evaluated_set.add(idx)
@@ -457,7 +335,10 @@ class _FamilySearchState:
 
 DEFAULT_TRUVARIMP_CONFIG = {
     "total_budget": 300,
-    "n_candidates_per_subfamily": 500,
+    # Size of the shared candidate pool each family draws per bootstrap (split
+    # evenly across its categorical sub-families; see rid.candidate_pool).
+    # compute_rid_cross_family sets this from its own n_candidates_per_family.
+    "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
     "beta_sqrt": 3.0,
     "eta_init": 1.0,
     "r": 0.1,
@@ -472,6 +353,30 @@ DEFAULT_TRUVARIMP_CONFIG = {
     "harvest_fraction": 0.2,
 }
 
+# Renamed keys: (old name, message). Passing one is an error, not a silent no-op.
+_RENAMED_TRUVARIMP_KEYS = {
+    "n_candidates_per_subfamily": (
+        "'n_candidates_per_subfamily' was replaced by 'n_candidates_per_family' (a per-family "
+        "pool size split evenly across categorical sub-families); pass n_candidates_per_family "
+        "to compute_rid_cross_family / CrossFamilyRashomonImportanceDistribution instead."
+    ),
+}
+
+
+def resolve_truvarimp_config(config=None):
+    """Merge ``config`` over ``DEFAULT_TRUVARIMP_CONFIG``, rejecting renamed/unknown keys."""
+
+    config = dict(config or {})
+    for key, message in _RENAMED_TRUVARIMP_KEYS.items():
+        if key in config:
+            raise ValueError(message)
+    unknown = sorted(set(config) - set(DEFAULT_TRUVARIMP_CONFIG))
+    if unknown:
+        raise ValueError(
+            f"Unknown truvarimp_config keys {unknown}; supported: {sorted(DEFAULT_TRUVARIMP_CONFIG)}"
+        )
+    return {**DEFAULT_TRUVARIMP_CONFIG, **config}
+
 
 def run_joint_truvarimp(
     resolved_model_configs,
@@ -484,6 +389,7 @@ def run_joint_truvarimp(
     epsilon,
     config=None,
     return_stats=False,
+    candidate_pool=None,
 ):
     """Run joint (CASH-style) TruVaRImp over all families for one bootstrap.
 
@@ -505,7 +411,7 @@ def run_joint_truvarimp(
     X_eval, y_eval : ndarray
         The bootstrap's out-of-bag rows, which every candidate's loss is scored on.
     b : int
-        Bootstrap index, used to seed random draws/model random_state.
+        Bootstrap index, used to seed the pool draws and the warm-up picks.
     epsilon : float
         Rashomon tolerance, interpreted exactly as elsewhere in rid/core.py:
         an absolute additive tolerance on log-loss (``eps_rel=0, eps_abs=epsilon``
@@ -514,7 +420,8 @@ def run_joint_truvarimp(
         Overrides for ``DEFAULT_TRUVARIMP_CONFIG``. ``total_budget`` bounds the
         TOTAL number of real model fits across all families (warm-up, active
         search, and harvest alike); ``harvest_fraction`` is the share of it
-        reserved for the closing harvest phase.
+        reserved for the closing harvest phase; ``n_candidates_per_family``
+        sizes the candidate pool when ``candidate_pool`` is not given.
     return_stats : bool, default=False
         Also return a dict of search diagnostics: real fits spent in each phase
         (``n_warmup``, ``n_active``, ``n_harvest``, ``n_fallback``), how many
@@ -523,6 +430,11 @@ def run_joint_truvarimp(
         ``"exhausted"``, ``"no_threshold"`` or ``"no_candidate"``), plus
         ``pinned``: the search-space dimensions each family fixes through its
         model kwargs (``{family_name: [dimension, ...]}``).
+    candidate_pool : dict, optional
+        This bootstrap's shared pool from
+        :func:`rid.candidate_pool.build_candidate_pool` (what
+        ``compute_rid_cross_family`` passes, so "grid" and TruVaRImp search the
+        identical candidates). Built here from ``config`` when omitted.
 
     Returns
     -------
@@ -536,10 +448,14 @@ def run_joint_truvarimp(
         Only when ``return_stats=True``; see above.
     """
 
-    cfg = dict(DEFAULT_TRUVARIMP_CONFIG)
-    if config:
-        cfg.update(config)
+    cfg = resolve_truvarimp_config(config)
+    if candidate_pool is None:
+        candidate_pool = build_candidate_pool(
+            resolved_model_configs, search_spaces, b, cfg["n_candidates_per_family"]
+        )
 
+    # Only picks warm-up candidates: the pool itself is drawn from its own
+    # per-family streams, so it doesn't depend on this generator.
     rng = np.random.default_rng(seed=b)
     eps_rel = 0.0  # matches this codebase's existing absolute-epsilon convention
     eta = cfg["eta_init"]
@@ -550,58 +466,27 @@ def run_joint_truvarimp(
     family_of_state = {}
     pinned_dims = {}
     for family_name, (trainer, model_kwargs) in resolved_model_configs.items():
-        search_space = search_spaces.get(family_name)
-        # Only a GridCandidateTrainer's build_estimator takes the
-        # (config, random_state, model_kwargs) signature this module calls.
-        # SingleCandidateTrainer's takes model_kwargs alone, and a custom
-        # trainer may expose an attribute of that name with any signature at
-        # all -- those must take the .train() fallback, not a TypeError.
-        build_estimator = (
-            trainer.build_estimator if isinstance(trainer, GridCandidateTrainer) else None
-        )
-
-        if search_space is not None and build_estimator is not None:
-            search_space, pinned = drop_pinned_dimensions(search_space, model_kwargs)
-            if pinned:
-                pinned_dims[family_name] = list(pinned)
-            log_flags = {
-                name: dim.log
-                for name, dim in search_space.continuous_dimensions().items()
-            }
-            for fixed_values, continuous_names in split_categorical_subspaces(search_space):
-                # With no continuous axis left, every draw would produce the
-                # identical config, so one candidate fully describes the
-                # sub-family; sampling n_candidates_per_subfamily duplicates
-                # would just burn budget refitting the same hyperparameters.
-                n_cand = cfg["n_candidates_per_subfamily"] if continuous_names else 1
-                samples = {
-                    name: search_space.dimensions[name].sample(rng, n_cand)
-                    for name in continuous_names
-                }
-                candidates = []
-                for i in range(n_cand):
-                    point = dict(model_kwargs)
-                    point.update(fixed_values)
-                    for name in continuous_names:
-                        point[name] = _round_integer_like(name, float(samples[name][i]))
-                    candidates.append(point)
-
-                sub_name = family_name if not fixed_values else f"{family_name}::{fixed_values}"
+        family_pool = candidate_pool.get(family_name)
+        if family_pool is not None:
+            if family_pool.pinned:
+                pinned_dims[family_name] = list(family_pool.pinned)
+            for sub in family_pool.subfamilies:
                 state = _FamilySearchState(
-                    name=sub_name,
-                    build_estimator=build_estimator,
-                    continuous_names=continuous_names,
-                    log_flags=log_flags,
-                    categorical_fixed=fixed_values,
-                    candidates=candidates,
+                    name=sub.name,
+                    build_estimator=family_pool.build_estimator,
+                    continuous_names=sub.continuous_names,
+                    log_flags=sub.log_flags,
+                    categorical_fixed=sub.fixed_values,
+                    candidates=sub.configs,
+                    random_states=sub.random_states,
                 )
                 states.append(state)
-                family_of_state[sub_name] = family_name
+                family_of_state[sub.name] = family_name
         else:
-            # No search space registered for this family (e.g. a
-            # SingleCandidateTrainer, or a custom trainer with no known
-            # continuous space): fall back to its own .train() once, and fold
-            # the result straight into the output rather than active-searching it.
+            # Not in the pool (e.g. a SingleCandidateTrainer, or a custom
+            # trainer with no known continuous space): fall back to its own
+            # .train() once, and fold the result straight into the output
+            # rather than active-searching it.
             models, losses = trainer.train(X_boot, y_boot, X_eval, y_eval, 1, b, model_kwargs)
             state = _FallbackFamilyState(family_name, models, losses)
             states.append(state)
@@ -625,7 +510,7 @@ def run_joint_truvarimp(
             break
         n_warmup = min(cfg["n_warmup_per_subfamily"], state.n_candidates, remaining)
         warm_idx = rng.choice(state.n_candidates, size=n_warmup, replace=False)
-        for seed_offset, idx in enumerate(warm_idx):
+        for position, idx in enumerate(warm_idx):
             # Random draws don't steer each other, so refit the GP once at the
             # end of the batch instead of after every fit.
             state.evaluate(
@@ -634,9 +519,7 @@ def run_joint_truvarimp(
                 y_boot,
                 X_eval,
                 y_eval,
-                b,
-                seed_offset,
-                refit=(seed_offset == n_warmup - 1),
+                refit=(position == n_warmup - 1),
             )
         total_evaluations += n_warmup
     n_warmup_total = total_evaluations
@@ -670,9 +553,7 @@ def run_joint_truvarimp(
             stop_reason = "no_candidate"
             break
 
-        best_state.evaluate(
-            best_idx, X_boot, y_boot, X_eval, y_eval, b, seed_offset=len(best_state.evaluated_idx)
-        )
+        best_state.evaluate(best_idx, X_boot, y_boot, X_eval, y_eval)
         total_evaluations += 1
 
     # --- harvest: actually fit the configurations the search believes are IN
@@ -682,7 +563,7 @@ def run_joint_truvarimp(
     # the confidently-good configurations the Rashomon filter downstream exists
     # to collect.
     n_harvest = _harvest_predicted_rashomon(
-        searchable, X_boot, y_boot, X_eval, y_eval, b, beta_sqrt, eps_rel, epsilon, harvest_budget
+        searchable, X_boot, y_boot, X_eval, y_eval, beta_sqrt, eps_rel, epsilon, harvest_budget
     )
 
     # --- collapse sub-family states back into the caller's family keys ---
@@ -743,7 +624,7 @@ def _shared_thresholds(searchable, beta_sqrt, eps_rel, epsilon):
 
 
 def _harvest_predicted_rashomon(
-    searchable, X_boot, y_boot, X_eval, y_eval, b, beta_sqrt, eps_rel, epsilon, harvest_budget
+    searchable, X_boot, y_boot, X_eval, y_eval, beta_sqrt, eps_rel, epsilon, harvest_budget
 ):
     """Spend the reserved budget fitting the best *predicted* configurations.
 
@@ -780,9 +661,7 @@ def _harvest_predicted_rashomon(
 
     evaluated = 0
     for _, _, idx, state in queue[:harvest_budget]:
-        state.evaluate(
-            idx, X_boot, y_boot, X_eval, y_eval, b, seed_offset=len(state.evaluated_idx), refit=False
-        )
+        state.evaluate(idx, X_boot, y_boot, X_eval, y_eval, refit=False)
         evaluated += 1
     return evaluated
 
