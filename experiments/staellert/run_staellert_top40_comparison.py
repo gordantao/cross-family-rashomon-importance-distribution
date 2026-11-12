@@ -2,14 +2,17 @@
 """Run Staellert direct target prediction tasks with feature selection.
 
 This script is classification-only (regression-task support was removed --
-see TASK_REGISTRY) and compares five top-k feature sets (METHODS):
+see TASK_REGISTRY) and compares four top-k feature sets (METHODS):
 1) stepwise_rf: forward stepwise selection scored via random forest.
 2) stepwise_logreg: forward stepwise selection scored via logistic regression.
 3) rid_tree: single-family RID on a fully enumerated decision-tree Rashomon set.
-4) cross_family_unweighted: cross-family RID, exhaustive grid candidate search.
-5) cross_family_unweighted_truvarimp: cross-family RID, joint TruVaRImp
+4) cross_family_unweighted_truvarimp: cross-family RID, joint TruVaRImp
    candidate search (candidate_search='truvarimp_joint', rid/truvarimp.py).
-The weighted cross-family variant was dropped, as in the nonlinear simulation.
+The weighted cross-family variant was dropped, as in the nonlinear simulation,
+and so was the exhaustive grid cross-family variant (cross_family_unweighted):
+fitting the whole shared candidate pool (~500 configs per family per bootstrap)
+is too expensive on real data. Grid search is kept only in the nonlinear
+simulation, where it validates TruVaRImp.
 
 Evaluation protocol (outer stratified holdout): each task's labelled rows are
 split once into train and test (--holdout-fraction, default 0.2;
@@ -101,7 +104,6 @@ METHODS = (
     "stepwise_rf",
     "stepwise_logreg",
     "rid_tree",
-    "cross_family_unweighted",
     "cross_family_unweighted_truvarimp",
 )
 
@@ -116,8 +118,7 @@ _RID_SETTING_KEYS = ("rid_metric", "rid_epsilon", "rid_n_bootstraps")
 METHOD_SETTING_KEYS = {
     "stepwise_rf": _DATA_SETTING_KEYS + _STEPWISE_SETTING_KEYS,
     "stepwise_logreg": _DATA_SETTING_KEYS + _STEPWISE_SETTING_KEYS,
-    "rid_tree": _DATA_SETTING_KEYS + _RID_SETTING_KEYS + ("rid_n_models_pool",),
-    "cross_family_unweighted": _DATA_SETTING_KEYS + _RID_SETTING_KEYS + ("rid_n_models_pool",),
+    "rid_tree": _DATA_SETTING_KEYS + _RID_SETTING_KEYS,
     "cross_family_unweighted_truvarimp": _DATA_SETTING_KEYS + _RID_SETTING_KEYS + ("truvarimp_total_budget",),
 }
 
@@ -128,7 +129,7 @@ def _parse_args() -> argparse.Namespace:
             "Run classification-only direct target prediction tasks on Staellert data, "
             "comparing random-forest and logistic-regression forward stepwise feature "
             "selection against single-family RID on a fully enumerated decision-tree "
-            "Rashomon set and unweighted cross-family RID (grid and TruVaRImp candidate search)."
+            "Rashomon set and unweighted cross-family RID (TruVaRImp candidate search)."
         )
     )
     parser.add_argument(
@@ -264,17 +265,6 @@ def _parse_args() -> argparse.Namespace:
         help="RID bootstrap iterations (default: 100)",
     )
     parser.add_argument(
-        "--rid-n-models-pool",
-        type=int,
-        default=50,
-        help=(
-            "RID n_models_pool / n_models_per_class (default: 50). Only sets seed refits for "
-            "seed-sensitive grids and custom trainers: the tree grid fits each config once, and "
-            "cross-family RID draws a shared candidate pool of "
-            "rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY per family instead"
-        ),
-    )
-    parser.add_argument(
         "--rid-n-jobs",
         type=int,
         default=1,
@@ -286,8 +276,8 @@ def _parse_args() -> argparse.Namespace:
         default=300,
         help=(
             "Shared per-bootstrap real-fit budget across all families for "
-            "cross_family_unweighted_truvarimp (default: 300). That method ignores "
-            "--rid-n-models-pool."
+            "cross_family_unweighted_truvarimp (default: 300), spent on a shared pool of "
+            "rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY candidates per family."
         ),
     )
     parser.add_argument(
@@ -677,13 +667,13 @@ def run_single_family_tree_rid(
     rid_metric: str,
     epsilon: float,
     n_bootstraps: int,
-    n_models_pool: int,
     n_jobs: int,
 ) -> tuple[list[str], pd.DataFrame, dict]:
+    # n_models_pool is left at its default: it only sets seed refits for
+    # refit_seeds=True grids, and the tree grid fits each config once.
     estimator = RashomonImportanceDistribution(
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
-        n_models_pool=n_models_pool,
         model_class=FullyEnumeratedTreeClassifier,
         vi_metrics=(rid_metric,),
         performance_metrics=("accuracy", "auprc"),
@@ -736,30 +726,26 @@ def run_cross_family_rid(
     rid_metric: str,
     epsilon: float,
     n_bootstraps: int,
-    n_models_per_class: int,
     n_jobs: int,
-    candidate_search: str = "grid",
-    truvarimp_total_budget: int | None = None,
+    truvarimp_total_budget: int,
 ) -> tuple[list[str], pd.DataFrame, dict]:
+    # Every family is in the shared candidate pool, so n_models_per_class is unused.
     estimator = CrossFamilyRashomonImportanceDistribution(
         model_configs=_build_cross_family_model_configs(),
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
-        n_models_per_class=n_models_per_class,
         vi_metrics=(rid_metric,),
         performance_metrics=("accuracy", "auprc"),
         family_balance_mode="unweighted",
         n_jobs=n_jobs,
-        candidate_search=candidate_search,
-        truvarimp_config=(
-            {"total_budget": truvarimp_total_budget} if candidate_search == "truvarimp_joint" else None
-        ),
+        candidate_search="truvarimp_joint",
+        truvarimp_config={"total_budget": truvarimp_total_budget},
     )
     estimator.fit(X, y)
 
     if estimator.metric_results_ is None:
         raise RuntimeError(
-            f"Cross-family RID ({candidate_search}) returned no metric results; "
+            "Cross-family RID (truvarimp_joint) returned no metric results; "
             "no valid Rashomon bootstraps were found"
         )
 
@@ -978,12 +964,10 @@ def _method_settings(method: str, args: argparse.Namespace, holdout_meta: dict) 
         settings["selection_model_scaling"] = "standardized_per_fold"
     if method.startswith(("rid_", "cross_family_")):
         settings["rashomon_evaluation"] = "out_of_bag"
-    # Added 2026-11-12: single-family grids fit each config once (seed refits only for
-    # RandomForest; no duplicate criterion="log_loss" trees), and cross-family RID draws
-    # its candidates from the shared pool (rid.candidate_pool). Older checkpoints lack
-    # these keys and are refused.
-    if method.startswith("rid_"):
-        settings["grid_refits"] = "seed_sensitive_only"
+    # Added 2026-11-12: cross-family RID draws its candidates from the shared pool
+    # (rid.candidate_pool); older checkpoints lack this key and are refused. Older
+    # rid_tree checkpoints (duplicate criterion="log_loss" trees) carry the since-removed
+    # rid_n_models_pool key and are refused too.
     if method.startswith("cross_family_"):
         settings["n_candidates_per_family"] = DEFAULT_N_CANDIDATES_PER_FAMILY
     # Added 2026-11-11: checkpoints from the old protocol (selection and evaluation on
@@ -1086,7 +1070,7 @@ def _run_method(
     if method == "rid_tree":
         logger.info(
             f"[rid_tree] metric={args.rid_metric} epsilon={args.rid_epsilon} "
-            f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
+            f"n_bootstraps={args.rid_n_bootstraps}"
         )
         features, table, perf = run_single_family_tree_rid(
             X=X,
@@ -1095,20 +1079,15 @@ def _run_method(
             rid_metric=args.rid_metric,
             epsilon=args.rid_epsilon,
             n_bootstraps=args.rid_n_bootstraps,
-            n_models_pool=args.rid_n_models_pool,
             n_jobs=args.rid_n_jobs,
         )
         return features, table, {"metric": args.rid_metric, "rashomon_oob_perf_stats": perf}
 
-    candidate_search = "truvarimp_joint" if method == "cross_family_unweighted_truvarimp" else "grid"
+    candidate_search = "truvarimp_joint"
     logger.info(
         f"[{method}] metric={args.rid_metric} epsilon={args.rid_epsilon} "
         f"n_bootstraps={args.rid_n_bootstraps} candidate_search={candidate_search} "
-        + (
-            f"total_budget={args.truvarimp_total_budget}"
-            if candidate_search == "truvarimp_joint"
-            else f"n_models_per_class={args.rid_n_models_pool}"
-        )
+        f"total_budget={args.truvarimp_total_budget}"
     )
     features, table, perf = run_cross_family_rid(
         X=X,
@@ -1117,9 +1096,7 @@ def _run_method(
         rid_metric=args.rid_metric,
         epsilon=args.rid_epsilon,
         n_bootstraps=args.rid_n_bootstraps,
-        n_models_per_class=args.rid_n_models_pool,
         n_jobs=args.rid_n_jobs,
-        candidate_search=candidate_search,
         truvarimp_total_budget=args.truvarimp_total_budget,
     )
     info = {
@@ -1305,10 +1282,11 @@ def _run_single_task(
     rid_tree_perf = completed["rid_tree"]["rashomon_oob_perf_stats"]
     row["rid_tree_rashomon_oob_accuracy_mean"] = rid_tree_perf.get("accuracy_mean")
     row["rid_tree_rashomon_oob_auprc_mean"] = rid_tree_perf.get("auprc_mean")
-    for method in ("cross_family_unweighted", "cross_family_unweighted_truvarimp"):
-        cross_family_rashomon = _summarize_cross_family_perf(completed[method]["rashomon_oob_perf_stats"])
-        row[f"{method}_rashomon_oob_accuracy_mean"] = cross_family_rashomon["accuracy_mean"]
-        row[f"{method}_rashomon_oob_auprc_mean"] = cross_family_rashomon["auprc_mean"]
+    cross_family_rashomon = _summarize_cross_family_perf(
+        completed["cross_family_unweighted_truvarimp"]["rashomon_oob_perf_stats"]
+    )
+    row["cross_family_unweighted_truvarimp_rashomon_oob_accuracy_mean"] = cross_family_rashomon["accuracy_mean"]
+    row["cross_family_unweighted_truvarimp_rashomon_oob_auprc_mean"] = cross_family_rashomon["auprc_mean"]
     row.update(overlap_counts)
 
     logger.info(f"[task] combined outputs saved in {task_output_dir}")
