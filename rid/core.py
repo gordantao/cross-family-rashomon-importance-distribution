@@ -531,6 +531,13 @@ def _prepare_groups(groups, n_rows):
         labels[:] = list(groups)
     if labels.shape[0] != n_rows:
         raise ValueError(f"groups must have one label per row of X ({n_rows}), got {labels.shape[0]}")
+    import pandas as pd  # only needed on the grouped path; every experiment env has it
+
+    # np.unique would silently merge float NaN/NA/NaT rows into one fake group
+    # (or give each object-dtype NaN its own group), so reject missing labels.
+    missing = np.asarray(pd.isna(labels), dtype=bool)
+    if missing.any():
+        raise ValueError(f"groups has {int(missing.sum())} missing labels (NaN/None/NA); give every row a group")
     try:
         unique_labels, codes = np.unique(labels, return_inverse=True)
     except TypeError as exc:
