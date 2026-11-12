@@ -60,7 +60,11 @@ def compute_model_reliance(model, X, y, metric="sub_mr", rng=None):
 
 
 def compute_loco_importance(model, X, y):
-    """Compute leave-one-covariate-out importance."""
+    """Compute leave-one-covariate-out importance.
+
+    Ablation-based: each column is set to 0 on the already-fitted model. RID
+    standardizes each bootstrap on its in-bag rows, so 0 is the in-bag mean.
+    """
 
     e_orig = log_loss(y, model.predict_proba(X), labels=model.classes_)
     importances = np.zeros(X.shape[1])
@@ -86,6 +90,13 @@ def _eligible_interaction_pairs(X, correlation_threshold=0.8):
         return [], n_total_pairs
 
     corr = np.corrcoef(X, rowvar=False)
+    # A column constant over these rows has undefined correlation (NaN, so its
+    # pairs are skipped). Mark it explicitly: np.corrcoef's mean of n equal
+    # nonzero values can be off by rounding, giving a garbage finite value that
+    # would make eligibility depend on the column's offset/scale.
+    constant = np.ptp(X, axis=0) == 0
+    corr[constant, :] = np.nan
+    corr[:, constant] = np.nan
     eligible_pairs = [
         (j, k)
         for j in range(n_features)
@@ -98,8 +109,9 @@ def _eligible_interaction_pairs(X, correlation_threshold=0.8):
 def compute_iloco_pairwise_importance(model, X, y, pairs):
     """Compute iLOCO_{j,k} = delta_j + delta_k - delta_{j,k} for given pairs.
 
-    Ablation-based (zero the column(s) on the ALREADY-FITTED model and
-    re-measure log-loss), matching compute_loco_importance's no-refit style,
+    Ablation-based (zero the column(s) on the ALREADY-FITTED model -- under
+    RID's per-bootstrap scaling, 0 is the in-bag mean -- and re-measure
+    log-loss), matching compute_loco_importance's no-refit style,
     rather than the original iLOCO paper's refit-per-subset approach --
     consistent with how this codebase already computes loco, and far cheaper.
     Single-feature deltas are computed once and reused across every pair
@@ -752,14 +764,15 @@ def _log_bootstrap_summary(label, bootstrap_stats):
             )
 
 
-def _bootstrap_split(X_scaled, y, b):
+def _bootstrap_split(X, y, b):
     """In-bag resample and out-of-bag rows for bootstrap ``b``.
 
-    The in-bag rows are exactly what ``resample(X_scaled, y, random_state=b)``
+    The in-bag rows are exactly what ``resample(X, y, random_state=b)``
     draws; the out-of-bag (OOB) rows -- about 1/e of the data -- are the ones it
     never drew. Every candidate is fit in-bag and judged out-of-bag: Rashomon
     membership, VI metrics and performance metrics all use the OOB rows, so a
     model that memorizes its bootstrap can't win membership on training loss.
+    Rows come back as given; callers standardize them with :func:`_scale_in_bag`.
 
     Returns ``None`` (an invalid bootstrap) unless both the in-bag and the OOB
     rows contain every class in ``y``. A model fit on an in-bag sample missing a
@@ -779,12 +792,24 @@ def _bootstrap_split(X_scaled, y, b):
         or np.unique(y[oob_mask]).size < n_classes
     ):
         return None
-    return X_scaled[in_bag], y[in_bag], X_scaled[oob_mask], y[oob_mask]
+    return X[in_bag], y[in_bag], X[oob_mask], y[oob_mask]
+
+
+def _scale_in_bag(X_boot, X_oob):
+    """Standardize a bootstrap's rows with a scaler fit on its in-bag rows only.
+
+    The OOB rows judge Rashomon membership, VI and performance, so they must not
+    shape the mean/SD the in-bag models are fit on. A column constant in-bag
+    gets scale 1 (StandardScaler's zero-variance rule), i.e. is only centered.
+    """
+
+    scaler = StandardScaler().fit(X_boot)
+    return scaler.transform(X_boot), scaler.transform(X_oob)
 
 
 def _run_single_bootstrap(
     b,
-    X_scaled,
+    X,
     y,
     model_trainer,
     model_kwargs,
@@ -795,10 +820,11 @@ def _run_single_bootstrap(
     performance_metric_specs,
 ):
     rng = np.random.default_rng(seed=b)
-    split = _bootstrap_split(X_scaled, y, b)
+    split = _bootstrap_split(X, y, b)
     if split is None:
         return None, {"n_fits": 0, "rashomon_size": 0, "valid": False}
     X_boot, y_boot, X_oob, y_oob = split
+    X_boot, X_oob = _scale_in_bag(X_boot, X_oob)
 
     models, losses = train_candidate_models(
         model_trainer, X_boot, y_boot, X_oob, y_oob, n_models_pool, b, model_kwargs
@@ -885,7 +911,7 @@ def _search_diagnostics(family_names, family_indices, family_losses, global_min_
 
 def _run_single_bootstrap_cross_family(
     b,
-    X_scaled,
+    X,
     y,
     model_configs,
     n_models_per_class,
@@ -901,7 +927,7 @@ def _run_single_bootstrap_cross_family(
     record_diagnostics=False,
 ):
     rng = np.random.default_rng(seed=b)
-    split = _bootstrap_split(X_scaled, y, b)
+    split = _bootstrap_split(X, y, b)
     if split is None:
         stats = {
             "n_fits": {name: 0 for name in model_configs},
@@ -913,6 +939,7 @@ def _run_single_bootstrap_cross_family(
             stats["diagnostics"] = None
         return (None, None, None, None), stats
     X_boot, y_boot, X_oob, y_oob = split
+    X_boot, X_oob = _scale_in_bag(X_boot, X_oob)
     search_start = time.perf_counter()
 
     # Both search modes draw from this one pool, so for a given b they see the
@@ -1125,9 +1152,8 @@ def compute_rid(
     vi_metric_names = tuple(metric_name for metric_name, _ in vi_metric_specs)
     performance_metric_names = tuple(metric_name for metric_name, _ in performance_metric_specs)
 
+    # Unscaled: each bootstrap standardizes on its own in-bag rows (_scale_in_bag).
     X_values, y_values, feature_names = _prepare_inputs(X, y)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_values)
 
     model_name = getattr(model_class, "__name__", type(model_trainer).__name__)
     logger.info(
@@ -1142,7 +1168,7 @@ def compute_rid(
             _run_single_bootstrap,
             b,
             suppress_warnings,
-            X_scaled,
+            X_values,
             y_values,
             model_trainer,
             model_kwargs,
@@ -1265,9 +1291,8 @@ def compute_rid_cross_family(
     family_balance_mode = normalize_cross_family_balance_mode(family_balance_mode)
     candidate_search = normalize_candidate_search(candidate_search)
 
+    # Unscaled: each bootstrap standardizes on its own in-bag rows (_scale_in_bag).
     X_values, y_values, feature_names = _prepare_inputs(X, y)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_values)
 
     n_candidates_per_family = int(n_candidates_per_family)
     truvarimp_config = dict(truvarimp_config or {})
@@ -1328,7 +1353,7 @@ def compute_rid_cross_family(
             _run_single_bootstrap_cross_family,
             b,
             suppress_warnings,
-            X_scaled,
+            X_values,
             y_values,
             resolved_model_configs,
             n_models_per_class,
