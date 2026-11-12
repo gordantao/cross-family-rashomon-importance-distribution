@@ -3,11 +3,12 @@
 
 In the OOB TruVaRImp Staellert run, random forests had 0 Rashomon members across
 all 100 bootstraps. compute_rid_cross_family discards every candidate's loss once
-membership is decided, so this script re-runs the grid cross-family candidate
-search (same data prep, scaler, bootstrap splits, shared candidate pool and
-per-candidate seeds as the cross_family_unweighted method of
-run_staellert_top40_comparison.py, see rid.candidate_pool) and records one row
-per candidate instead of a Rashomon set.
+membership is decided, so this script fits the whole shared candidate pool
+exhaustively (what candidate_search="grid" does; same data prep, scaler,
+bootstrap splits, pool and per-candidate seeds as the
+cross_family_unweighted_truvarimp method of run_staellert_top40_comparison.py,
+whose TruVaRImp search fits only a budgeted subset of that pool, see
+rid.candidate_pool) and records one row per candidate instead of a Rashomon set.
 
 It mirrors the comparison's outer stratified holdout protocol: the labelled rows
 are split once (--holdout-fraction, --holdout-seed; same defaults as the
@@ -23,11 +24,10 @@ Each candidate row records:
   the OOB rows (the temperature for one half is fit on the other), to separate
   "ranks cells worse" from "reports less confident probabilities".
 
-A RandomForest_probe family (not part of the standard pool, never counted
-toward the bootstrap's best loss) adds min_samples_leaf and larger max_features,
-which the standard RF search space doesn't search. Each bootstrap also saves the OOB
-predicted probabilities of every family's best candidate, for reliability
-diagrams.
+Each bootstrap also saves the OOB predicted probabilities of every family's
+best candidate, for reliability diagrams. ``plot`` only reads collections of
+shared-pool candidates (dict configs); it refuses older collections (with the
+since-removed RF probe family or hand-grid tuple configs).
 
 Usage:
     # cluster: collect (checkpoints one file pair per bootstrap; reruns skip them)
@@ -52,7 +52,6 @@ import pandas as pd
 from joblib import Parallel, delayed
 from scipy.optimize import minimize_scalar
 from scipy.special import log_softmax
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
@@ -78,24 +77,13 @@ from run_staellert_top40_comparison import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-PROBE_FAMILY = "RandomForest_probe"
-# Unbounded depth only: on Staellert, max_depth=20 trees matched max_depth=None
-# exactly (they never grow deeper), so leaf size is the regularizer worth probing.
-PROBE_RF_CONFIGS = [
-    {"n_estimators": 200, "max_depth": None, "max_features": max_features,
-     "min_samples_leaf": min_samples_leaf}
-    for max_features in ["sqrt", 0.33, 0.5]
-    for min_samples_leaf in [1, 2, 5, 10, 20]
-]
-PROBE_RF_SEED_MULTIPLIER = 3500
-
 # Same clipping as sklearn's log_loss (dtype eps, then renormalize rows), so
 # per-row losses agree with candidate_loss even where a model predicts p=0.
 PROB_CLIP = np.finfo(np.float64).eps
 ECE_BINS = 15
 # Settings that change collected rows; a results dir written under others is refused.
 SETTING_KEYS = ("task", "correlation_threshold", "holdout_fraction", "holdout_seed", "n_models_pool",
-                "n_candidates_per_family", "rf_probe", "families", "evaluation_protocol",
+                "n_candidates_per_family", "families", "evaluation_protocol",
                 "holdout_test_rows_sha256")
 
 
@@ -202,12 +190,6 @@ def _family_candidates(name, trainer, model_kwargs, family_pool, n_models_pool, 
             yield config, seed, trainer.build_estimator(config, seed, model_kwargs)
 
 
-def _probe_candidates(b):
-    for config in PROBE_RF_CONFIGS:
-        seed = b * PROBE_RF_SEED_MULTIPLIER
-        yield config, seed, RandomForestClassifier(random_state=seed, **config)
-
-
 def _config_columns(config):
     if isinstance(config, dict):
         return {f"cfg_{k}": v for k, v in config.items()}
@@ -217,7 +199,7 @@ def _config_columns(config):
 
 
 def _collect_bootstrap(b, X_scaled, y, families, search_spaces, n_models_pool,
-                       n_candidates_per_family, rf_probe, classes, out_dir):
+                       n_candidates_per_family, classes, out_dir):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         start = time.perf_counter()
@@ -236,8 +218,6 @@ def _collect_bootstrap(b, X_scaled, y, families, search_spaces, n_models_pool,
         sources = [(name, "standard",
                     _family_candidates(name, trainer, kwargs, pool.get(name), n_models_pool, b))
                    for name, (trainer, kwargs) in families.items()]
-        if rf_probe:
-            sources.append((PROBE_FAMILY, "probe", _probe_candidates(b)))
 
         rows = []
         best = {}
@@ -336,7 +316,6 @@ def run_collect(args):
         "holdout_seed": args.holdout_seed,
         "n_models_pool": args.n_models_pool,
         "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
-        "rf_probe": args.rf_probe,
         "families": list(families),
         "evaluation_protocol": holdout_meta["protocol"],
         "holdout_test_rows_sha256": holdout_meta["test_rows_sha256"],
@@ -354,7 +333,7 @@ def run_collect(args):
     logger.info(f"{X.shape[0]} train rows (of {meta['n_rows']}; test rows sha256 "
                 f"{holdout_meta['test_rows_sha256']}) x {X.shape[1]} features, "
                 f"classes {holdout_meta['train_class_counts']}")
-    logger.info(f"families: {list(families)} (+{PROBE_FAMILY})" if args.rf_probe else f"families: {list(families)}")
+    logger.info(f"families: {list(families)}")
     logger.info(f"bootstraps: {len(bootstraps)} requested, {len(bootstraps) - len(todo)} already done, "
                 f"{len(todo)} to run on {args.n_jobs} workers")
 
@@ -362,7 +341,7 @@ def run_collect(args):
     done = 0
     results = Parallel(n_jobs=args.n_jobs, return_as="generator_unordered")(
         delayed(_collect_bootstrap)(b, X_scaled, y_values, families, search_spaces, args.n_models_pool,
-                                    DEFAULT_N_CANDIDATES_PER_FAMILY, args.rf_probe, classes,
+                                    DEFAULT_N_CANDIDATES_PER_FAMILY, classes,
                                     per_bootstrap_dir)
         for b in todo
     )
@@ -387,7 +366,7 @@ def _load_candidates(per_bootstrap_dir):
 # --------------------------------------------------------------------------- plot
 
 
-FAMILY_ORDER = ["GradientBoosting", "SVM", "Lasso", "ElasticNet", "Ridge", "RandomForest", PROBE_FAMILY]
+FAMILY_ORDER = ["GradientBoosting", "SVM", "Lasso", "ElasticNet", "Ridge", "RandomForest"]
 FAMILY_COLORS = {
     "GradientBoosting": "#4C72B0",
     "SVM": "#8172B3",
@@ -395,7 +374,6 @@ FAMILY_COLORS = {
     "ElasticNet": "#64B5CD",
     "Ridge": "#937860",
     "RandomForest": "#C44E52",
-    PROBE_FAMILY: "#DD8452",
 }
 
 
@@ -438,7 +416,7 @@ def plot_bootstrap_panels(df, epsilon, plt, path, n_panels=12):
         ax.set_yscale("log")
         ax.set_title(f"bootstrap {b}", fontsize=9)
         ax.set_xticks(range(len(families)))
-        ax.set_xticklabels([f.replace("RandomForest_probe", "RF probe") for f in families],
+        ax.set_xticklabels(families,
                            rotation=45, ha="right", fontsize=7)
     for ax in axes.flat[len(bootstraps):]:
         ax.set_visible(False)
@@ -465,7 +443,7 @@ def plot_gap_by_family(df, epsilon, plt, path):
         ax.axhline(epsilon, color="black", ls="--", lw=1, label=f"ε = {epsilon}")
         ax.set_yscale("log")
         ax.set_xticks(range(1, len(families) + 1))
-        ax.set_xticklabels([f.replace("RandomForest_probe", "RF probe") for f in families], rotation=30, ha="right")
+        ax.set_xticklabels(families, rotation=30, ha="right")
         ax.set_title(title)
     axes[0].set_ylabel("loss − bootstrap's best loss (log scale; 0 clipped to 1e-4)")
     axes[0].legend(fontsize=8)
@@ -561,7 +539,7 @@ def plot_temperature(df, plt, path):
     axes[0].set_title("T > 1: overconfident · T < 1: underconfident")
     for ax in axes:
         ax.set_xticks(range(1, len(families) + 1))
-        ax.set_xticklabels([f.replace("RandomForest_probe", "RF probe") for f in families], rotation=30, ha="right")
+        ax.set_xticklabels(families, rotation=30, ha="right")
     width = 0.38
     raw = [best.loc[best["family"] == f, "log_loss"].median() for f in families]
     scaled = [best.loc[best["family"] == f, "ts_log_loss"].median() for f in families]
@@ -614,18 +592,6 @@ def plot_rf_heatmaps(df, epsilon, plt, path):
             if (rf["n_estimators"] == n_est).any():
                 panels.append((f"standard RF, n_estimators {n_est}", rf[rf["n_estimators"] == n_est],
                                "max_depth", "max_features"))
-    elif not rf.empty:
-        # Pre-2026-11-12 runs: hand-grid (n_estimators, max_depth, max_features) tuples.
-        rf = rf.assign(n_estimators=rf["cfg_0"].map(_rf_label), max_depth=rf["cfg_1"].map(_rf_label),
-                       max_features=rf["cfg_2"].map(_rf_label))
-        for n_est in sorted(rf["n_estimators"].unique(), key=int):
-            panels.append((f"standard RF, n_estimators={n_est}", rf[rf["n_estimators"] == n_est],
-                           "max_depth", "max_features"))
-    probe = df[df["family"] == PROBE_FAMILY]
-    if not probe.empty:
-        probe = probe.assign(min_samples_leaf=probe["cfg_min_samples_leaf"].astype(int),
-                             max_features=probe["cfg_max_features"].map(_rf_label))
-        panels.append(("RF probe (200 trees, unbounded depth)", probe, "min_samples_leaf", "max_features"))
     if not panels:
         return
     fig, axes = plt.subplots(1, len(panels), figsize=(3.6 * len(panels), 3.6), squeeze=False)
@@ -702,7 +668,7 @@ def plot_per_class_loss(df, plt, path):
         medians = [best.loc[best["family"] == f, col].median() for f in families]
         ax.bar(np.arange(len(families)) + k * width, medians, width, label=col.replace("loss_class_", "class "))
     ax.set_xticks(np.arange(len(families)) + 0.4 - width / 2)
-    ax.set_xticklabels([f.replace("RandomForest_probe", "RF probe") for f in families], rotation=30, ha="right")
+    ax.set_xticklabels(families, rotation=30, ha="right")
     ax.set_ylabel("median per-row log-loss within class")
     ax.set_title("Which class drives each family's loss? (family's best model per bootstrap)")
     ax.legend(fontsize=8)
@@ -748,7 +714,17 @@ def run_plot(args):
 
     output_dir = Path(args.output_dir)
     per_bootstrap_dir = output_dir / "per_bootstrap"
-    df = _with_gaps(_load_candidates(per_bootstrap_dir))
+    df = _load_candidates(per_bootstrap_dir)
+    # Only shared-pool collections (standard families, dict configs -> named cfg_*
+    # columns) are supported; older ones (an extra probe family, or hand-grid tuple
+    # configs -> positional cfg_0/cfg_1/...) would give wrong plots, so refuse them.
+    unknown = sorted(set(df["family"]) - set(FAMILY_ORDER))
+    if unknown or (df["pool"] != "standard").any() or "cfg_0" in df.columns:
+        raise SystemExit(
+            f"{per_bootstrap_dir} is an older collection (families outside {FAMILY_ORDER}: {unknown}, "
+            f"or non-shared-pool candidates/tuple configs); re-run collect into a fresh --output-dir"
+        )
+    df = _with_gaps(df)
     logger.info(f"{len(df)} candidates from {df['bootstrap'].nunique()} bootstraps")
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
@@ -789,12 +765,11 @@ def _parse_args():
     parser.add_argument("--bootstraps", type=int, nargs="+", default=None,
                         help="Run only these bootstrap indices (e.g. for a smoke test)")
     parser.add_argument("--n-models-pool", type=int, default=100,
-                        help="Same meaning as --rid-n-models-pool in the comparison script (default: 100)")
+                        help="Seed refits per config for a grid-trained family outside the shared "
+                             "candidate pool; none of the default families is (default: 100)")
     parser.add_argument("--families", nargs="+", default=None,
                         help="Restrict the standard pool to these families (smoke tests only: "
                              "the bootstrap's best loss then ignores the others)")
-    parser.add_argument("--no-rf-probe", dest="rf_probe", action="store_false",
-                        help=f"Skip the {PROBE_FAMILY} family")
     parser.add_argument("--epsilon", type=float, default=0.05, help="Rashomon epsilon for plots (default: 0.05)")
     parser.add_argument("--n-jobs", type=int, default=1)
     add_logging_arguments(parser)

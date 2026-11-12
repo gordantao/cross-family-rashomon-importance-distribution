@@ -10,15 +10,17 @@
 #SBATCH --mail-user=gtao@unc.edu
 
 # -------------------------------------------------------
-# Re-runs the grid cross-family candidate search on Staellert annotated_phase
-# (same splits, grids and seeds as cross_family_unweighted in
-# run_staellert_top40_comparison.sl, including its outer holdout: the search
-# runs on the train rows only) and records every candidate's OOB losses and
-# calibration stats instead of a Rashomon set -- see the script docstring.
+# Fits the whole shared cross-family candidate pool (an exhaustive grid search)
+# on Staellert annotated_phase -- same splits, pool and seeds as
+# cross_family_unweighted_truvarimp in run_staellert_top40_comparison.sl, whose
+# TruVaRImp search fits a budgeted subset of that pool; the outer holdout
+# matches too (the search runs on the train rows only) -- and records every
+# candidate's OOB losses and calibration stats instead of a Rashomon set -- see
+# the script docstring.
 #
 # One bootstrap per worker, 100 bootstraps on 50 cpus = 2 waves. Models are
-# scored and dropped immediately, so memory stays far below the 96G the grid
-# comparison task needs. Each bootstrap checkpoints
+# scored and dropped immediately, so memory stays far below what holding a
+# bootstrap's whole fitted pool would need. Each bootstrap checkpoints
 # results/rashomon_family_diagnostics_holdout/per_bootstrap/b<NNN>_*; resubmit after a
 # timeout and finished bootstraps are skipped.
 #
