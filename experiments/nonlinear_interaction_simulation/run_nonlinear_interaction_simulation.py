@@ -58,6 +58,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 from pathlib import Path
@@ -1155,11 +1156,18 @@ def per_dgp_coverage_path(output_dir, dgp_name, beta):
     return os.path.join(output_dir, PER_DGP_SUBDIR, f"{SEARCH_COVERAGE_PREFIX}{dgp_name}__{_beta_tag(beta)}.csv")
 
 
+def _tmp_path(path):
+    """Per-process temp name; the hostname keeps array tasks on different nodes
+    (which can share a PID) from writing the same temp file on shared storage."""
+
+    return f"{path}.{socket.gethostname()}.{os.getpid()}.tmp"
+
+
 def write_csv_atomic(df, path):
     """Write via a temp file + rename so a job killed mid-write (or a concurrent
     array task) never leaves a truncated CSV behind."""
 
-    tmp_path = f"{path}.{os.getpid()}.tmp"
+    tmp_path = _tmp_path(path)
     df.to_csv(tmp_path, index=False)
     os.replace(tmp_path, path)
 
@@ -1221,7 +1229,7 @@ def prepare_output_dir(output_dir, study_settings):
                 f"{os.path.join(output_dir, PER_DGP_SUBDIR)} to start over."
             )
 
-    tmp_path = f"{settings_path}.{os.getpid()}.tmp"
+    tmp_path = _tmp_path(settings_path)
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(study_settings, handle, indent=2)
     os.replace(tmp_path, settings_path)
@@ -1421,6 +1429,10 @@ def write_combined_outputs(output_dir):
     coverage_paths = checkpoint_paths(SEARCH_COVERAGE_PREFIX)
     if coverage_paths:
         coverage = pd.concat([pd.read_csv(path) for path in coverage_paths], ignore_index=True)
+        # Coverage is checkpointed just before study results, so a cell that
+        # crashed (or that a concurrent task is finishing) between the two writes
+        # can have a coverage row only; keep the cells study_results has.
+        coverage = coverage.merge(snr_results[["dgp", "beta", "rep"]], on=["dgp", "beta", "rep"])
         coverage = coverage.sort_values(["dgp", "beta", "rep"], kind="stable")
         by_dgp_beta, by_dgp, by_family = build_coverage_tables(coverage)
         coverage_outputs = {
