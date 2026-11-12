@@ -451,6 +451,10 @@ def normalize_candidate_search(candidate_search):
 def summarize_metric_result(metric_result):
     """Compute per-feature expected importance and P(phi > 0).
 
+    ``metric_result`` is one value of ``metric_results_``: the 5-tuple
+    ``(rid_cdfs, cdf_grid, raw_importances, expected_importance,
+    prob_positive)`` built by ``_aggregate_metric_results``.
+
     ``expected_importance`` is the mean of the RID distribution itself: the
     average, over valid bootstraps, of each bootstrap's mean importance across
     its Rashomon set, so every bootstrap counts equally (as in the averaged
@@ -459,16 +463,24 @@ def summarize_metric_result(metric_result):
     (cross-family ``weighted`` balance mode) and plain otherwise
     (single-family, or cross-family ``unweighted``). ``raw_importances`` stays
     the pooled per-model values, so its plain mean is *not* this quantity.
+
+    ``prob_positive`` is P(phi > 0) under the same distribution, computed
+    exactly from the per-model values (not read off the discretized CDF, whose
+    first grid point at or above 0 would drop the mass in (0, grid point]):
+    the average, over valid bootstraps, of each bootstrap's (weighted, where
+    per-model weights exist) fraction of Rashomon models with phi strictly
+    greater than 0. Exact zeros (e.g. a feature a model does not use) do not
+    count as positive. For ``iloco`` (``sum_abs`` reduction, always >= 0) it
+    is the fraction of models where the feature has any nonzero interaction.
     """
 
-    rid_cdfs, cdf_grid, raw_importances, expected_importance = metric_result
-    idx_zero = min(np.searchsorted(cdf_grid, 0), len(cdf_grid) - 1)
+    rid_cdfs, _cdf_grid, _raw_importances, expected_importance, prob_positive = metric_result
 
     summary = {}
     for feature_name in rid_cdfs:
         summary[feature_name] = {
             "expected_importance": expected_importance[feature_name],
-            "prob_positive": float(1 - rid_cdfs[feature_name][idx_zero]),
+            "prob_positive": float(prob_positive[feature_name]),
         }
     return summary
 
@@ -515,6 +527,9 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
         # valid bootstrap counts once, regardless of its Rashomon-set size.
         boot_mean_sums = {feature_name: 0.0 for feature_name in feature_names}
         boot_mean_counts = {feature_name: 0 for feature_name in feature_names}
+        # Same per-bootstrap averaging for P(phi > 0), computed exactly from the
+        # values rather than read off the discretized CDF.
+        boot_positive_sums = {feature_name: 0.0 for feature_name in feature_names}
 
         valid_count = 0
         for i, boot_importances in enumerate(per_bootstrap_importances):
@@ -528,6 +543,9 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
                     continue
                 boot_mean_sums[feature_name] += float(np.average(values, weights=boot_weights))
                 boot_mean_counts[feature_name] += 1
+                boot_positive_sums[feature_name] += float(
+                    np.average(np.asarray(values) > 0, weights=boot_weights)
+                )
                 if boot_weights is not None:
                     values_arr = np.array(values)
                     weights_arr = np.array(boot_weights)
@@ -552,8 +570,16 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
             )
             for feature_name in feature_names
         }
+        prob_positive = {
+            feature_name: (
+                boot_positive_sums[feature_name] / boot_mean_counts[feature_name]
+                if boot_mean_counts[feature_name]
+                else 0.0
+            )
+            for feature_name in feature_names
+        }
 
-        metric_results[metric] = (rid_cdfs, cdf_grid, raw_importances, expected_importance)
+        metric_results[metric] = (rid_cdfs, cdf_grid, raw_importances, expected_importance, prob_positive)
 
     return metric_results
 
@@ -1592,8 +1618,10 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
     Attributes
     ----------
     metric_results_ : dict or None
-        Mapping ``metric_name -> (rid_cdfs, cdf_grid, raw_importances, expected_importance)``.
-        ``None`` if no bootstrap produced a non-empty Rashomon set.
+        Mapping ``metric_name -> (rid_cdfs, cdf_grid, raw_importances,
+        expected_importance, prob_positive)``; the last two are per-feature
+        dicts (see ``summarize_metric_result``). ``None`` if no bootstrap
+        produced a non-empty Rashomon set.
 
     family_counts_ : dict of str to int
         Total number of Rashomon models selected for each family across valid
