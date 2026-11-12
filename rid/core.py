@@ -449,9 +449,14 @@ def normalize_candidate_search(candidate_search):
 def summarize_metric_result(metric_result):
     """Compute per-feature expected importance and P(phi > 0).
 
-    ``expected_importance`` is a weighted mean when the metric result carries
-    per-model weights (cross-family ``weighted`` balance mode); it reduces to
-    a plain mean otherwise (single-family, or cross-family ``unweighted``).
+    ``expected_importance`` is the mean of the RID distribution itself: the
+    average, over valid bootstraps, of each bootstrap's mean importance across
+    its Rashomon set, so every bootstrap counts equally (as in the averaged
+    ECDFs) regardless of how many models it kept. Within a bootstrap the mean
+    is weighted by the per-model weights when the metric result carries them
+    (cross-family ``weighted`` balance mode) and plain otherwise
+    (single-family, or cross-family ``unweighted``). ``raw_importances`` stays
+    the pooled per-model values, so its plain mean is *not* this quantity.
     """
 
     rid_cdfs, cdf_grid, raw_importances, expected_importance = metric_result
@@ -496,28 +501,18 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
 
     for metric in metrics:
         raw_importances = {feature_name: [] for feature_name in feature_names}
-        raw_weights = {feature_name: [] for feature_name in feature_names}
-        for i, boot_importances in enumerate(per_bootstrap_importances):
-            boot_weights = per_bootstrap_weights[i][metric] if per_bootstrap_weights is not None else None
+        for boot_importances in per_bootstrap_importances:
             for feature_name in feature_names:
-                values = boot_importances[metric][feature_name]
-                raw_importances[feature_name].extend(values)
-                raw_weights[feature_name].extend(
-                    boot_weights if boot_weights is not None else [1.0] * len(values)
-                )
-
-        expected_importance = {
-            feature_name: (
-                float(np.average(raw_importances[feature_name], weights=raw_weights[feature_name]))
-                if raw_importances[feature_name]
-                else 0.0
-            )
-            for feature_name in feature_names
-        }
+                raw_importances[feature_name].extend(boot_importances[metric][feature_name])
 
         all_values = [value for values in raw_importances.values() for value in values]
         cdf_grid = np.linspace(np.min(all_values), np.max(all_values), n_cdf_points)
         rid_cdfs = {feature_name: np.zeros(n_cdf_points) for feature_name in feature_names}
+        # Per-bootstrap (weighted) means, summed and divided like the ECDFs below,
+        # so expected_importance is the mean of the averaged-ECDF mixture: each
+        # valid bootstrap counts once, regardless of its Rashomon-set size.
+        boot_mean_sums = {feature_name: 0.0 for feature_name in feature_names}
+        boot_mean_counts = {feature_name: 0 for feature_name in feature_names}
 
         valid_count = 0
         for i, boot_importances in enumerate(per_bootstrap_importances):
@@ -529,6 +524,8 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
                 values = boot_importances[metric][feature_name]
                 if len(values) == 0:
                     continue
+                boot_mean_sums[feature_name] += float(np.average(values, weights=boot_weights))
+                boot_mean_counts[feature_name] += 1
                 if boot_weights is not None:
                     values_arr = np.array(values)
                     weights_arr = np.array(boot_weights)
@@ -544,6 +541,15 @@ def _aggregate_metric_results(per_bootstrap_importances, feature_names, metrics,
 
         for feature_name in feature_names:
             rid_cdfs[feature_name] /= valid_count
+
+        expected_importance = {
+            feature_name: (
+                boot_mean_sums[feature_name] / boot_mean_counts[feature_name]
+                if boot_mean_counts[feature_name]
+                else 0.0
+            )
+            for feature_name in feature_names
+        }
 
         metric_results[metric] = (rid_cdfs, cdf_grid, raw_importances, expected_importance)
 
