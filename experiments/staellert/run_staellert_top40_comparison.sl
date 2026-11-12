@@ -85,8 +85,12 @@ $PYTHON_ENV --version
 #          (2) single-family RID on a fully enumerated decision-tree Rashomon set,
 #          (3) cross-family RID (unweighted), exhaustive grid candidate search,
 #          (4) cross-family RID (unweighted), joint TruVaRImp candidate search.
-# Results go to a fresh dir: RID now judges Rashomon membership/VI out-of-bag,
-# so results in top40_feature_comparison/ (in-sample) are not comparable.
+# Results go to a fresh dir: every method now selects on the train rows of an
+# outer stratified holdout (--holdout-fraction 0.2, --holdout-seed 42) and the
+# evaluator panel scores on the held-out test rows. Earlier dirs
+# (top40_feature_comparison_oob/, and the in-sample top40_feature_comparison/)
+# scored stepwise methods on the same CV folds they selected on, and every
+# method on rows it selected on, so they are not comparable.
 # 100 bootstraps, not 500: Staellert candidate fits average ~1 min, so a grid
 # bootstrap is ~500 fit-minutes and 500 bootstraps on 50 cpus would need ~85h
 # (TruVaRImp ~50h). At 100: grid ~17h, TruVaRImp ~10h.
@@ -98,7 +102,9 @@ echo "Method:        $METHOD"
 
 $PYTHON_ENV experiments/staellert/run_staellert_top40_comparison.py \
     --data-dir experiments/staellert/data/staellert_et_al \
-    --output-dir experiments/staellert/results/top40_feature_comparison_oob \
+    --output-dir experiments/staellert/results/top40_feature_comparison_holdout \
+    --holdout-fraction 0.2 \
+    --holdout-seed 42 \
     --tasks annotated_phase \
     --methods "$METHOD" \
     --top-k 40 \

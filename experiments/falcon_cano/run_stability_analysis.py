@@ -53,7 +53,7 @@ from rid import (  # noqa: E402
     silence_warnings,
     vi_sub_mr,
 )
-from run_falcon_cano_top40_comparison import _prepare_dataset, resolve_num_workers  # noqa: E402
+from run_falcon_cano_top40_comparison import _prepare_dataset_unsplit, resolve_num_workers  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +285,7 @@ def main():
 
     started = time.time()
 
-    X, y, data_meta = _prepare_dataset(
+    X, y, data_meta = _prepare_dataset_unsplit(
         data_path=Path(args.data),
         use_curated_descriptors=args.use_curated_descriptors,
         correlation_threshold=args.correlation_threshold,

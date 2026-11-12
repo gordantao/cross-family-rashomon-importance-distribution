@@ -18,6 +18,13 @@
 # biomarker_recovery.csv, run_settings.json), and overall_task_summary.csv is
 # rebuilt from every finished task each time.
 #
+# Evaluation: each task's rows are split once (stratified, --holdout-fraction
+# 0.2, --holdout-seed 42); every method selects on the train rows and the
+# evaluator panel scores on the held-out test rows. Outputs go to
+# top40_feature_comparison_holdout/: the older top40_feature_comparison/ scored
+# stepwise methods on the same CV folds they selected on (and every method on
+# rows it selected on), so it is not comparable.
+#
 # Prerequisites (once, on the cluster): the conda env, the raw data, and the
 # processed panel.
 #   conda env create -f experiments/gdsc/environment.yml   # -> zikry_lab-gdsc
@@ -70,7 +77,9 @@ echo "Method:        $METHOD"
 
 $PYTHON_ENV experiments/gdsc/run_gdsc_top40_comparison.py \
     --data-dir experiments/gdsc/data/processed \
-    --output-dir experiments/gdsc/results/top40_feature_comparison \
+    --output-dir experiments/gdsc/results/top40_feature_comparison_holdout \
+    --holdout-fraction 0.2 \
+    --holdout-seed 42 \
     --tasks "$TASK" \
     --methods "$METHOD" \
     --top-k 40 \

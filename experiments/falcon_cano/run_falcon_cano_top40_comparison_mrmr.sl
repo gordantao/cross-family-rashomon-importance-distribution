@@ -73,12 +73,14 @@ $PYTHON_ENV --version
 # This targets the specific confound where stepwise selection wins a
 # matched-k predictive comparison partly because its own greedy CV-scored
 # search avoids redundant features "for free," while RID's marginal ranking
-# doesn't. Under --top-k=auto, RID methods elbow-detect a held-out CV-gain
-# curve here (not prob_positive -- see --rid-selection's help text).
+# doesn't. Under --top-k=auto, RID methods elbow-detect an in-train CV-gain
+# curve on the outer holdout's train rows here (not prob_positive -- see --rid-selection's help text).
 # --rid-metric is pinned explicitly to sub_mr (also the script's default).
 $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --data experiments/falcon_cano/falcon_cano_featured.csv \
-    --output-dir experiments/falcon_cano/results/top40_feature_comparison_auto_k_mrmr \
+    --output-dir experiments/falcon_cano/results/top40_feature_comparison_auto_k_mrmr_holdout \
+    --holdout-fraction 0.2 \
+    --holdout-seed 42 \
     --top-k auto \
     --top-k-max-sweep 100 \
     --rid-selection mrmr \
