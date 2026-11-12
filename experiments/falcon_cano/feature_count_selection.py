@@ -3,7 +3,7 @@ method's own already-computed signal curve, instead of an arbitrary fixed
 top-k or a deviance-based BIC/AIC refit sweep (this file's earlier approach,
 now superseded by this one).
 
-RID-based methods (rid_tree, cross_family_unweighted, cross_family_weighted)
+RID-based methods (rid_tree, cross_family_unweighted_truvarimp)
 already compute, as a side effect of fitting, each feature's `prob_positive`
 (P(phi > 0) -- the fraction of bootstrap Rashomon-set models under which that
 feature's importance was positive; see `summarize_metric_result` in

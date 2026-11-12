@@ -76,8 +76,7 @@ def load_method_feature_lists(top40_results_dir: Path) -> dict[str, list[str]]:
         "stepwise_logreg": "stepwise_logreg_top_features.csv",
         "stepwise_rf": "stepwise_rf_top_features.csv",
         "rid_tree": "rid_tree_top_features.csv",
-        "cross_family_unweighted": "rid_cross_family_unweighted_top_features.csv",
-        "cross_family_weighted": "rid_cross_family_weighted_top_features.csv",
+        "cross_family_unweighted_truvarimp": "rid_cross_family_unweighted_truvarimp_top_features.csv",
     }
     method_feature_lists = {}
     for method_name, filename in file_map.items():

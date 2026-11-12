@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Compare feature-selection methods for the Falcon-Cano bioavailability study.
 
-Compares five top-k feature sets on the Falcon-Cano oral-bioavailability
+Compares four top-k feature sets on the Falcon-Cano oral-bioavailability
 classification task (%F >= 50 vs. < 50):
 
 1) Forward stepwise selection scored via logistic-regression CV.
 2) Forward stepwise selection scored via random-forest CV.
 3) Single-family RID using a fully enumerated decision-tree Rashomon set
    (RashomonImportanceDistribution over FullyEnumeratedTreeClassifier).
-4) Cross-family RID with family_balance_mode='unweighted'.
-5) Cross-family RID with family_balance_mode='weighted'.
+4) cross_family_unweighted_truvarimp: cross-family RID
+   (family_balance_mode='unweighted') with joint TruVaRImp candidate search
+   (candidate_search='truvarimp_joint', rid/truvarimp.py), spending
+   --truvarimp-total-budget real fits per bootstrap on the shared candidate pool.
+The exhaustive grid cross-family methods (cross_family_unweighted and
+cross_family_weighted) were dropped: fitting the whole shared pool (~500 configs
+per family per bootstrap) is too expensive on real data, and the weighted
+balance mode was dropped with them. Grid search is kept only in the nonlinear
+simulation, where it validates TruVaRImp.
 
 Evaluation protocol (outer stratified holdout): the rows are split once into
 train and test (--holdout-fraction, default 0.2; --holdout-seed). Feature
@@ -137,8 +144,8 @@ def _parse_args() -> argparse.Namespace:
         description=(
             "Compare forward-stepwise feature selection (logistic regression and "
             "random forest) against single-family RID on a fully enumerated "
-            "decision-tree Rashomon set and cross-family RID (both unweighted and "
-            "weighted balance modes), for the Falcon-Cano bioavailability task. "
+            "decision-tree Rashomon set and unweighted cross-family RID (TruVaRImp "
+            "candidate search), for the Falcon-Cano bioavailability task. "
             "Every method selects on the train rows of an outer stratified holdout; its "
             "selected features are scored with a common evaluator panel fit on those "
             "train rows and scored on the held-out test rows, for a fair comparison."
@@ -277,8 +284,8 @@ def _parse_args() -> argparse.Namespace:
         choices=["marginal", "mrmr"],
         default="marginal",
         help=(
-            "How RID-based methods (rid_tree, cross_family_unweighted, "
-            "cross_family_weighted) order their ranked features. 'marginal' (default) "
+            "How RID-based methods (rid_tree, cross_family_unweighted_truvarimp) "
+            "order their ranked features. 'marginal' (default) "
             "uses RID's own expected_importance ranking as-is -- two substitutable "
             "features can both rank highly, since RID deliberately characterizes "
             "importance across the whole Rashomon set rather than penalizing "
@@ -310,14 +317,13 @@ def _parse_args() -> argparse.Namespace:
         help="Bootstrap iterations for the single-family tree RID (default: 100)",
     )
     parser.add_argument(
-        "--rid-n-models-pool",
+        "--truvarimp-total-budget",
         type=int,
-        default=50,
+        default=300,
         help=(
-            "RID n_models_pool / n_models_per_class (default: 50). Only sets seed refits for "
-            "seed-sensitive grids and custom trainers: the tree grid fits each config once, and "
-            "cross-family RID draws a shared candidate pool of "
-            "rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY per family instead"
+            "Shared per-bootstrap real-fit budget across all families for "
+            "cross_family_unweighted_truvarimp (default: 300), spent on a shared pool of "
+            "rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY candidates per family."
         ),
     )
     parser.add_argument(
@@ -637,13 +643,13 @@ def run_single_family_tree_rid(
     rid_metric: str,
     epsilon: float,
     n_bootstraps: int,
-    n_models_pool: int,
     n_jobs: int,
 ) -> tuple[list[str], pd.DataFrame, dict]:
+    # n_models_pool is left at its default: it only sets seed refits for
+    # refit_seeds=True grids, and the tree grid fits each config once.
     estimator = RashomonImportanceDistribution(
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
-        n_models_pool=n_models_pool,
         model_class=FullyEnumeratedTreeClassifier,
         vi_metrics=(rid_metric,),
         performance_metrics=("accuracy", "auprc"),
@@ -696,25 +702,26 @@ def run_cross_family_rid(
     rid_metric: str,
     epsilon: float,
     n_bootstraps: int,
-    n_models_per_class: int,
-    family_balance_mode: str,
     n_jobs: int,
+    truvarimp_total_budget: int,
 ) -> tuple[list[str], pd.DataFrame, dict]:
+    # Every family is in the shared candidate pool, so n_models_per_class is unused.
     estimator = CrossFamilyRashomonImportanceDistribution(
         model_configs=_build_cross_family_model_configs(),
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
-        n_models_per_class=n_models_per_class,
         vi_metrics=(rid_metric,),
         performance_metrics=("accuracy", "auprc"),
-        family_balance_mode=family_balance_mode,
+        family_balance_mode="unweighted",
         n_jobs=n_jobs,
+        candidate_search="truvarimp_joint",
+        truvarimp_config={"total_budget": truvarimp_total_budget},
     )
     estimator.fit(X, y)
 
     if estimator.metric_results_ is None:
         raise RuntimeError(
-            f"Cross-family RID ({family_balance_mode}) returned no metric results; "
+            "Cross-family RID (truvarimp_joint) returned no metric results; "
             "no valid Rashomon bootstraps were found"
         )
 
@@ -940,6 +947,7 @@ def main() -> None:
     logger.info(f"  holdout:               fraction={args.holdout_fraction} seed={args.holdout_seed}")
     logger.info(f"  use_curated_descriptors: {args.use_curated_descriptors}")
     logger.info(f"  rid_n_jobs:            {rid_n_jobs}")
+    logger.info(f"  truvarimp_total_budget: {args.truvarimp_total_budget}")
     logger.info("=" * 70)
 
     start_time = time.time()
@@ -1126,7 +1134,7 @@ def main() -> None:
     # --- Method 3: single-family RID on a fully enumerated tree Rashomon set ---
     logger.info(
         f"[rid] metric={args.rid_metric} epsilon={args.rid_epsilon} "
-        f"n_bootstraps={args.rid_n_bootstraps} n_models_pool={args.rid_n_models_pool}"
+        f"n_bootstraps={args.rid_n_bootstraps}"
     )
     rid_tree_features, rid_tree_table, rid_tree_perf = run_single_family_tree_rid(
         X=X_train,
@@ -1135,44 +1143,40 @@ def main() -> None:
         rid_metric=args.rid_metric,
         epsilon=args.rid_epsilon,
         n_bootstraps=args.rid_n_bootstraps,
-        n_models_pool=args.rid_n_models_pool,
         n_jobs=rid_n_jobs,
     )
     rid_tree_features, rid_tree_table = resolve_rid_feature_count("rid_tree", rid_tree_features, rid_tree_table)
     rid_tree_table.to_csv(output_dir / "rid_tree_top_features.csv", index=False)
 
-    # --- Methods 4-5: cross-family RID (unweighted, weighted) ---
-    cross_family_features: dict[str, list[str]] = {}
-    cross_family_perf: dict[str, dict] = {}
-    for balance_mode in ("unweighted", "weighted"):
-        logger.info(
-            f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
-            f"n_bootstraps={args.rid_n_bootstraps} n_models_per_class={args.rid_n_models_pool} "
-            f"family_balance_mode={balance_mode}"
-        )
-        features, table, perf = run_cross_family_rid(
-            X=X_train,
-            y=y_train,
-            top_k=selection_top_k,
-            rid_metric=args.rid_metric,
-            epsilon=args.rid_epsilon,
-            n_bootstraps=args.rid_n_bootstraps,
-            n_models_per_class=args.rid_n_models_pool,
-            family_balance_mode=balance_mode,
-            n_jobs=rid_n_jobs,
-        )
-        features, table = resolve_rid_feature_count(f"cross_family_{balance_mode}", features, table)
-        table.to_csv(output_dir / f"rid_cross_family_{balance_mode}_top_features.csv", index=False)
-        cross_family_features[balance_mode] = features
-        cross_family_perf[balance_mode] = perf
+    # --- Method 4: cross-family RID (unweighted), TruVaRImp candidate search ---
+    logger.info(
+        f"[rid] cross-family metric={args.rid_metric} epsilon={args.rid_epsilon} "
+        f"n_bootstraps={args.rid_n_bootstraps} candidate_search=truvarimp_joint "
+        f"total_budget={args.truvarimp_total_budget} family_balance_mode=unweighted"
+    )
+    cross_family_features, cross_family_table, cross_family_perf = run_cross_family_rid(
+        X=X_train,
+        y=y_train,
+        top_k=selection_top_k,
+        rid_metric=args.rid_metric,
+        epsilon=args.rid_epsilon,
+        n_bootstraps=args.rid_n_bootstraps,
+        n_jobs=rid_n_jobs,
+        truvarimp_total_budget=args.truvarimp_total_budget,
+    )
+    cross_family_features, cross_family_table = resolve_rid_feature_count(
+        "cross_family_unweighted_truvarimp", cross_family_features, cross_family_table
+    )
+    cross_family_table.to_csv(
+        output_dir / "rid_cross_family_unweighted_truvarimp_top_features.csv", index=False
+    )
 
-    # --- Comparison across all five top-k feature sets ---
+    # --- Comparison across all four top-k feature sets ---
     method_feature_lists = {
         "stepwise_logreg": stepwise_logreg_features,
         "stepwise_rf": stepwise_rf_features,
         "rid_tree": rid_tree_features,
-        "cross_family_unweighted": cross_family_features["unweighted"],
-        "cross_family_weighted": cross_family_features["weighted"],
+        "cross_family_unweighted_truvarimp": cross_family_features,
     }
     comparison = _build_comparison_table(method_feature_lists)
     comparison.sort_values(
@@ -1189,8 +1193,7 @@ def main() -> None:
         X_train, y_train, X_test, y_test, method_feature_lists, evaluator_panel, cv, args.stepwise_scoring
     )
 
-    cross_family_unweighted_rashomon = _summarize_cross_family_perf(cross_family_perf["unweighted"])
-    cross_family_weighted_rashomon = _summarize_cross_family_perf(cross_family_perf["weighted"])
+    cross_family_rashomon = _summarize_cross_family_perf(cross_family_perf)
 
     credit_split_ratios = None
     if redundant_pair is not None:
@@ -1253,23 +1256,17 @@ def main() -> None:
             "top_features": rid_tree_features,
             "rashomon_oob_perf_stats": rid_tree_perf,
         },
-        "cross_family_unweighted": {
+        "cross_family_unweighted_truvarimp": {
             "metric": args.rid_metric,
             "epsilon": args.rid_epsilon,
-            # Grid search = every candidate of the shared pool fit once (rid.candidate_pool).
-            "candidate_search": "grid",
+            "family_balance_mode": "unweighted",
+            # TruVaRImp spends total_budget real fits per bootstrap on the shared
+            # candidate pool (rid.candidate_pool) of n_candidates_per_family per family.
+            "candidate_search": "truvarimp_joint",
+            "truvarimp_total_budget": args.truvarimp_total_budget,
             "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
-            "top_features": cross_family_features["unweighted"],
-            "rashomon_oob_perf_stats": cross_family_perf["unweighted"],
-        },
-        "cross_family_weighted": {
-            "metric": args.rid_metric,
-            "epsilon": args.rid_epsilon,
-            # Grid search = every candidate of the shared pool fit once (rid.candidate_pool).
-            "candidate_search": "grid",
-            "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
-            "top_features": cross_family_features["weighted"],
-            "rashomon_oob_perf_stats": cross_family_perf["weighted"],
+            "top_features": cross_family_features,
+            "rashomon_oob_perf_stats": cross_family_perf,
         },
         "overlap_counts": overlap_counts,
     }
@@ -1304,10 +1301,8 @@ def main() -> None:
         {
             "rid_tree_rashomon_oob_accuracy_mean": rid_tree_perf.get("accuracy_mean"),
             "rid_tree_rashomon_oob_auprc_mean": rid_tree_perf.get("auprc_mean"),
-            "cross_family_unweighted_rashomon_oob_accuracy_mean": cross_family_unweighted_rashomon["accuracy_mean"],
-            "cross_family_unweighted_rashomon_oob_auprc_mean": cross_family_unweighted_rashomon["auprc_mean"],
-            "cross_family_weighted_rashomon_oob_accuracy_mean": cross_family_weighted_rashomon["accuracy_mean"],
-            "cross_family_weighted_rashomon_oob_auprc_mean": cross_family_weighted_rashomon["auprc_mean"],
+            "cross_family_unweighted_truvarimp_rashomon_oob_accuracy_mean": cross_family_rashomon["accuracy_mean"],
+            "cross_family_unweighted_truvarimp_rashomon_oob_auprc_mean": cross_family_rashomon["auprc_mean"],
         }
     )
     if credit_split_ratios is not None:

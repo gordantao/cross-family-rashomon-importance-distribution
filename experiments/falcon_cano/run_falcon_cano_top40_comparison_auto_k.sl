@@ -64,7 +64,7 @@ echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
 # --- Run the top-k comparison analysis with elbow-based auto k-selection ---
-# Same five methods as run_falcon_cano_top40_comparison.sl, but each method's
+# Same four methods as run_falcon_cano_top40_comparison.sl, but each method's
 # feature count is chosen via elbow detection on its own native signal curve
 # instead of a flat top-40 (--top-k auto; see feature_count_selection.py):
 # RID-based methods elbow-detect prob_positive (P(phi>0) across the Rashomon
@@ -84,7 +84,7 @@ $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --top-k-max-sweep 100 \
     --rid-metric sub_mr \
     --rid-n-bootstraps 500 \
-    --rid-n-models-pool 100 \
+    --truvarimp-total-budget 300 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
 

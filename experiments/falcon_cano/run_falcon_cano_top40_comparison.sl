@@ -67,8 +67,11 @@ $PYTHON_ENV --version
 # Compares: (1) forward stepwise selection via logistic regression,
 #           (2) forward stepwise selection via random forest,
 #           (3) single-family RID on a fully enumerated decision-tree Rashomon set,
-#           (4) cross-family RID (family_balance_mode=unweighted),
-#           (5) cross-family RID (family_balance_mode=weighted).
+#           (4) cross-family RID (family_balance_mode=unweighted), joint
+#               TruVaRImp candidate search (300 real fits per bootstrap).
+# The exhaustive grid cross-family methods (unweighted and weighted) were
+# dropped as too expensive (each fit the whole ~500-config-per-family shared
+# candidate pool every bootstrap).
 # Every method selects on the train rows of one outer stratified holdout
 # (--holdout-fraction 0.2, --holdout-seed 42); its selected features are scored
 # by the same evaluator panel (logreg and RBF SVM behind a StandardScaler, RF),
@@ -79,8 +82,9 @@ $PYTHON_ENV --version
 # they selected on (and every method on rows it selected on), and
 # top40_feature_comparison/ additionally predates out-of-bag Rashomon
 # membership (f134dd8) and the evaluator/stepwise-logreg scaling fix (bdee476)
-# and used --rid-n-models-pool 50; this run uses 100.
-# Memory: 96G, as for the Staellert grid cross-family run that OOM'd at 32G.
+# and used --rid-n-models-pool 50 (a since-removed flag).
+# Memory: 96G, raised for the since-removed grid cross-family methods (the
+# Staellert grid run OOM'd at 32G); kept as headroom.
 # (--inject-redundant-duplicate is available as an opt-in diagnostic but is
 # NOT used here -- it changes the feature space for every method, which
 # would make this run's results incomparable to the standard benchmark. Run
@@ -92,7 +96,7 @@ $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --holdout-seed 42 \
     --top-k 40 \
     --rid-n-bootstraps 500 \
-    --rid-n-models-pool 100 \
+    --truvarimp-total-budget 300 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
 
