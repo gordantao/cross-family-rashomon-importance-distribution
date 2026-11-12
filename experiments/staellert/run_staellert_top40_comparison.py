@@ -61,6 +61,7 @@ from sklearn.svm import SVC
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from rid.candidate_pool import DEFAULT_N_CANDIDATES_PER_FAMILY  # noqa: E402
 from rid import (
     CrossFamilyRashomonImportanceDistribution,
     ElasticNetClassifier,
@@ -266,7 +267,12 @@ def _parse_args() -> argparse.Namespace:
         "--rid-n-models-pool",
         type=int,
         default=50,
-        help="Candidate refits per grid point, per bootstrap, for the tree Rashomon set (default: 50)",
+        help=(
+            "RID n_models_pool / n_models_per_class (default: 50). Only sets seed refits for "
+            "seed-sensitive grids and custom trainers: the tree grid fits each config once, and "
+            "cross-family RID draws a shared candidate pool of "
+            "rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY per family instead"
+        ),
     )
     parser.add_argument(
         "--rid-n-jobs",
@@ -972,6 +978,14 @@ def _method_settings(method: str, args: argparse.Namespace, holdout_meta: dict) 
         settings["selection_model_scaling"] = "standardized_per_fold"
     if method.startswith(("rid_", "cross_family_")):
         settings["rashomon_evaluation"] = "out_of_bag"
+    # Added 2026-11-12: single-family grids fit each config once (seed refits only for
+    # RandomForest; no duplicate criterion="log_loss" trees), and cross-family RID draws
+    # its candidates from the shared pool (rid.candidate_pool). Older checkpoints lack
+    # these keys and are refused.
+    if method.startswith("rid_"):
+        settings["grid_refits"] = "seed_sensitive_only"
+    if method.startswith("cross_family_"):
+        settings["n_candidates_per_family"] = DEFAULT_N_CANDIDATES_PER_FAMILY
     # Added 2026-11-11: checkpoints from the old protocol (selection and evaluation on
     # the same rows/folds) lack these and are refused, as are ones from another split.
     settings["evaluation_protocol"] = holdout_meta["protocol"]

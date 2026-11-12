@@ -231,7 +231,7 @@ def parse_args():
     parser.add_argument("--rid-metric", type=str, default="sub_mr")
     parser.add_argument("--truvarimp-total-budget", type=int, default=tv.DEFAULT_TRUVARIMP_TOTAL_BUDGET)
     parser.add_argument(
-        "--models-per-class", type=int, default=100, help="Grid path only (default: 100, as in the .sl)"
+        "--models-per-class", type=int, default=100, help="n_models_per_class (default: 100, as in the .sl); unused by the pooled built-in families"
     )
     parser.add_argument(
         "--bootstraps", type=int, default=2, help="Bootstraps for the single-process probe (default: 2)"

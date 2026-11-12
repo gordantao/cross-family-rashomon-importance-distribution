@@ -4,9 +4,10 @@
 In the OOB TruVaRImp Staellert run, random forests had 0 Rashomon members across
 all 100 bootstraps. compute_rid_cross_family discards every candidate's loss once
 membership is decided, so this script re-runs the grid cross-family candidate
-search (same data prep, scaler, bootstrap splits, grids and seeds as the
-cross_family_unweighted method of run_staellert_top40_comparison.py) and records
-one row per candidate instead of a Rashomon set.
+search (same data prep, scaler, bootstrap splits, shared candidate pool and
+per-candidate seeds as the cross_family_unweighted method of
+run_staellert_top40_comparison.py, see rid.candidate_pool) and records one row
+per candidate instead of a Rashomon set.
 
 It mirrors the comparison's outer stratified holdout protocol: the labelled rows
 are split once (--holdout-fraction, --holdout-seed; same defaults as the
@@ -24,7 +25,7 @@ Each candidate row records:
 
 A RandomForest_probe family (not part of the standard pool, never counted
 toward the bootstrap's best loss) adds min_samples_leaf and larger max_features,
-which the standard RF grid doesn't search. Each bootstrap also saves the OOB
+which the standard RF search space doesn't search. Each bootstrap also saves the OOB
 predicted probabilities of every family's best candidate, for reliability
 diagrams.
 
@@ -63,6 +64,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from rid import add_logging_arguments, configure_logging, silence_warnings  # noqa: E402
 from rid.core import _bootstrap_split, _prepare_inputs  # noqa: E402
+from rid.candidate_pool import (  # noqa: E402
+    DEFAULT_N_CANDIDATES_PER_FAMILY,
+    build_candidate_pool,
+    resolve_default_search_space,
+)
 from rid.models import GridCandidateTrainer, candidate_loss, resolve_model_config  # noqa: E402
 from run_staellert_top40_comparison import (  # noqa: E402
     TASK_REGISTRY,
@@ -89,7 +95,8 @@ PROB_CLIP = np.finfo(np.float64).eps
 ECE_BINS = 15
 # Settings that change collected rows; a results dir written under others is refused.
 SETTING_KEYS = ("task", "correlation_threshold", "holdout_fraction", "holdout_seed", "n_models_pool",
-                "rf_probe", "families", "evaluation_protocol", "holdout_test_rows_sha256")
+                "n_candidates_per_family", "rf_probe", "families", "evaluation_protocol",
+                "holdout_test_rows_sha256")
 
 
 # --------------------------------------------------------------------------- collect
@@ -176,12 +183,19 @@ def _candidate_row(model, X_oob, y_oob, classes, folds):
     return row, proba
 
 
-def _family_candidates(name, trainer, model_kwargs, n_models_pool, b):
-    """Yield (config, seed, estimator) exactly as GridCandidateTrainer.train builds them."""
+def _family_candidates(name, trainer, model_kwargs, family_pool, n_models_pool, b):
+    """Yield (config, seed, estimator) exactly as compute_rid_cross_family's grid search
+    builds them: every shared-pool candidate with its own seed, or, for a family outside
+    the pool, GridCandidateTrainer.train's configs/seeds."""
 
+    if family_pool is not None:
+        for sub in family_pool.subfamilies:
+            for config, seed in zip(sub.configs, sub.random_states):
+                yield config, seed, family_pool.build_estimator(dict(config), seed, {})
+        return
     if not isinstance(trainer, GridCandidateTrainer):
         raise TypeError(f"family {name} is not grid-trained; this diagnostic only handles grid families")
-    per = max(1, n_models_pool // len(trainer.configs))
+    per = max(1, n_models_pool // len(trainer.configs)) if trainer.refit_seeds else 1
     for config in trainer.configs:
         for i in range(per):
             seed = b * trainer.random_state_multiplier + i
@@ -202,7 +216,8 @@ def _config_columns(config):
     return {"cfg_0": config}
 
 
-def _collect_bootstrap(b, X_scaled, y, families, n_models_pool, rf_probe, classes, out_dir):
+def _collect_bootstrap(b, X_scaled, y, all_families, search_spaces, families, n_models_pool,
+                       n_candidates_per_family, rf_probe, classes, out_dir):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         start = time.perf_counter()
@@ -215,7 +230,11 @@ def _collect_bootstrap(b, X_scaled, y, families, n_models_pool, rf_probe, classe
             raise RuntimeError(f"bootstrap {b}: _oob_rows no longer matches rid.core._bootstrap_split")
         folds = list(KFold(n_splits=2, shuffle=True, random_state=b).split(X_oob))
 
-        sources = [(name, "standard", _family_candidates(name, trainer, kwargs, n_models_pool, b))
+        # Built over every family so each keeps its family position (and hence its
+        # pool draws and seeds) when --families selects a subset.
+        pool = build_candidate_pool(all_families, search_spaces, b, n_candidates_per_family)
+        sources = [(name, "standard",
+                    _family_candidates(name, trainer, kwargs, pool.get(name), n_models_pool, b))
                    for name, (trainer, kwargs) in families.items()]
         if rf_probe:
             sources.append((PROBE_FAMILY, "probe", _probe_candidates(b)))
@@ -298,12 +317,14 @@ def run_collect(args):
     unknown = set(args.families or []) - set(all_families)
     if unknown:
         raise SystemExit(f"unknown --families {sorted(unknown)}; choose from {list(all_families)}")
-    families = {}
+    resolved_families = {}
+    search_spaces = {}
     for name, model_config in all_families.items():
-        if args.families and name not in args.families:
-            continue
-        _, trainer, kwargs = resolve_model_config(model_config)
-        families[name] = (trainer, kwargs)
+        model_class, trainer, kwargs = resolve_model_config(model_config)
+        resolved_families[name] = (trainer, kwargs)
+        search_spaces[name] = resolve_default_search_space(model_class)
+    families = {name: value for name, value in resolved_families.items()
+                if not args.families or name in args.families}
 
     output_dir = Path(args.output_dir)
     per_bootstrap_dir = output_dir / "per_bootstrap"
@@ -314,6 +335,7 @@ def run_collect(args):
         "holdout_fraction": args.holdout_fraction,
         "holdout_seed": args.holdout_seed,
         "n_models_pool": args.n_models_pool,
+        "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
         "rf_probe": args.rf_probe,
         "families": list(families),
         "evaluation_protocol": holdout_meta["protocol"],
@@ -339,7 +361,8 @@ def run_collect(args):
     start = time.perf_counter()
     done = 0
     results = Parallel(n_jobs=args.n_jobs, return_as="generator_unordered")(
-        delayed(_collect_bootstrap)(b, X_scaled, y_values, families, args.n_models_pool,
+        delayed(_collect_bootstrap)(b, X_scaled, y_values, resolved_families, search_spaces, families,
+                                    args.n_models_pool, DEFAULT_N_CANDIDATES_PER_FAMILY,
                                     args.rf_probe, classes, per_bootstrap_dir)
         for b in todo
     )
@@ -577,8 +600,21 @@ def _label_sort_key(label):
 def plot_rf_heatmaps(df, epsilon, plt, path):
     panels = []
     rf = df[df["family"] == "RandomForest"]
-    if not rf.empty:
-        # Standard grid configs are (n_estimators, max_depth, max_features) tuples.
+    if not rf.empty and "cfg_n_estimators" in rf:
+        # Shared-pool configs are continuous draws, so bin them for the heatmap.
+        rf = rf.assign(
+            n_estimators=pd.cut(rf["cfg_n_estimators"], [0, 100, 200, np.inf],
+                                labels=["<100", "100-199", ">=200"]).astype(str),
+            max_depth=pd.cut(rf["cfg_max_depth"], [0, 3, 5, 8, 12, np.inf],
+                             labels=["2-3", "4-5", "6-8", "9-12", "13-20"]).astype(str),
+            max_features=rf["cfg_max_features"].map(_rf_label),
+        )
+        for n_est in ["<100", "100-199", ">=200"]:
+            if (rf["n_estimators"] == n_est).any():
+                panels.append((f"standard RF, n_estimators {n_est}", rf[rf["n_estimators"] == n_est],
+                               "max_depth", "max_features"))
+    elif not rf.empty:
+        # Pre-2026-11-12 runs: hand-grid (n_estimators, max_depth, max_features) tuples.
         rf = rf.assign(n_estimators=rf["cfg_0"].map(_rf_label), max_depth=rf["cfg_1"].map(_rf_label),
                        max_features=rf["cfg_2"].map(_rf_label))
         for n_est in sorted(rf["n_estimators"].unique(), key=int):
