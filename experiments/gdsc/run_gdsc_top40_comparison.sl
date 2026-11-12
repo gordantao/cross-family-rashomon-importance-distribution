@@ -4,7 +4,7 @@
 #SBATCH --error=gdsc-top40-comparison_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --array=0-19
 #SBATCH --mail-type=END,FAIL
@@ -31,8 +31,8 @@
 #   bash experiments/gdsc/download_gdsc_data.sh
 #   /nas/longleaf/home/gtao/.conda/envs/zikry_lab-gdsc/bin/python experiments/gdsc/prepare_gdsc_data.py
 #
-# Memory: 96G, matching experiments/staellert/run_staellert_top40_comparison.sl
-# (raised for the since-removed grid cross-family method; kept as headroom).
+# Memory: 32G, matching experiments/staellert/run_staellert_top40_comparison.sl
+# (96G was only needed by the since-removed grid cross-family method).
 #
 # Timed-out or failed pairs: resubmit -- checkpointed pairs are skipped. To
 # rerun specific pairs only, e.g. every cross_family_unweighted_truvarimp

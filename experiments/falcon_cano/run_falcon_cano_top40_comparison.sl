@@ -4,7 +4,7 @@
 #SBATCH --error=falcon-cano-top40-comparison_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
@@ -83,8 +83,8 @@ $PYTHON_ENV --version
 # top40_feature_comparison/ additionally predates out-of-bag Rashomon
 # membership (f134dd8) and the evaluator/stepwise-logreg scaling fix (bdee476)
 # and used --rid-n-models-pool 50 (a since-removed flag).
-# Memory: 96G, raised for the since-removed grid cross-family methods (the
-# Staellert grid run OOM'd at 32G); kept as headroom.
+# Memory: 32G. 96G was only needed by the since-removed grid cross-family
+# methods (the Staellert grid run OOM'd at 32G); TruVaRImp peaked at 19.5G there.
 # (--inject-redundant-duplicate is available as an opt-in diagnostic but is
 # NOT used here -- it changes the feature space for every method, which
 # would make this run's results incomparable to the standard benchmark. Run

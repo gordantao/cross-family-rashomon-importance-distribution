@@ -4,7 +4,7 @@
 #SBATCH --error=top40-feature-comparison_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --array=0-3
 #SBATCH --mail-type=END,FAIL
@@ -21,10 +21,9 @@
 # the combined outputs (top_feature_overlap.csv, run_settings.json,
 # overall_task_summary.csv).
 #
-# Memory: 96G. It was raised from 32G for the since-removed grid cross-family
-# task (it held each bootstrap's full candidate pool in all 50 workers and was
-# OOM-killed at 32G, job 7128947_3); TruVaRImp peaked at 19.5G, so 32G would
-# likely do now, but 96G is kept as headroom.
+# Memory: 32G. The since-removed grid cross-family task needed 96G (it held
+# each bootstrap's full candidate pool in all 50 workers and was OOM-killed at
+# 32G, job 7128947_3); TruVaRImp peaked at 19.5G, so 32G is enough now.
 #
 # Timed-out or failed tasks: resubmit -- checkpointed methods are skipped. To
 # rerun specific methods only:
