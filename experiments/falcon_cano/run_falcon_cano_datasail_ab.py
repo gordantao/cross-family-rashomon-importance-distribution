@@ -12,8 +12,15 @@ in the same partition, using ECFP/Tanimoto similarity.
 
 This is a RE-EVALUATION study, not a re-selection study: it reuses each
 method's ALREADY-SELECTED top-40 feature list from
-results/top40_feature_comparison/ rather than re-running the expensive RID
-bootstrapping or stepwise search -- only the held-out scoring changes.
+results/top40_feature_comparison_holdout/ rather than re-running the expensive
+RID bootstrapping or stepwise search -- only the held-out scoring changes.
+
+Caveat: those lists were selected on the comparison's outer-holdout TRAIN rows
+(80%), but both arms here score on ALL rows, so most of every evaluation fold
+was seen during selection. Absolute scores are therefore optimistic; the A/B
+contrast (how much cluster-aware splitting changes the method comparison) is
+still like-for-like, since both arms share the same bias. A cluster-aware outer
+holdout inside the comparison script itself would remove the bias.
 
 Arm A ("leaky"): the existing StratifiedKFold evaluator (_evaluate_feature_set
 from run_falcon_cano_top40_comparison.py), unchanged.
@@ -76,8 +83,7 @@ def load_method_feature_lists(top40_results_dir: Path) -> dict[str, list[str]]:
         "stepwise_logreg": "stepwise_logreg_top_features.csv",
         "stepwise_rf": "stepwise_rf_top_features.csv",
         "rid_tree": "rid_tree_top_features.csv",
-        "cross_family_unweighted": "rid_cross_family_unweighted_top_features.csv",
-        "cross_family_weighted": "rid_cross_family_weighted_top_features.csv",
+        "cross_family_unweighted_truvarimp": "rid_cross_family_unweighted_truvarimp_top_features.csv",
     }
     method_feature_lists = {}
     for method_name, filename in file_map.items():
@@ -201,7 +207,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top40-results-dir",
         type=str,
-        default=str(Path(__file__).resolve().parent / "results" / "top40_feature_comparison"),
+        default=str(Path(__file__).resolve().parent / "results" / "top40_feature_comparison_holdout"),
         help="Directory containing the already-computed *_top_features.csv files to re-evaluate.",
     )
     parser.add_argument(

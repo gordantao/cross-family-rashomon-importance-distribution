@@ -64,9 +64,9 @@ echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
 # --- Run the top-k comparison analysis with mRMR-reordered RID selection ---
-# Same five methods and elbow-based auto-k as
+# Same four methods and elbow-based auto-k as
 # run_falcon_cano_top40_comparison_auto_k.sl, but RID-based methods
-# (rid_tree, cross_family_unweighted, cross_family_weighted) have their
+# (rid_tree, cross_family_unweighted_truvarimp) have their
 # ranking greedily reordered by mRMR (mrmr_selection.py) before k-selection:
 # trades off each feature's RID importance against its redundancy with
 # already-picked features, instead of RID's plain marginal-importance sort.
@@ -87,7 +87,7 @@ $PYTHON_ENV experiments/falcon_cano/run_falcon_cano_top40_comparison.py \
     --mrmr-lambda 1.0 \
     --rid-metric sub_mr \
     --rid-n-bootstraps 500 \
-    --rid-n-models-pool 100 \
+    --truvarimp-total-budget 300 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
 

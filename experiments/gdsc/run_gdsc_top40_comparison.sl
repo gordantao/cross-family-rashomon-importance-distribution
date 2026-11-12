@@ -4,15 +4,15 @@
 #SBATCH --error=gdsc-top40-comparison_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
-#SBATCH --array=0-24
+#SBATCH --array=0-19
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
 # -------------------------------------------------------
-# Job array: one (task, method) pair per array index -- 5 GDSC drug tasks x 5
-# methods = 25 indices, index = task_idx * 5 + method_idx. Each pair
+# Job array: one (task, method) pair per array index -- 5 GDSC drug tasks x 4
+# methods = 20 indices, index = task_idx * 4 + method_idx. Each pair
 # checkpoints <task>/<method>_result.json; whichever pair finishes a task last
 # builds that task's combined outputs (top_feature_overlap.csv,
 # biomarker_recovery.csv, run_settings.json), and overall_task_summary.csv is
@@ -31,12 +31,13 @@
 #   bash experiments/gdsc/download_gdsc_data.sh
 #   /nas/longleaf/home/gtao/.conda/envs/zikry_lab-gdsc/bin/python experiments/gdsc/prepare_gdsc_data.py
 #
-# Memory: 96G, matching the Staellert grid cross-family task that OOM'd at 32G
-# (each of 50 workers holds a bootstrap's full ~520-model candidate pool).
+# Memory: 32G, matching experiments/staellert/run_staellert_top40_comparison.sl
+# (96G was only needed by the since-removed grid cross-family method).
 #
 # Timed-out or failed pairs: resubmit -- checkpointed pairs are skipped. To
-# rerun specific pairs only, e.g. every cross_family_unweighted (method 3):
-#   sbatch --array=3,8,13,18,23 experiments/gdsc/run_gdsc_top40_comparison.sl
+# rerun specific pairs only, e.g. every cross_family_unweighted_truvarimp
+# (method 3):
+#   sbatch --array=3,7,11,15,19 experiments/gdsc/run_gdsc_top40_comparison.sl
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -68,7 +69,7 @@ $PYTHON_ENV --version
 
 TASKS=(dabrafenib trametinib nutlin3a lapatinib talazoparib)
 METHODS=(
-	stepwise_rf stepwise_logreg rid_tree cross_family_unweighted cross_family_unweighted_truvarimp
+	stepwise_rf stepwise_logreg rid_tree cross_family_unweighted_truvarimp
 )
 TASK="${TASKS[$((SLURM_ARRAY_TASK_ID / ${#METHODS[@]}))]}"
 METHOD="${METHODS[$((SLURM_ARRAY_TASK_ID % ${#METHODS[@]}))]}"
@@ -84,7 +85,6 @@ $PYTHON_ENV experiments/gdsc/run_gdsc_top40_comparison.py \
     --methods "$METHOD" \
     --top-k 40 \
     --rid-n-bootstraps 100 \
-    --rid-n-models-pool 100 \
     --truvarimp-total-budget 300 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"

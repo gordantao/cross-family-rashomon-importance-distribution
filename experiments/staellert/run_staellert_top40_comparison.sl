@@ -4,9 +4,9 @@
 #SBATCH --error=top40-feature-comparison_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
-#SBATCH --array=0-4
+#SBATCH --array=0-3
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=gtao@unc.edu
 
@@ -17,18 +17,17 @@
 #
 # Job array: one task per method (index into METHODS below), each with its own
 # 50 cpus / 48h. Every method checkpoints <task>/<method>_result.json when it
-# finishes; whichever task finishes last finds all five checkpoints and builds
+# finishes; whichever task finishes last finds all four checkpoints and builds
 # the combined outputs (top_feature_overlap.csv, run_settings.json,
 # overall_task_summary.csv).
 #
-# Memory: 96G, not 32G. The grid cross-family task holds each bootstrap's full
-# candidate pool (~520 fitted models, ~0.5GB -- mostly unbounded-depth random
-# forests) in every one of its 50 workers at once; at 32G it was OOM-killed
-# (MaxRSS 33.5G, job 7128947_3). TruVaRImp peaked at 19.5G.
+# Memory: 32G. The since-removed grid cross-family task needed 96G (it held
+# each bootstrap's full candidate pool in all 50 workers and was OOM-killed at
+# 32G, job 7128947_3); TruVaRImp peaked at 19.5G, so 32G is enough now.
 #
 # Timed-out or failed tasks: resubmit -- checkpointed methods are skipped. To
 # rerun specific methods only:
-#   sbatch --array=3,4 experiments/staellert/run_staellert_top40_comparison.sl
+#   sbatch --array=2,3 experiments/staellert/run_staellert_top40_comparison.sl
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -83,19 +82,19 @@ $PYTHON_ENV --version
 # Methods: (0) forward stepwise selection via random forest,
 #          (1) forward stepwise selection via logistic regression,
 #          (2) single-family RID on a fully enumerated decision-tree Rashomon set,
-#          (3) cross-family RID (unweighted), exhaustive grid candidate search,
-#          (4) cross-family RID (unweighted), joint TruVaRImp candidate search.
+#          (3) cross-family RID (unweighted), joint TruVaRImp candidate search.
+# The exhaustive grid cross-family method was dropped as too expensive here
+# (it fit the whole ~500-config-per-family shared pool every bootstrap).
 # Results go to a fresh dir: every method now selects on the train rows of an
 # outer stratified holdout (--holdout-fraction 0.2, --holdout-seed 42) and the
 # evaluator panel scores on the held-out test rows. Earlier dirs
 # (top40_feature_comparison_oob/, and the in-sample top40_feature_comparison/)
 # scored stepwise methods on the same CV folds they selected on, and every
 # method on rows it selected on, so they are not comparable.
-# 100 bootstraps, not 500: Staellert candidate fits average ~1 min, so a grid
-# bootstrap is ~500 fit-minutes and 500 bootstraps on 50 cpus would need ~85h
-# (TruVaRImp ~50h). At 100: grid ~17h, TruVaRImp ~10h.
+# 100 bootstraps, not 500: Staellert candidate fits average ~1 min, so 500
+# TruVaRImp bootstraps on 50 cpus would need ~50h; at 100, ~10h.
 METHODS=(
-	stepwise_rf stepwise_logreg rid_tree cross_family_unweighted cross_family_unweighted_truvarimp
+	stepwise_rf stepwise_logreg rid_tree cross_family_unweighted_truvarimp
 )
 METHOD="${METHODS[$SLURM_ARRAY_TASK_ID]}"
 echo "Method:        $METHOD"
@@ -109,7 +108,6 @@ $PYTHON_ENV experiments/staellert/run_staellert_top40_comparison.py \
     --methods "$METHOD" \
     --top-k 40 \
     --rid-n-bootstraps 100 \
-    --rid-n-models-pool 100 \
     --truvarimp-total-budget 300 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
     --rid-n-jobs "$SLURM_CPUS_PER_TASK"
