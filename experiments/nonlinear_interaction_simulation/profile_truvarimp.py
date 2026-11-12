@@ -3,8 +3,8 @@
 Profile cross-family RID's TruVaRImp candidate search on one simulated cell.
 
 Two probes, both on the exact production path the simulation uses
-(``run_cross_family_rid_truvarimp`` / ``run_cross_family_rid``, same
-``RID_MODEL_CONFIGS``, same DGP seeds):
+(``run_nonlinear_interaction_simulation.run_cross_family_rid``, same
+``RID_MODEL_CONFIGS``, shared candidate pool and DGP seeds):
 
 1. ``single`` -- a few bootstraps in-process (n_jobs=1) under cProfile, with
    BLAS/OpenMP threads capped at --blas-threads. Reports where one
@@ -45,7 +45,6 @@ from threadpoolctl import threadpool_info, threadpool_limits
 from rid import add_logging_arguments, configure_logging, silence_warnings
 
 import run_nonlinear_interaction_simulation as base
-import run_nonlinear_interaction_simulation_truvarimp as tv
 
 logger = logging.getLogger(__name__)
 
@@ -99,24 +98,15 @@ def build_cell(dgp, beta, rep, sample_size, noise_std, base_seed, beta_grid):
 
 
 def run_cross_family(args, X, y, n_bootstraps, n_jobs):
-    if args.candidate_search == "truvarimp_joint":
-        return tv.run_cross_family_rid_truvarimp(
-            X,
-            y,
-            n_bootstraps=n_bootstraps,
-            total_budget=args.truvarimp_total_budget,
-            epsilon=args.epsilon,
-            family_balance_mode="unweighted",
-            n_jobs=n_jobs,
-            rid_metric=args.rid_metric,
-        )
     return base.run_cross_family_rid(
         X,
         y,
         n_bootstraps=n_bootstraps,
-        n_models_per_class=args.models_per_class,
         epsilon=args.epsilon,
         family_balance_mode="unweighted",
+        candidate_search=args.candidate_search,
+        n_candidates_per_family=args.n_candidates_per_family,
+        truvarimp_total_budget=args.truvarimp_total_budget,
         n_jobs=n_jobs,
         rid_metric=args.rid_metric,
     )
@@ -229,9 +219,9 @@ def parse_args():
     parser.add_argument("--base-seed", type=int, default=base.DEFAULT_BASE_SEED)
     parser.add_argument("--epsilon", type=float, default=base.DEFAULT_EPSILON)
     parser.add_argument("--rid-metric", type=str, default="sub_mr")
-    parser.add_argument("--truvarimp-total-budget", type=int, default=tv.DEFAULT_TRUVARIMP_TOTAL_BUDGET)
+    parser.add_argument("--truvarimp-total-budget", type=int, default=base.DEFAULT_TRUVARIMP_TOTAL_BUDGET)
     parser.add_argument(
-        "--models-per-class", type=int, default=100, help="n_models_per_class (default: 100, as in the .sl); unused by the pooled built-in families"
+        "--n-candidates-per-family", type=int, default=base.DEFAULT_N_CANDIDATES_PER_FAMILY
     )
     parser.add_argument(
         "--bootstraps", type=int, default=2, help="Bootstraps for the single-process probe (default: 2)"

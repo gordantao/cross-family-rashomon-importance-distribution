@@ -832,6 +832,31 @@ def _run_single_bootstrap(
     return (boot_importances, boot_perf), stats
 
 
+def _search_diagnostics(family_names, family_indices, family_losses, global_min_loss, epsilon, search_seconds):
+    """One bootstrap's candidate-search record for ``search_diagnostics_``.
+
+    ``evaluated`` maps each family to ``(candidate_indices, oob_losses)`` of every
+    candidate fit (indices are the shared pool's ``candidate_index``, so the same
+    key means the same model in either search mode); ``rashomon`` maps each family
+    to the indices that passed ``loss <= min_loss + epsilon``.
+    """
+
+    evaluated = {}
+    rashomon = {}
+    for name in family_names:
+        indices = np.asarray(family_indices[name], dtype=int)
+        losses = np.asarray(family_losses[name], dtype=float)
+        evaluated[name] = (indices, losses)
+        rashomon[name] = indices[losses <= global_min_loss + epsilon]
+    return {
+        "evaluated": evaluated,
+        "rashomon": rashomon,
+        "min_loss": float(global_min_loss),
+        "n_fits": int(sum(len(losses) for _, losses in evaluated.values())),
+        "search_seconds": float(search_seconds),
+    }
+
+
 def _run_single_bootstrap_cross_family(
     b,
     X_scaled,
@@ -847,17 +872,22 @@ def _run_single_bootstrap_cross_family(
     search_spaces=None,
     truvarimp_config=None,
     n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
+    record_diagnostics=False,
 ):
     rng = np.random.default_rng(seed=b)
     split = _bootstrap_split(X_scaled, y, b)
     if split is None:
-        return (None, None, None, None), {
+        stats = {
             "n_fits": {name: 0 for name in model_configs},
             "rashomon_size": {name: 0 for name in model_configs},
             "truvarimp": None,
             "valid": False,
         }
+        if record_diagnostics:
+            stats["diagnostics"] = None
+        return (None, None, None, None), stats
     X_boot, y_boot, X_oob, y_oob = split
+    search_start = time.perf_counter()
 
     # Both search modes draw from this one pool, so for a given b they see the
     # identical candidates (and fit any one of them with the same random_state).
@@ -879,6 +909,7 @@ def _run_single_bootstrap_cross_family(
             return_stats=True,
             candidate_pool=candidate_pool,
         )
+        family_indices = search_stats.pop("evaluated_candidate_indices")
     else:
         family_models = {}
         family_losses = {}
@@ -893,6 +924,10 @@ def _run_single_bootstrap_cross_family(
                 )
             family_models[name] = models
             family_losses[name] = losses
+        # fit_candidate_pool fits in candidate_index order; a family outside the
+        # pool is keyed by its own fit order.
+        family_indices = {name: list(range(len(family_losses[name]))) for name in model_configs}
+    search_seconds = time.perf_counter() - search_start
 
     stats = {
         "n_fits": {name: len(family_losses[name]) for name in model_configs},
@@ -908,6 +943,11 @@ def _run_single_bootstrap_cross_family(
     if all_losses.size == 0:
         return empty_result, stats
     global_min_loss = np.min(all_losses)
+
+    if record_diagnostics:
+        stats["diagnostics"] = _search_diagnostics(
+            model_configs, family_indices, family_losses, global_min_loss, epsilon, search_seconds
+        )
 
     family_rashomon = {name: [] for name in model_configs}
     for name in model_configs:
@@ -1143,8 +1183,21 @@ def compute_rid_cross_family(
     truvarimp_config=None,
     suppress_warnings=True,
     n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
+    return_search_diagnostics=False,
 ):
     """Compute cross-family RID and return metric results, family counts, and family performance.
+
+    ``return_search_diagnostics`` (default False) appends a fifth return value:
+    one record per bootstrap (index ``b``), ``None`` for a bootstrap whose split
+    was invalid or that fit nothing, otherwise a dict with ``evaluated``
+    (``{family: (candidate_indices, oob_losses)}`` for every candidate fit),
+    ``rashomon`` (``{family: candidate_indices}`` of the members), ``min_loss``,
+    ``n_fits``, ``search_seconds`` (candidate fitting/search only) and
+    ``seconds`` (the whole bootstrap, VI included). Pool candidates are keyed
+    by their ``candidate_index``, so for the same data and ``b`` both search
+    modes key the same model identically; this is what lets a ``"grid"`` run
+    serve as the exact Rashomon-set ground truth for a ``"truvarimp_joint"``
+    run. Recording it changes no other output.
 
     ``suppress_warnings`` (default True) ignores every Python warning raised
     while fitting and scoring candidates inside each bootstrap worker.
@@ -1262,6 +1315,7 @@ def compute_rid_cross_family(
             search_spaces,
             truvarimp_config,
             n_candidates_per_family,
+            return_search_diagnostics,
         )
         for b in range(n_bootstraps)
     )
@@ -1269,6 +1323,15 @@ def compute_rid_cross_family(
         tasks, n_jobs, n_bootstraps, progress_label
     )
     _log_bootstrap_summary(progress_label, bootstrap_stats)
+
+    search_diagnostics = None
+    if return_search_diagnostics:
+        search_diagnostics = []
+        for stats in bootstrap_stats:
+            record = stats.get("diagnostics")
+            if record is not None:
+                record = {**record, "seconds": stats["seconds"]}
+            search_diagnostics.append(record)
 
     per_bootstrap_importances = []
     per_bootstrap_family_perf = []
@@ -1287,6 +1350,8 @@ def compute_rid_cross_family(
     n_valid = len(per_bootstrap_importances)
     if n_valid == 0:
         logger.warning("No bootstraps produced a non-empty Rashomon set.")
+        if return_search_diagnostics:
+            return None, family_counts, None, 0, search_diagnostics
         return None, family_counts, None, 0
 
     active_metrics = _active_metrics(per_bootstrap_importances, feature_names, vi_metric_names)
@@ -1313,6 +1378,8 @@ def compute_rid_cross_family(
     for name, perf_stats in family_perf_stats.items():
         logger.info(f"  {name}: {_format_perf_stats(perf_stats, performance_metric_specs)}")
 
+    if return_search_diagnostics:
+        return metric_results, family_counts, family_perf_stats, n_valid, search_diagnostics
     return metric_results, family_counts, family_perf_stats, n_valid
 
 
@@ -1517,6 +1584,11 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         Ignore every Python warning (e.g. sklearn ``ConvergenceWarning``)
         raised while fitting and scoring candidates inside each bootstrap.
 
+    record_search_diagnostics : bool, default=False
+        Keep a per-bootstrap record of the candidate search in
+        ``search_diagnostics_`` (see ``compute_rid_cross_family``'s
+        ``return_search_diagnostics``). Changes no other output.
+
     Attributes
     ----------
     metric_results_ : dict or None
@@ -1543,6 +1615,11 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         Canonical names of VI metrics available in ``metric_results_`` after
         fit-time filtering.
 
+    search_diagnostics_ : list or None
+        One record per bootstrap when ``record_search_diagnostics=True``
+        (evaluated pool candidates with their OOB losses, Rashomon members,
+        min loss, fit count, wall-clock), else ``None``.
+
     Notes
     -----
     Metric callables are invoked by signature introspection. Any subset of the
@@ -1565,6 +1642,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         truvarimp_config=None,
         suppress_warnings=True,
         n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
+        record_search_diagnostics=False,
     ):
         self.model_configs = model_configs
         self.epsilon = epsilon
@@ -1579,14 +1657,10 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         self.truvarimp_config = truvarimp_config
         self.suppress_warnings = suppress_warnings
         self.n_candidates_per_family = n_candidates_per_family
+        self.record_search_diagnostics = record_search_diagnostics
 
     def fit(self, X, y):
-        (
-            self.metric_results_,
-            self.family_counts_,
-            self.family_perf_stats_,
-            self.n_valid_bootstraps_,
-        ) = compute_rid_cross_family(
+        results = compute_rid_cross_family(
             X,
             y,
             model_configs=self.model_configs,
@@ -1602,7 +1676,15 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             truvarimp_config=self.truvarimp_config,
             suppress_warnings=self.suppress_warnings,
             n_candidates_per_family=self.n_candidates_per_family,
+            return_search_diagnostics=self.record_search_diagnostics,
         )
+        (
+            self.metric_results_,
+            self.family_counts_,
+            self.family_perf_stats_,
+            self.n_valid_bootstraps_,
+        ) = results[:4]
+        self.search_diagnostics_ = results[4] if self.record_search_diagnostics else None
         _, _, self.feature_names_ = _prepare_inputs(X, y)
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()
         return self

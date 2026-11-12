@@ -429,7 +429,9 @@ def run_joint_truvarimp(
         and why the active loop ended (``stop_reason``: ``"budget"``,
         ``"exhausted"``, ``"no_threshold"`` or ``"no_candidate"``), plus
         ``pinned``: the search-space dimensions each family fixes through its
-        model kwargs (``{family_name: [dimension, ...]}``).
+        model kwargs (``{family_name: [dimension, ...]}``), and
+        ``evaluated_candidate_indices``: each family's pool ``candidate_index``
+        per evaluated candidate, aligned with ``family_models``/``family_losses``.
     candidate_pool : dict, optional
         This bootstrap's shared pool from
         :func:`rid.candidate_pool.build_candidate_pool` (what
@@ -470,6 +472,7 @@ def run_joint_truvarimp(
         if family_pool is not None:
             if family_pool.pinned:
                 pinned_dims[family_name] = list(family_pool.pinned)
+            index_offset = 0
             for sub in family_pool.subfamilies:
                 state = _FamilySearchState(
                     name=sub.name,
@@ -480,6 +483,10 @@ def run_joint_truvarimp(
                     candidates=sub.configs,
                     random_states=sub.random_states,
                 )
+                # Pool candidate_index runs across the family's sub-families in
+                # order, so a sub-family's local index plus this offset recovers it.
+                state.index_offset = index_offset
+                index_offset += len(sub.configs)
                 states.append(state)
                 family_of_state[sub.name] = family_name
         else:
@@ -569,10 +576,13 @@ def run_joint_truvarimp(
     # --- collapse sub-family states back into the caller's family keys ---
     family_models = {name: [] for name in resolved_model_configs}
     family_losses = {name: [] for name in resolved_model_configs}
+    family_indices = {name: [] for name in resolved_model_configs}
     for state in states:
         parent = family_of_state[state.name] if state.name in family_of_state else state.name
         family_models[parent].extend(state.models)
         family_losses[parent].extend(state.losses)
+        offset = getattr(state, "index_offset", 0)
+        family_indices[parent].extend(offset + int(idx) for idx in state.evaluated_idx)
 
     family_losses = {name: np.array(values) for name, values in family_losses.items()}
     if not return_stats:
@@ -595,6 +605,9 @@ def run_joint_truvarimp(
         # Reported back rather than logged here: under n_jobs > 1 this runs in a
         # joblib worker with no logging handler, so a log call would be dropped.
         "pinned": pinned_dims,
+        # Pool candidate_index of every evaluated candidate, aligned with
+        # family_models/family_losses (for a fallback family: its own fit order).
+        "evaluated_candidate_indices": family_indices,
     }
     return family_models, family_losses, stats
 
