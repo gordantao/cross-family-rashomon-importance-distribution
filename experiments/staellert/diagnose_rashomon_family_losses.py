@@ -89,7 +89,7 @@ PROB_CLIP = np.finfo(np.float64).eps
 ECE_BINS = 15
 # Settings that change collected rows; a results dir written under others is refused.
 SETTING_KEYS = ("task", "correlation_threshold", "holdout_fraction", "holdout_seed", "n_models_pool",
-                "rf_probe", "families")
+                "rf_probe", "families", "evaluation_protocol", "holdout_test_rows_sha256")
 
 
 # --------------------------------------------------------------------------- collect
