@@ -1,19 +1,46 @@
 #!/usr/bin/env python3
 """
-Cross-family RID simulation study runner (cluster-friendly).
+Cross-family RID simulation study: grid-vs-TruVaRImp validation + ground-truth recovery.
 
-This script reproduces the cleaned nonlinear interaction notebook as a
-command-line workflow suitable for Slurm jobs, and benchmarks ground-truth
-feature recovery across four methods on each simulated dataset:
-1) Cross-family RID with family_balance_mode='unweighted'.
-2) Forward stepwise selection scored via logistic regression.
-3) Forward stepwise selection scored via random forest.
-4) Single-family RID on a fully enumerated decision-tree Rashomon set.
+Real-data experiments run cross-family RID with TruVaRImp candidate search only.
+This study is where that choice is validated: on synthetic DGPs with known
+relevant features, it runs cross-family RID with BOTH search modes over the
+identical shared candidate pool (rid.candidate_pool; same data, bootstrap
+indices, family names, per-candidate seeds), so the exhaustive grid's
+per-bootstrap Rashomon set is the exact ground truth for TruVaRImp's. Five
+methods per simulated dataset:
+1) cross_family_unweighted: cross-family RID, candidate_search='grid' (every
+   one of --n-candidates-per-family pool candidates per family is fit).
+2) cross_family_unweighted_truvarimp: cross-family RID,
+   candidate_search='truvarimp_joint' (--truvarimp-total-budget fits per
+   bootstrap, chosen adaptively from the same pool).
+3) stepwise_logreg: forward stepwise selection scored via logistic regression.
+4) stepwise_rf: forward stepwise selection scored via random forest.
+5) rid_tree: single-family RID on a fully enumerated decision-tree Rashomon set.
 
-Results are checkpointed to one CSV per DGP (``per_dgp/study_results_<dgp>.csv``)
-after every completed (dgp, beta, rep) cell, and a rerun into the same
---output-dir skips cells already on disk, so a run that hits the SLURM time
-limit can simply be resubmitted (optionally restricted via --dgps).
+Per (dgp, beta, rep) cell it records:
+- ground-truth recovery (precision@k/recall@k/NDCG@k/exact match, k = number of
+  relevant features) for all five methods -> ``study_results*.csv``;
+- search coverage of TruVaRImp against the grid -> ``search_coverage*.csv``:
+  Rashomon-membership recall |TV & G|/|G| and precision |TV & G|/|TV| per
+  bootstrap, the min-loss gap TV_min - G_min and whether TruVaRImp evaluated
+  the grid's best candidate, per-family recall and member counts, fits and
+  wall-clock per bootstrap in each mode, and agreement of the two modes' RID
+  outputs (Spearman of expected_importance, top-k overlap, max |delta
+  prob_positive|). Since a pool candidate fits to the identical model in both
+  modes, ``loss_mismatch_max`` (max |delta OOB loss| over candidates both modes
+  evaluated) must be 0. Even identical Rashomon sets don't give bit-identical
+  RID outputs: sub_mr's per-bootstrap permutation RNG is consumed in member
+  order, which is candidate-index order for the grid but evaluation order for
+  TruVaRImp, so the agreement metrics include that Monte Carlo noise.
+
+Results are checkpointed to one CSV per (DGP, beta) and kind
+(``per_dgp/study_results_<dgp>__beta<beta>.csv`` and
+``per_dgp/search_coverage_<dgp>__beta<beta>.csv``) after every completed
+(dgp, beta, rep) cell, and a rerun into the same --output-dir skips cells
+already on disk, so a run that hits the SLURM time limit can simply be
+resubmitted (optionally restricted via --dgps / --betas). One file per
+(DGP, beta) lets concurrent array tasks each own different betas of a DGP.
 
 Ground-truth recovery (precision@k/recall@k/NDCG@k/exact-match vs. the known
 relevant features) only measures ranking overlap with ground truth, never
@@ -41,6 +68,7 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
+from scipy.stats import spearmanr
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_score
@@ -69,7 +97,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SAMPLE_SIZE = 400
 DEFAULT_REPETITIONS = 12
 DEFAULT_BOOTSTRAPS = 12
-DEFAULT_MODELS_PER_CLASS = 6
+DEFAULT_TRUVARIMP_TOTAL_BUDGET = 300
 DEFAULT_BETA_GRID = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
 DEFAULT_NOISE_STD = 1.0
 DEFAULT_BASE_SEED = 20260514
@@ -79,8 +107,23 @@ DEFAULT_STEPWISE_CV_SPLITS = 5
 DEFAULT_STEPWISE_LOGREG_C = 1.0
 DEFAULT_STEPWISE_RF_N_ESTIMATORS = 100
 DEFAULT_RANDOM_STATE = 42
-METHODS = ("cross_family_unweighted", "stepwise_logreg", "stepwise_rf", "rid_tree")
+METHODS = (
+    "cross_family_unweighted",
+    "cross_family_unweighted_truvarimp",
+    "stepwise_logreg",
+    "stepwise_rf",
+    "rid_tree",
+)
+# The two cross-family methods differ ONLY in candidate_search: same
+# RID_MODEL_CONFIGS (hence family names, pools and seeds), data and bootstraps.
+CROSS_FAMILY_SEARCH_MODES = {
+    "cross_family_unweighted": "grid",
+    "cross_family_unweighted_truvarimp": "truvarimp_joint",
+}
+GRID_METHOD, TRUVARIMP_METHOD = CROSS_FAMILY_SEARCH_MODES
 PER_DGP_SUBDIR = "per_dgp"
+STUDY_RESULTS_PREFIX = "study_results_"
+SEARCH_COVERAGE_PREFIX = "search_coverage_"
 
 # No per-family search_grid overrides here: every family now inherits its
 # grid straight from rid.models.TRAINER_REGISTRY, standardizing this
@@ -706,27 +749,36 @@ def run_cross_family_rid(
     y,
     *,
     n_bootstraps,
-    n_models_per_class,
     epsilon,
     family_balance_mode,
+    candidate_search,
+    n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
+    truvarimp_total_budget=DEFAULT_TRUVARIMP_TOTAL_BUDGET,
     n_jobs=1,
     rid_metric="sub_mr",
 ):
+    """Fit cross-family RID with per-bootstrap search diagnostics; return the estimator.
+
+    Every RID_MODEL_CONFIGS family is in the shared candidate pool, so
+    ``n_models_per_class`` is never used and is left at its default.
+    """
+
     estimator = CrossFamilyRashomonImportanceDistribution(
         model_configs=RID_MODEL_CONFIGS,
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
-        n_models_per_class=n_models_per_class,
         vi_metrics=(rid_metric,),
         performance_metrics=RID_PERFORMANCE_METRICS,
         family_balance_mode=family_balance_mode,
         n_jobs=n_jobs,
+        candidate_search=candidate_search,
+        truvarimp_config={"total_budget": truvarimp_total_budget},
+        n_candidates_per_family=n_candidates_per_family,
+        record_search_diagnostics=True,
     )
 
     estimator.fit(X, y)
-
-    ranked_features = [feature for feature, _ in estimator.rank_features(rid_metric)]
-    return ranked_features
+    return estimator
 
 
 def _score_candidate_feature(feature, selected_features, X, y, model_cls, model_kwargs, cv, scoring):
@@ -764,14 +816,14 @@ def run_single_family_tree_rid(
     *,
     epsilon,
     n_bootstraps,
-    n_models_pool,
     n_jobs=1,
     rid_metric="sub_mr",
 ):
+    # n_models_pool is left at its default: the tree grid has refit_seeds=False,
+    # so each config is fit exactly once whatever it is set to.
     estimator = RashomonImportanceDistribution(
         epsilon=epsilon,
         n_bootstraps=n_bootstraps,
-        n_models_pool=n_models_pool,
         model_class=FullyEnumeratedTreeClassifier,
         vi_metrics=(rid_metric,),
         performance_metrics=RID_PERFORMANCE_METRICS,
@@ -896,9 +948,11 @@ def build_method_runners(
     y,
     cv,
     scoring,
+    fitted_estimators,
     *,
     n_bootstraps,
-    n_models_per_class,
+    n_candidates_per_family,
+    truvarimp_total_budget,
     epsilon,
     stepwise_logreg_C,
     stepwise_rf_n_estimators,
@@ -906,19 +960,34 @@ def build_method_runners(
     n_jobs=1,
     rid_metric="sub_mr",
 ):
-    """Zero-arg runner per method in ``METHODS`` order, each returning a full feature ranking."""
+    """Zero-arg runner per method in ``METHODS`` order, each returning a full feature ranking.
+
+    The cross-family runners also store their fitted estimator in
+    ``fitted_estimators[method]``, for ``compute_search_coverage``.
+    """
+
+    def cross_family_runner(method_name):
+        def run():
+            estimator = run_cross_family_rid(
+                X,
+                y,
+                n_bootstraps=n_bootstraps,
+                epsilon=epsilon,
+                family_balance_mode="unweighted",
+                candidate_search=CROSS_FAMILY_SEARCH_MODES[method_name],
+                n_candidates_per_family=n_candidates_per_family,
+                truvarimp_total_budget=truvarimp_total_budget,
+                n_jobs=n_jobs,
+                rid_metric=rid_metric,
+            )
+            fitted_estimators[method_name] = estimator
+            return [feature for feature, _ in estimator.rank_features(rid_metric)]
+
+        return run
 
     return {
-        "cross_family_unweighted": lambda: run_cross_family_rid(
-            X,
-            y,
-            n_bootstraps=n_bootstraps,
-            n_models_per_class=n_models_per_class,
-            epsilon=epsilon,
-            family_balance_mode="unweighted",
-            n_jobs=n_jobs,
-            rid_metric=rid_metric,
-        ),
+        GRID_METHOD: cross_family_runner(GRID_METHOD),
+        TRUVARIMP_METHOD: cross_family_runner(TRUVARIMP_METHOD),
         "stepwise_logreg": lambda: run_forward_stepwise_ranking(
             X,
             y,
@@ -940,15 +1009,150 @@ def build_method_runners(
             y,
             epsilon=epsilon,
             n_bootstraps=n_bootstraps,
-            n_models_pool=n_models_per_class,
             n_jobs=n_jobs,
             rid_metric=rid_metric,
         ),
     }
 
 
-def per_dgp_results_path(output_dir, dgp_name):
-    return os.path.join(output_dir, PER_DGP_SUBDIR, f"study_results_{dgp_name}.csv")
+def _search_keys(evaluated_or_members):
+    """``{family: indices}`` (or ``{family: (indices, losses)}``) -> set of (family, index) keys."""
+
+    keys = set()
+    for family, value in evaluated_or_members.items():
+        indices = value[0] if isinstance(value, tuple) else value
+        keys.update((family, int(index)) for index in indices)
+    return keys
+
+
+def _key_losses(evaluated):
+    return {
+        (family, int(index)): float(loss)
+        for family, (indices, losses) in evaluated.items()
+        for index, loss in zip(indices, losses)
+    }
+
+
+def _safe_ratio(numerator, denominator):
+    return numerator / denominator if denominator else np.nan
+
+
+def _nanmean(values):
+    values = [value for value in values if value is not None and not np.isnan(value)]
+    return float(np.mean(values)) if values else np.nan
+
+
+def compute_search_coverage(grid_estimator, truvarimp_estimator, rid_metric, top_k):
+    """TruVaRImp-vs-grid coverage for one cell, aggregated over bootstraps.
+
+    Both estimators searched the identical per-bootstrap pool, keyed by
+    (family, candidate_index), so the grid's Rashomon set G is the exact ground
+    truth for TruVaRImp's set TV. Only bootstraps with a record in both modes
+    count (both modes share the bootstrap split, so they're valid together).
+    """
+
+    families = list(grid_estimator.family_counts_)
+    per_boot = []
+    for grid_rec, tv_rec in zip(grid_estimator.search_diagnostics_, truvarimp_estimator.search_diagnostics_):
+        if grid_rec is None or tv_rec is None:
+            continue
+        grid_members = _search_keys(grid_rec["rashomon"])
+        tv_members = _search_keys(tv_rec["rashomon"])
+        grid_losses = _key_losses(grid_rec["evaluated"])
+        tv_losses = _key_losses(tv_rec["evaluated"])
+        shared = grid_losses.keys() & tv_losses.keys()
+        grid_best = {key for key, loss in grid_losses.items() if loss == grid_rec["min_loss"]}
+        overlap = grid_members & tv_members
+        row = {
+            "n_overlap": len(overlap),
+            "n_grid": len(grid_members),
+            "n_tv": len(tv_members),
+            "recall": _safe_ratio(len(overlap), len(grid_members)),
+            "precision": _safe_ratio(len(overlap), len(tv_members)),
+            "min_loss_gap": tv_rec["min_loss"] - grid_rec["min_loss"],
+            "found_grid_best": float(bool(grid_best & tv_losses.keys())),
+            "loss_mismatch": max((abs(grid_losses[k] - tv_losses[k]) for k in shared), default=0.0),
+            "grid_fits": grid_rec["n_fits"],
+            "tv_fits": tv_rec["n_fits"],
+            "grid_seconds": grid_rec["seconds"],
+            "tv_seconds": tv_rec["seconds"],
+            "grid_search_seconds": grid_rec["search_seconds"],
+            "tv_search_seconds": tv_rec["search_seconds"],
+        }
+        for family in families:
+            g_f = {key for key in grid_members if key[0] == family}
+            t_f = {key for key in tv_members if key[0] == family}
+            row[f"recall__{family}"] = _safe_ratio(len(g_f & t_f), len(g_f))
+            row[f"grid_members__{family}"] = len(g_f)
+            row[f"truvarimp_members__{family}"] = len(t_f)
+        per_boot.append(row)
+
+    coverage = {"n_bootstraps_compared": len(per_boot)}
+    if per_boot:
+        frame = pd.DataFrame(per_boot)
+        coverage.update(
+            {
+                "recall_mean": _nanmean(frame["recall"]),
+                "recall_min": float(frame["recall"].min()),
+                "recall_pooled": _safe_ratio(frame["n_overlap"].sum(), frame["n_grid"].sum()),
+                "precision_mean": _nanmean(frame["precision"]),
+                "precision_min": float(frame["precision"].min()),
+                "precision_pooled": _safe_ratio(frame["n_overlap"].sum(), frame["n_tv"].sum()),
+                "min_loss_gap_mean": float(frame["min_loss_gap"].mean()),
+                "min_loss_gap_max": float(frame["min_loss_gap"].max()),
+                "found_grid_best_rate": float(frame["found_grid_best"].mean()),
+                "loss_mismatch_max": float(frame["loss_mismatch"].max()),
+                "grid_rashomon_size_mean": float(frame["n_grid"].mean()),
+                "truvarimp_rashomon_size_mean": float(frame["n_tv"].mean()),
+                "grid_fits_mean": float(frame["grid_fits"].mean()),
+                "truvarimp_fits_mean": float(frame["tv_fits"].mean()),
+                "grid_seconds_mean": float(frame["grid_seconds"].mean()),
+                "truvarimp_seconds_mean": float(frame["tv_seconds"].mean()),
+                "grid_search_seconds_mean": float(frame["grid_search_seconds"].mean()),
+                "truvarimp_search_seconds_mean": float(frame["tv_search_seconds"].mean()),
+            }
+        )
+        coverage["fit_ratio"] = _safe_ratio(coverage["truvarimp_fits_mean"], coverage["grid_fits_mean"])
+        coverage["time_ratio"] = _safe_ratio(coverage["truvarimp_seconds_mean"], coverage["grid_seconds_mean"])
+        for family in families:
+            coverage[f"recall__{family}"] = _nanmean(frame[f"recall__{family}"])
+            coverage[f"grid_members__{family}"] = float(frame[f"grid_members__{family}"].mean())
+            coverage[f"truvarimp_members__{family}"] = float(frame[f"truvarimp_members__{family}"].mean())
+
+    # RID output agreement between the two modes.
+    if grid_estimator.metric_results_ and truvarimp_estimator.metric_results_:
+        grid_summary = grid_estimator.metric_summary(rid_metric)
+        tv_summary = truvarimp_estimator.metric_summary(rid_metric)
+        features = list(grid_summary)
+        grid_imp = np.array([grid_summary[f]["expected_importance"] for f in features])
+        tv_imp = np.array([tv_summary[f]["expected_importance"] for f in features])
+        grid_rank = [f for f, _ in grid_estimator.rank_features(rid_metric)]
+        tv_rank = [f for f, _ in truvarimp_estimator.rank_features(rid_metric)]
+        coverage.update(
+            {
+                "importance_spearman": float(spearmanr(grid_imp, tv_imp)[0]),
+                "top_k": top_k,
+                "top_k_overlap": len(set(grid_rank[:top_k]) & set(tv_rank[:top_k])) / top_k,
+                "max_abs_delta_prob_positive": float(
+                    max(abs(grid_summary[f]["prob_positive"] - tv_summary[f]["prob_positive"]) for f in features)
+                ),
+                "max_abs_delta_expected_importance": float(np.max(np.abs(grid_imp - tv_imp))),
+                "rankings_identical": int(grid_rank == tv_rank),
+            }
+        )
+    return coverage
+
+
+def _beta_tag(beta):
+    return f"beta{float(beta):g}"
+
+
+def per_dgp_results_path(output_dir, dgp_name, beta):
+    return os.path.join(output_dir, PER_DGP_SUBDIR, f"{STUDY_RESULTS_PREFIX}{dgp_name}__{_beta_tag(beta)}.csv")
+
+
+def per_dgp_coverage_path(output_dir, dgp_name, beta):
+    return os.path.join(output_dir, PER_DGP_SUBDIR, f"{SEARCH_COVERAGE_PREFIX}{dgp_name}__{_beta_tag(beta)}.csv")
 
 
 def write_csv_atomic(df, path):
@@ -961,8 +1165,8 @@ def write_csv_atomic(df, path):
 
 
 def load_completed_cells(results_path, methods):
-    """Rows of every (beta, rep) cell already checkpointed for one DGP with all
-    ``methods`` present, plus the set of those ``(beta, rep)`` keys."""
+    """Rows of every (beta, rep) cell already checkpointed in one (DGP, beta)
+    file with all ``methods`` present, plus the set of those ``(beta, rep)`` keys."""
 
     if not os.path.exists(results_path):
         return [], set()
@@ -975,12 +1179,24 @@ def load_completed_cells(results_path, methods):
     return existing[keep].to_dict("records"), done_cells
 
 
+def load_coverage_rows(coverage_path, done_cells):
+    """Coverage rows of cells whose study results are complete. Coverage is written
+    before study results, so a cell interrupted between the two is rerun and its
+    stale coverage row dropped here."""
+
+    if not os.path.exists(coverage_path):
+        return []
+    existing = pd.read_csv(coverage_path)
+    keep = [(float(b), int(r)) in done_cells for b, r in zip(existing["beta"], existing["rep"])]
+    return existing[keep].to_dict("records")
+
+
 def prepare_output_dir(output_dir, study_settings):
     """Create ``output_dir`` and write ``study_settings.json``, refusing to mix
     checkpointed per-DGP results produced under different settings.
 
-    ``num_workers`` and the selected DGP subset are excluded from the check,
-    since neither changes any cell's result.
+    ``num_workers`` and the selected DGP/beta subsets are excluded from the
+    check (they are not settings keys at all), since none changes any cell's result.
     """
 
     os.makedirs(os.path.join(output_dir, PER_DGP_SUBDIR), exist_ok=True)
@@ -1015,6 +1231,7 @@ def run_simulation_study(
     simulators,
     *,
     beta_grid,
+    betas=None,
     sample_size,
     n_repetitions,
     noise_std,
@@ -1023,34 +1240,47 @@ def run_simulation_study(
     random_state,
     make_method_runners,
     output_dir,
+    rid_metric,
 ):
-    """Run every (dgp, beta, rep) cell, checkpointing each DGP's rows to its own
-    CSV after every cell and skipping cells already checkpointed in ``output_dir``.
+    """Run every (dgp, beta, rep) cell, checkpointing each (DGP, beta)'s rows to
+    its own CSVs after every cell and skipping cells already checkpointed in
+    ``output_dir``.
 
-    ``make_method_runners(X, y, cv, scoring)`` returns the ``{method: runner}``
-    mapping for one cell (see ``build_method_runners``).
+    ``betas`` (default: all of ``beta_grid``) restricts the run to a subset of
+    ``beta_grid``; each cell's seed still comes from its beta's index in the full
+    ``beta_grid``, so a subset reproduces the full run's datasets.
+
+    ``make_method_runners(X, y, cv, scoring, fitted_estimators)`` returns the
+    ``{method: runner}`` mapping for one cell (see ``build_method_runners``).
     """
 
     start = time.time()
     evaluator_panel = build_common_evaluator_panel(random_state)
     stepwise_scoring = "roc_auc"
+    selected_betas = [beta for beta in beta_grid if betas is None or beta in betas]
 
     checkpoints = {
-        dgp_name: load_completed_cells(per_dgp_results_path(output_dir, dgp_name), METHODS)
+        (dgp_name, beta): load_completed_cells(per_dgp_results_path(output_dir, dgp_name, beta), METHODS)
         for dgp_name in simulators
+        for beta in selected_betas
     }
     n_skipped = sum(len(done_cells) for _, done_cells in checkpoints.values())
-    total_cells = len(simulators) * len(beta_grid) * n_repetitions - n_skipped
+    total_cells = len(simulators) * len(selected_betas) * n_repetitions - n_skipped
     if n_skipped:
         logger.info(f"Resuming: {n_skipped} cells already checkpointed, {total_cells} remaining")
     completed = 0
 
     for dgp_name, simulator in simulators.items():
         dgp_index = list(ALL_SIMULATORS).index(dgp_name)
-        results_path = per_dgp_results_path(output_dir, dgp_name)
-        rows, done_cells = checkpoints[dgp_name]
 
         for beta_index, beta in enumerate(beta_grid):
+            if beta not in selected_betas:
+                continue
+            results_path = per_dgp_results_path(output_dir, dgp_name, beta)
+            coverage_path = per_dgp_coverage_path(output_dir, dgp_name, beta)
+            rows, done_cells = checkpoints[(dgp_name, beta)]
+            coverage_rows = load_coverage_rows(coverage_path, done_cells)
+
             for rep in range(n_repetitions):
                 if (float(beta), rep) in done_cells:
                     continue
@@ -1073,7 +1303,8 @@ def run_simulation_study(
                 cv = StratifiedKFold(n_splits=stepwise_cv_splits, shuffle=True, random_state=random_state)
 
                 cell_label = f"[{dgp_name} beta={beta} rep={rep}]"
-                method_runners = make_method_runners(X, y, cv, stepwise_scoring)
+                fitted_estimators = {}
+                method_runners = make_method_runners(X, y, cv, stepwise_scoring, fitted_estimators)
                 method_rankings, method_seconds = run_methods_with_logging(method_runners, cell_label)
 
                 method_feature_lists = {
@@ -1110,23 +1341,60 @@ def run_simulation_study(
                         }
                     )
 
+                coverage = compute_search_coverage(
+                    fitted_estimators[GRID_METHOD],
+                    fitted_estimators[TRUVARIMP_METHOD],
+                    rid_metric,
+                    len(ground_truth),
+                )
+                coverage_rows.append(
+                    {
+                        "dgp": dgp_name,
+                        "beta": float(beta),
+                        "rep": rep,
+                        "snr_empirical": snr_empirical,
+                        "grid_method_seconds": method_seconds[GRID_METHOD],
+                        "truvarimp_method_seconds": method_seconds[TRUVARIMP_METHOD],
+                        **coverage,
+                    }
+                )
+                logger.info(
+                    f"{cell_label}: TruVaRImp vs grid: recall={coverage.get('recall_mean', np.nan):.3f} "
+                    f"precision={coverage.get('precision_mean', np.nan):.3f} "
+                    f"min_loss_gap={coverage.get('min_loss_gap_mean', np.nan):.4f} "
+                    f"spearman={coverage.get('importance_spearman', np.nan):.3f} "
+                    f"fits={coverage.get('truvarimp_fits_mean', np.nan):.0f}/{coverage.get('grid_fits_mean', np.nan):.0f}"
+                )
+                # Coverage first: study results decide which cells are done.
+                write_csv_atomic(
+                    pd.DataFrame(coverage_rows).sort_values(["beta", "rep"], kind="stable"), coverage_path
+                )
                 write_csv_atomic(pd.DataFrame(rows).sort_values(["beta", "rep"], kind="stable"), results_path)
 
                 completed += 1
                 log_cell_progress(completed, total_cells, cell_label, method_seconds, start)
 
-        logger.info(f"[{dgp_name}] complete -> {results_path}")
+            logger.info(f"[{dgp_name} beta={beta}] complete -> {results_path}")
+
+        logger.info(f"[{dgp_name}] complete")
         write_combined_outputs(output_dir)
 
 
 def write_combined_outputs(output_dir):
-    """Rebuild the combined study_results/metric/SNR outputs from every per-DGP
-    checkpoint in ``output_dir`` (including DGPs run by earlier or concurrent jobs)."""
+    """Rebuild the combined study_results/metric/SNR and search-coverage outputs from
+    every per-(DGP, beta) checkpoint in ``output_dir`` (including those written by
+    earlier or concurrent jobs)."""
 
     per_dgp_dir = os.path.join(output_dir, PER_DGP_SUBDIR)
-    per_dgp_paths = sorted(
-        os.path.join(per_dgp_dir, name) for name in os.listdir(per_dgp_dir) if name.endswith(".csv")
-    )
+
+    def checkpoint_paths(prefix):
+        return sorted(
+            os.path.join(per_dgp_dir, name)
+            for name in os.listdir(per_dgp_dir)
+            if name.startswith(prefix) and name.endswith(".csv")
+        )
+
+    per_dgp_paths = checkpoint_paths(STUDY_RESULTS_PREFIX)
     if not per_dgp_paths:
         logger.info("No per-DGP results yet; skipping combined outputs")
         return []
@@ -1148,8 +1416,149 @@ def write_combined_outputs(output_dir):
     write_csv_atomic(metric_table_by_dgp, dgp_path)
     write_csv_atomic(snr_plot_table.round(6), snr_table_path)
     save_snr_plot(snr_plot_table, snr_plot_path)
+    output_paths = [study_results_path, dgp_beta_path, dgp_path, snr_table_path, snr_plot_path]
 
-    return [study_results_path, dgp_beta_path, dgp_path, snr_table_path, snr_plot_path]
+    coverage_paths = checkpoint_paths(SEARCH_COVERAGE_PREFIX)
+    if coverage_paths:
+        coverage = pd.concat([pd.read_csv(path) for path in coverage_paths], ignore_index=True)
+        coverage = coverage.sort_values(["dgp", "beta", "rep"], kind="stable")
+        by_dgp_beta, by_dgp, by_family = build_coverage_tables(coverage)
+        coverage_outputs = {
+            "search_coverage.csv": coverage,
+            "search_coverage_by_dgp_beta.csv": by_dgp_beta,
+            "search_coverage_by_dgp.csv": by_dgp,
+            "search_coverage_by_family.csv": by_family,
+        }
+        for name, table in coverage_outputs.items():
+            path = os.path.join(output_dir, name)
+            write_csv_atomic(table, path)
+            output_paths.append(path)
+        output_paths.extend(save_coverage_plots(coverage, output_dir))
+
+    return output_paths
+
+
+# Per-cell search-coverage columns summarized in the aggregate tables/plots.
+COVERAGE_SUMMARY_COLUMNS = [
+    "recall_mean",
+    "recall_min",
+    "precision_mean",
+    "precision_min",
+    "min_loss_gap_mean",
+    "min_loss_gap_max",
+    "found_grid_best_rate",
+    "loss_mismatch_max",
+    "grid_rashomon_size_mean",
+    "truvarimp_rashomon_size_mean",
+    "grid_fits_mean",
+    "truvarimp_fits_mean",
+    "fit_ratio",
+    "grid_seconds_mean",
+    "truvarimp_seconds_mean",
+    "time_ratio",
+    "grid_method_seconds",
+    "truvarimp_method_seconds",
+    "importance_spearman",
+    "top_k_overlap",
+    "max_abs_delta_prob_positive",
+    "rankings_identical",
+]
+
+
+def build_coverage_tables(coverage):
+    """Mean/SEM of the coverage columns by (dgp, beta), means by dgp (plus an
+    ``ALL`` row), and per-family recall/member counts in long form by dgp."""
+
+    columns = [column for column in COVERAGE_SUMMARY_COLUMNS if column in coverage]
+    by_dgp_beta = coverage.groupby(["dgp", "beta"])[columns].agg(["mean", "sem"]).reset_index()
+    by_dgp_beta.columns = ["_".join(col).strip("_") for col in by_dgp_beta.columns.to_flat_index()]
+
+    by_dgp = coverage.groupby("dgp")[columns].mean().reset_index()
+    overall = coverage[columns].mean().to_frame().T
+    overall.insert(0, "dgp", "ALL")
+    by_dgp = pd.concat([by_dgp, overall], ignore_index=True)
+
+    families = sorted(column.split("__", 1)[1] for column in coverage if column.startswith("recall__"))
+    family_rows = []
+    for dgp_name, group in [*coverage.groupby("dgp"), ("ALL", coverage)]:
+        for family in families:
+            family_rows.append(
+                {
+                    "dgp": dgp_name,
+                    "family": family,
+                    "recall_mean": group[f"recall__{family}"].mean(),
+                    "grid_members_mean": group[f"grid_members__{family}"].mean(),
+                    "truvarimp_members_mean": group[f"truvarimp_members__{family}"].mean(),
+                }
+            )
+    by_family = pd.DataFrame(family_rows)
+
+    for table in (by_dgp_beta, by_dgp, by_family):
+        numeric_cols = table.select_dtypes(include=[np.number]).columns
+        table[numeric_cols] = table[numeric_cols].round(4)
+    return by_dgp_beta, by_dgp, by_family
+
+
+def _plot_metric_panels(coverage, panels, title, output_path):
+    """One panel per (column, label): mean +/- SEM across reps vs beta, one line per DGP."""
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 4.5), squeeze=False)
+    for ax, (column, label) in zip(axes[0], panels):
+        stats = coverage.groupby(["dgp", "beta"])[column].agg(["mean", "sem"]).reset_index()
+        for dgp_name, group in stats.groupby("dgp"):
+            group = group.sort_values("beta")
+            ax.plot(group["beta"], group["mean"], marker="o", linewidth=2, label=dgp_name)
+            ax.fill_between(
+                group["beta"],
+                group["mean"] - group["sem"].fillna(0.0),
+                group["mean"] + group["sem"].fillna(0.0),
+                alpha=0.15,
+            )
+        ax.set_xlabel("beta")
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.3)
+    axes[0][-1].legend(title="Simulation", bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.suptitle(title)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def save_coverage_plots(coverage, output_dir):
+    paths = {
+        "search_coverage_recall_precision.png": (
+            [
+                ("recall_mean", "Rashomon recall |TV & G| / |G|"),
+                ("precision_mean", "Rashomon precision |TV & G| / |TV|"),
+                ("found_grid_best_rate", "Share of bootstraps TruVaRImp fit the grid's best"),
+            ],
+            "TruVaRImp Rashomon-set coverage vs. exhaustive grid (same pool)",
+        ),
+        "search_rid_agreement.png": (
+            [
+                ("importance_spearman", "Spearman of expected_importance"),
+                ("top_k_overlap", "Top-k overlap (k = # relevant features)"),
+                ("max_abs_delta_prob_positive", "max |delta prob_positive|"),
+            ],
+            "RID output agreement: TruVaRImp vs. grid",
+        ),
+        "search_cost_ratio.png": (
+            [
+                ("fit_ratio", "Fits per bootstrap, TruVaRImp / grid"),
+                ("time_ratio", "Seconds per bootstrap, TruVaRImp / grid"),
+            ],
+            "TruVaRImp cost relative to exhaustive grid",
+        ),
+    }
+    written = []
+    for name, (panels, title) in paths.items():
+        panels = [(column, label) for column, label in panels if column in coverage]
+        if not panels:
+            continue
+        path = os.path.join(output_dir, name)
+        _plot_metric_panels(coverage, panels, title, path)
+        written.append(path)
+    return written
 
 
 HELD_OUT_SCORE_COLUMNS = [
@@ -1240,10 +1649,14 @@ def save_snr_plot(snr_plot_table, output_path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark ground-truth feature recovery across four methods (cross-family RID "
-            "unweighted, stepwise logistic regression, stepwise random forest, and "
-            "single-family tree RID) "
-            "on simulated nonlinear-interaction datasets, and save tables/plots."
+            "Validate TruVaRImp candidate search against the exhaustive grid on simulated "
+            "nonlinear-interaction datasets: cross-family RID runs in both modes over the "
+            "identical shared candidate pool, so the grid's per-bootstrap Rashomon set is the "
+            "exact ground truth for TruVaRImp's (membership recall/precision, min-loss gap, "
+            "per-family recall, fits/time, RID output agreement). Also benchmarks ground-truth "
+            "feature recovery across five methods (cross-family RID grid and TruVaRImp, stepwise "
+            "logistic regression, stepwise random forest, single-family tree RID), and saves "
+            "tables/plots."
         )
     )
     parser.add_argument(
@@ -1271,14 +1684,24 @@ def parse_args():
         help="RID bootstraps per fit",
     )
     parser.add_argument(
-        "--models-per-class",
+        "--n-candidates-per-family",
         type=int,
-        default=DEFAULT_MODELS_PER_CLASS,
+        default=DEFAULT_N_CANDIDATES_PER_FAMILY,
         help=(
-            "RID n_models_per_class / n_models_pool. Only sets seed refits for seed-sensitive "
-            "grids and custom trainers: rid_tree fits each tree config once, and cross-family "
-            "RID fits a shared candidate pool of rid.candidate_pool.DEFAULT_N_CANDIDATES_PER_FAMILY "
-            "per family"
+            "Shared candidate pool size per family per bootstrap (rid.candidate_pool), used by "
+            "both cross-family methods: cross_family_unweighted fits all of it, "
+            f"cross_family_unweighted_truvarimp searches it (default: {DEFAULT_N_CANDIDATES_PER_FAMILY})"
+        ),
+    )
+    parser.add_argument(
+        "--truvarimp-total-budget",
+        type=int,
+        default=DEFAULT_TRUVARIMP_TOTAL_BUDGET,
+        help=(
+            "Real fits per bootstrap, shared across all families, for "
+            "cross_family_unweighted_truvarimp (default: "
+            f"{DEFAULT_TRUVARIMP_TOTAL_BUDGET}). Even a budget above the pool size need not "
+            "be spent: TruVaRImp stops once no unevaluated candidate is worth a fit"
         ),
     )
     parser.add_argument(
@@ -1286,7 +1709,21 @@ def parse_args():
         type=float,
         nargs="+",
         default=DEFAULT_BETA_GRID,
-        help="List of beta values used in latent score beta*signal+epsilon",
+        help=(
+            "List of beta values used in latent score beta*signal+epsilon. Seeds derive from a "
+            "beta's index in this list, so keep it fixed and use --betas to run a subset"
+        ),
+    )
+    parser.add_argument(
+        "--betas",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Run only these betas (each must be in --beta-grid), e.g. one array task per "
+            "(DGP, beta). Seeds still come from each beta's index in --beta-grid, so a subset "
+            "reproduces the full run's datasets. Default: all of --beta-grid"
+        ),
     )
     parser.add_argument(
         "--noise-std",
@@ -1311,7 +1748,7 @@ def parse_args():
         type=str,
         default="sub_mr",
         help=(
-            "RID variable-importance metric used by cross_family_unweighted and "
+            "RID variable-importance metric used by both cross-family methods and "
             "rid_tree (default: sub_mr; also available: loco, coef, iloco). DGP feature counts are tiny (6-11), so iloco's "
             "O(features^2) pairwise cost is negligible here, unlike on the real "
             "Falcon-Cano/Staellert datasets."
@@ -1394,17 +1831,24 @@ def main():
     n_jobs = resolve_num_workers(args.num_workers)
 
     simulators = select_simulators(args.dgps, args.include_redundant_dgps)
+    unknown_betas = sorted(set(args.betas or []) - set(args.beta_grid))
+    if unknown_betas:
+        raise SystemExit(f"--betas {unknown_betas} not in --beta-grid {args.beta_grid}")
 
     study_settings = {
         "rashomon_evaluation": "out_of_bag",
-        # Added 2026-11-12: cross-family grid search fits every candidate of the shared
-        # pool (rid.candidate_pool) once; rid_tree fits each grid config once.
-        "n_candidates_per_family": DEFAULT_N_CANDIDATES_PER_FAMILY,
+        # Added 2026-11-12: both cross-family methods search the same shared pool
+        # (rid.candidate_pool): grid fits all of it, TruVaRImp spends this budget on it.
+        # rid_tree fits each grid config once.
+        "candidate_search_modes": dict(CROSS_FAMILY_SEARCH_MODES),
+        "n_candidates_per_family": args.n_candidates_per_family,
+        "truvarimp_total_budget": args.truvarimp_total_budget,
         "grid_refits": "seed_sensitive_only",
+        # Checkpoints are one file per (DGP, beta), with search-coverage rows alongside.
+        "checkpoint_layout": "per_dgp_beta_with_search_coverage",
         "sample_size": args.sample_size,
         "repetitions_per_beta": args.repetitions,
         "bootstraps": args.bootstraps,
-        "models_per_class": args.models_per_class,
         "beta_grid": args.beta_grid,
         "noise_std": args.noise_std,
         "base_seed": args.base_seed,
@@ -1420,13 +1864,15 @@ def main():
     prepare_output_dir(args.output_dir, study_settings)
 
     logger.info("=" * 70)
-    logger.info("Running nonlinear interaction simulation study")
+    logger.info("Running nonlinear interaction simulation study (grid vs. TruVaRImp validation)")
     logger.info(f"output_dir={args.output_dir}")
     logger.info(f"sample_size={args.sample_size}")
     logger.info(f"repetitions={args.repetitions}")
     logger.info(f"bootstraps={args.bootstraps}")
-    logger.info(f"models_per_class={args.models_per_class}")
+    logger.info(f"n_candidates_per_family={args.n_candidates_per_family}")
+    logger.info(f"truvarimp_total_budget={args.truvarimp_total_budget}")
     logger.info(f"beta_grid={args.beta_grid}")
+    logger.info(f"betas={args.betas or args.beta_grid}")
     logger.info(f"noise_std={args.noise_std}")
     logger.info(f"epsilon={args.epsilon}")
     logger.info(f"rid_metric={args.rid_metric}")
@@ -1443,19 +1889,22 @@ def main():
     run_simulation_study(
         simulators,
         beta_grid=args.beta_grid,
+        betas=args.betas,
         sample_size=args.sample_size,
         n_repetitions=args.repetitions,
         noise_std=args.noise_std,
         base_seed=args.base_seed,
         stepwise_cv_splits=args.stepwise_cv_splits,
         random_state=args.random_state,
-        make_method_runners=lambda X, y, cv, scoring: build_method_runners(
+        make_method_runners=lambda X, y, cv, scoring, fitted_estimators: build_method_runners(
             X,
             y,
             cv,
             scoring,
+            fitted_estimators,
             n_bootstraps=args.bootstraps,
-            n_models_per_class=args.models_per_class,
+            n_candidates_per_family=args.n_candidates_per_family,
+            truvarimp_total_budget=args.truvarimp_total_budget,
             epsilon=args.epsilon,
             stepwise_logreg_C=args.stepwise_logreg_C,
             stepwise_rf_n_estimators=args.stepwise_rf_n_estimators,
@@ -1464,6 +1913,7 @@ def main():
             rid_metric=args.rid_metric,
         ),
         output_dir=args.output_dir,
+        rid_metric=args.rid_metric,
     )
     output_paths = write_combined_outputs(args.output_dir)
 

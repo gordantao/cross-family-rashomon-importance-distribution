@@ -82,7 +82,7 @@ Varma, M. V. S., Obach, R. S., Rotter, C. *et al.* “Physicochemical Space for 
 - `rid/` — the shared `CrossFamilyRashomonImportanceDistribution` package used by every experiment below.
 - `experiments/falcon_cano/` — the bioavailability study (this README), driven by `run_rashomon_falcon_cano.py`.
 - `experiments/staellert/` — the Staellert single-cell manifold top-40 feature comparison, driven by `run_staellert_top40_comparison.py`.
-- `experiments/nonlinear_interaction_simulation/` — the synthetic simulation study that validates RID against known ground-truth DGPs, driven by `run_nonlinear_interaction_simulation.py`.
+- `experiments/nonlinear_interaction_simulation/` — the synthetic simulation study that validates RID against known ground-truth DGPs and validates TruVaRImp candidate search against the exhaustive grid over the same candidate pool (Rashomon-set recall/precision, cost, RID output agreement), driven by `run_nonlinear_interaction_simulation.py`.
 
 Each experiment folder is self-contained (its own `data/`, `results/`, `analysis/`, and `environment.yml` as applicable) and imports the shared `rid` package from the repo root. The `environment.yml` at the repo root is the umbrella env covering all three experiments combined.
 
