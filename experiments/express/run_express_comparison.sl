@@ -65,7 +65,7 @@ PYTHON_ENV="/nas/longleaf/home/gtao/.conda/envs/zikry_lab-express/bin/python"
 echo "Using python from: $PYTHON_ENV"
 $PYTHON_ENV --version
 
-LABEL="${LABEL:-zscore_median}"
+LABEL="${LABEL:-zscore_mean}"
 METHODS=(
 	stepwise_rf stepwise_logreg rid_tree cross_family_unweighted_truvarimp
 )

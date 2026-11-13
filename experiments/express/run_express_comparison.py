@@ -30,7 +30,7 @@ the sorted test patient IDs goes into each checkpoint's settings, so checkpoints
 from another split are refused.
 
 Label, fit on the train patients only (--label):
-    zscore_median (default)  within each combo, z-score log CR with the train
+    zscore_mean (default)    within each combo, z-score log CR with the train
                              rows' mean and SD for that combo; label 1 when
                              -z > 0, i.e. log CR below that combo's train mean
                              (better-than-typical synergy for that combo). The
@@ -106,7 +106,7 @@ logger = logging.getLogger(__name__)
 
 ROWS_FILE = "rows.csv"
 EXPRESSION_FILE = "expression.csv"
-LABELS = ("zscore_median", "cr_lt_075")
+LABELS = ("zscore_mean", "cr_lt_075")
 CR_THRESHOLD = 0.75
 
 # The answer key as GDSC-style biomarker groups, one gene per group.
@@ -153,10 +153,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--label",
         choices=LABELS,
-        default="zscore_median",
+        default="zscore_mean",
         help=(
-            "zscore_median: log CR below its combo's train-patient mean (per-combo z-score < 0); "
-            f"cr_lt_075: CR < {CR_THRESHOLD} (default: zscore_median)"
+            "zscore_mean: log CR below its combo's train-patient mean (per-combo z-score < 0); "
+            f"cr_lt_075: CR < {CR_THRESHOLD} (default: zscore_mean)"
         ),
     )
     parser.add_argument(
@@ -456,7 +456,7 @@ def _make_patient_holdout_split(
 
 
 def _fit_label_params(train_rows: pd.DataFrame, label: str) -> dict:
-    """Per-combo log-CR mean and SD over the train rows (zscore_median); nothing
+    """Per-combo log-CR mean and SD over the train rows (zscore_mean); nothing
     for cr_lt_075. Fit on train rows only, then applied to every row."""
 
     if label == "cr_lt_075":
@@ -474,7 +474,7 @@ def _fit_label_params(train_rows: pd.DataFrame, label: str) -> dict:
 
 
 def _apply_label(rows: pd.DataFrame, params: dict) -> tuple[pd.Series, pd.Series | None]:
-    """Binary label (int 0/1) and, for zscore_median, the per-combo z-score."""
+    """Binary label (int 0/1) and, for zscore_mean, the per-combo z-score."""
 
     if params["label"] == "cr_lt_075":
         return (rows["cr"] < params["cr_threshold"]).astype(int), None
@@ -1078,6 +1078,8 @@ def _method_settings(method: str, args: argparse.Namespace, holdout_meta: dict) 
         settings["rid_bootstrap"] = "grouped_by_patient"
     if method.startswith("cross_family_"):
         settings["n_candidates_per_family"] = DEFAULT_N_CANDIDATES_PER_FAMILY
+    # The forced-in genes change the feature panel but not data_fingerprint.
+    settings["answer_key_genes"] = list(ANSWER_KEY_GENES)
     settings["evaluation_protocol"] = holdout_meta["protocol"]
     settings["holdout_test_patients_sha256"] = holdout_meta["test_patients_sha256"]
     return settings
@@ -1091,6 +1093,7 @@ def _run_key(args: argparse.Namespace) -> dict:
     keys = sorted(set().union(*METHOD_SETTING_KEYS.values()) - {"label"})
     run_key = {key: getattr(args, key) for key in keys}
     run_key["n_candidates_per_family"] = DEFAULT_N_CANDIDATES_PER_FAMILY
+    run_key["answer_key_genes"] = list(ANSWER_KEY_GENES)
     return json.loads(json.dumps(run_key))
 
 

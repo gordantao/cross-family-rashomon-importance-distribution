@@ -26,9 +26,13 @@ Reads data/raw/ (download_express_data.sh) and writes data/processed/
                          all-rows class balance (sanity check only) and the raw
                          files' sha256
 
-Join: Table S9's lab_id <-> the mapping's labId, keeping AML specimens
-(rna_control == "No") whose RNA sample is a column of the expression matrix.
-Every matched patient has exactly one specimen and one RNA sample (checked).
+Join: Table S9's lab_id <-> the mapping's labId, keeping specimens that aren't
+healthy controls (rna_control == "No") and whose RNA sample is a column of the
+expression matrix. There is no diagnosis filter beyond Table S9's own cohort:
+its dxAtSpecimenAcquisition is AML for almost every specimen, but a few are
+acute leukaemias of ambiguous lineage, and those are kept (counts in
+prepare_summary.json). Every matched patient has exactly one specimen and one
+RNA sample (checked).
 
 Combination ratio, per (patient, combo) row:
     CR = AUC_combo / min(AUC_VEN, AUC_partner)
@@ -93,7 +97,8 @@ def load_table_s9(raw_dir: Path) -> tuple[pd.DataFrame, float]:
     """Table S9 plus the maximum possible AUC (the auc_pct_of_max scale)."""
 
     s9 = pd.read_excel(raw_dir / TABLE_S9_FILE, sheet_name=TABLE_S9_SHEET)
-    missing = {"patient_id", "lab_id", "drug", "drug_type", "probit_auc", "auc_pct_of_max", "specimenType"} - set(s9.columns)
+    missing = {"patient_id", "lab_id", "drug", "drug_type", "probit_auc", "auc_pct_of_max", "specimenType",
+               "dxAtSpecimenAcquisition"} - set(s9.columns)
     if missing:
         raise ValueError(f"{TABLE_S9_FILE} lacks columns {sorted(missing)}; has the publisher changed the layout?")
     if s9.duplicated(["lab_id", "drug"]).any():
@@ -106,7 +111,7 @@ def load_table_s9(raw_dir: Path) -> tuple[pd.DataFrame, float]:
 
 
 def load_mapping(raw_dir: Path, expression_samples: set[str]) -> pd.DataFrame:
-    """labId -> RNA sample for AML specimens (not healthy controls) with expression."""
+    """labId -> RNA sample for specimens that aren't healthy controls, with expression."""
 
     mapping = pd.read_excel(raw_dir / MAPPING_FILE)
     mapping = mapping[mapping["dbgap_rnaseq_sample"].isin(expression_samples) & mapping["rna_control"].eq("No")]
@@ -146,6 +151,7 @@ def build_rows(s9: pd.DataFrame, mapping: pd.DataFrame, auc_floor: float) -> pd.
             "cr": cr.to_numpy(),
             "log_cr": np.log(cr.to_numpy()),
             "specimen_type": specimen.loc[sub.index, "specimenType"].to_numpy(),
+            "diagnosis": specimen.loc[sub.index, "dxAtSpecimenAcquisition"].to_numpy(),
             "rna_sample": specimen.loc[sub.index, "dbgap_rnaseq_sample"].to_numpy(),
         }))
     rows = pd.concat(frames, ignore_index=True).sort_values(["patient_id", "combo"], ignore_index=True)
@@ -199,7 +205,8 @@ def build(args) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
 
     samples_by_patient = rows.drop_duplicates("patient_id").set_index("patient_id")["rna_sample"]
     expression, expression_info = load_expression(raw_dir, samples_by_patient)
-    rows = rows.drop(columns="rna_sample")
+    patients_per_diagnosis = rows.drop_duplicates("patient_id")["diagnosis"].value_counts(dropna=False)
+    rows = rows.drop(columns=["rna_sample", "diagnosis"])
 
     missing_answer_key = sorted(set(ANSWER_KEY_GENES) - set(expression.columns))
     if missing_answer_key:
@@ -225,6 +232,7 @@ def build(args) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         "rows_per_combo": rows["combo"].value_counts().sort_index().to_dict(),
         "rows_per_specimen_type": rows["specimen_type"].value_counts().to_dict(),
         "patients_per_specimen_type": rows.drop_duplicates("patient_id")["specimen_type"].value_counts().to_dict(),
+        "patients_per_diagnosis": {str(k): int(v) for k, v in patients_per_diagnosis.items()},
         "expression": expression_info,
         "answer_key_genes": list(ANSWER_KEY_GENES),
         "missing_answer_key_genes": missing_answer_key,
