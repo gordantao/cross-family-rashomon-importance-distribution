@@ -39,6 +39,16 @@
 #
 # Memory: 128G. cross_family_unweighted_truvarimp OOM'd at 32G and peaked at
 # ~70G RSS across its 50 workers (job 9043384); the other methods need far less.
+#
+# Extra arguments: EXTRA_ARGS is appended to the python command line, and a
+# repeated flag overrides the one above (argparse keeps the last). E.g. profile
+# where cross_family_unweighted_truvarimp's per-bootstrap time goes, with 4
+# bootstraps into a separate output dir (never the real run's checkpoints):
+#   EXTRA_ARGS="--rid-n-bootstraps 4 --profile cprofile --output-dir experiments/express/results/express_profile" \
+#     sbatch --array=3 --export=ALL experiments/express/run_express_comparison.sl
+# -> <output-dir>/<label>/<method>_profile.csv (one row per bootstrap) and
+#    <method>_profile/bootstrap_<b>.prof (python -m pstats <file>). --profile
+#    timers skips the cProfile overhead and writes only the CSV.
 # -------------------------------------------------------
 
 set -euo pipefail
@@ -75,6 +85,8 @@ METHODS=(
 METHOD="${METHODS[$SLURM_ARRAY_TASK_ID]}"
 echo "Label:         $LABEL"
 echo "Method:        $METHOD"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+echo "Extra args:    ${EXTRA_ARGS:-none}"
 
 $PYTHON_ENV experiments/express/run_express_comparison.py \
     --data-dir experiments/express/data/processed \
@@ -88,7 +100,8 @@ $PYTHON_ENV experiments/express/run_express_comparison.py \
     --rid-n-bootstraps 100 \
     --truvarimp-total-budget 300 \
     --stepwise-n-jobs "$SLURM_CPUS_PER_TASK" \
-    --rid-n-jobs "$SLURM_CPUS_PER_TASK"
+    --rid-n-jobs "$SLURM_CPUS_PER_TASK" \
+    $EXTRA_ARGS  # unquoted on purpose: split into separate arguments
 
 echo "========================================"
 echo "End time: $(date)"
