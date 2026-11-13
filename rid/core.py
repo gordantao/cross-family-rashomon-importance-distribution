@@ -514,6 +514,37 @@ def _prepare_inputs(X, y):
     return X_values, y_values, feature_names
 
 
+def _prepare_groups(groups, n_rows):
+    """Encode ``groups`` as integer codes for :func:`_bootstrap_split`.
+
+    Returns ``(codes, n_groups)``, or ``(None, None)`` when ``groups`` is None.
+    Codes index the unique labels in sorted order, so the grouped bootstrap's
+    draw is deterministic for a given set of labels regardless of row order.
+    """
+
+    if groups is None:
+        return None, None
+    labels = np.asarray(groups)
+    if labels.ndim != 1:
+        # e.g. tuple labels, which np.asarray would expand into a 2-D array
+        labels = np.empty(len(groups), dtype=object)
+        labels[:] = list(groups)
+    if labels.shape[0] != n_rows:
+        raise ValueError(f"groups must have one label per row of X ({n_rows}), got {labels.shape[0]}")
+    import pandas as pd  # only needed on the grouped path; every experiment env has it
+
+    # np.unique would silently merge float NaN/NA/NaT rows into one fake group
+    # (or give each object-dtype NaN its own group), so reject missing labels.
+    missing = np.asarray(pd.isna(labels), dtype=bool)
+    if missing.any():
+        raise ValueError(f"groups has {int(missing.sum())} missing labels (NaN/None/NA); give every row a group")
+    try:
+        unique_labels, codes = np.unique(labels, return_inverse=True)
+    except TypeError as exc:
+        raise ValueError("groups labels must be mutually sortable (e.g. all str or all int)") from exc
+    return codes.reshape(-1), len(unique_labels)
+
+
 def _active_metrics(per_bootstrap_importances, feature_names, metric_names):
     return [
         metric
@@ -764,7 +795,7 @@ def _log_bootstrap_summary(label, bootstrap_stats):
             )
 
 
-def _bootstrap_split(X, y, b):
+def _bootstrap_split(X, y, b, groups=None):
     """In-bag resample and out-of-bag rows for bootstrap ``b``.
 
     The in-bag rows are exactly what ``resample(X, y, random_state=b)``
@@ -780,11 +811,27 @@ def _bootstrap_split(X, y, b):
     OOB rows missing a class break multiclass log-loss/AUPRC; rare classes hit
     this (e.g. Staellert's 13-cell M phase loses all its OOB rows at seeds 227
     and 416). Seeds are unchanged, so valid bootstraps are unaffected.
+
+    ``groups`` (integer codes from :func:`_prepare_groups`, or None) switches to
+    a cluster bootstrap: ``resample`` draws the sorted unique groups with
+    replacement (same ``random_state=b``), the in-bag rows are every row of each
+    drawn group repeated with the group's multiplicity, and the OOB rows are
+    every row of the groups never drawn -- so no group is on both sides. With
+    few or large groups more bootstraps fail the class check above; they count
+    as invalid like any other. ``groups=None`` is the row bootstrap, unchanged.
     """
 
-    in_bag = resample(np.arange(len(y)), random_state=b)
-    oob_mask = np.ones(len(y), dtype=bool)
-    oob_mask[in_bag] = False
+    if groups is None:
+        in_bag = resample(np.arange(len(y)), random_state=b)
+        oob_mask = np.ones(len(y), dtype=bool)
+        oob_mask[in_bag] = False
+    else:
+        n_groups = int(groups.max()) + 1
+        drawn = resample(np.arange(n_groups), random_state=b)
+        order = np.argsort(groups, kind="stable")
+        bounds = np.searchsorted(groups[order], np.arange(n_groups + 1))
+        in_bag = np.concatenate([order[bounds[g]:bounds[g + 1]] for g in drawn])
+        oob_mask = ~np.isin(groups, drawn)
     n_classes = np.unique(y).size
     if (
         n_classes < 2
@@ -818,9 +865,10 @@ def _run_single_bootstrap(
     feature_names,
     vi_metric_specs,
     performance_metric_specs,
+    groups=None,
 ):
     rng = np.random.default_rng(seed=b)
-    split = _bootstrap_split(X, y, b)
+    split = _bootstrap_split(X, y, b, groups)
     if split is None:
         return None, {"n_fits": 0, "rashomon_size": 0, "valid": False}
     X_boot, y_boot, X_oob, y_oob = split
@@ -925,9 +973,10 @@ def _run_single_bootstrap_cross_family(
     truvarimp_config=None,
     n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
     record_diagnostics=False,
+    groups=None,
 ):
     rng = np.random.default_rng(seed=b)
-    split = _bootstrap_split(X, y, b)
+    split = _bootstrap_split(X, y, b, groups)
     if split is None:
         stats = {
             "n_fits": {name: 0 for name in model_configs},
@@ -1119,6 +1168,7 @@ def compute_rid(
     n_cdf_points=200,
     n_jobs=1,
     suppress_warnings=True,
+    groups=None,
 ):
     """Compute single-family RID and return metric results, performance, and valid bootstrap count.
 
@@ -1130,6 +1180,12 @@ def compute_rid(
 
     ``suppress_warnings`` (default True) ignores every Python warning raised
     while fitting and scoring candidates inside each bootstrap worker.
+
+    ``groups`` (default None: the row bootstrap) is an optional length-n array
+    of hashable, mutually sortable labels, e.g. patient IDs when a patient has
+    many rows. Each bootstrap then resamples whole groups (a cluster
+    bootstrap), so a group's rows are never both in-bag and out-of-bag; see
+    :func:`_bootstrap_split`. Expect more invalid bootstraps with few groups.
     """
 
     if model_config is not None:
@@ -1154,12 +1210,14 @@ def compute_rid(
 
     # Unscaled: each bootstrap standardizes on its own in-bag rows (_scale_in_bag).
     X_values, y_values, feature_names = _prepare_inputs(X, y)
+    group_codes, n_groups = _prepare_groups(groups, len(y_values))
 
     model_name = getattr(model_class, "__name__", type(model_trainer).__name__)
     logger.info(
         f"RID: {model_name}, {len(feature_names)} features, "
         f"B={n_bootstraps}, pool={n_models_pool}, epsilon={epsilon}, n_jobs={n_jobs}, "
         f"metrics={vi_metric_names}, performance_metrics={performance_metric_names}"
+        + (f", grouped bootstrap over {n_groups} groups" if group_codes is not None else "")
     )
 
     progress_label = f"RID[{model_name}] bootstraps"
@@ -1177,6 +1235,7 @@ def compute_rid(
             feature_names,
             vi_metric_specs,
             performance_metric_specs,
+            group_codes,
         )
         for b in range(n_bootstraps)
     )
@@ -1236,6 +1295,7 @@ def compute_rid_cross_family(
     suppress_warnings=True,
     n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
     return_search_diagnostics=False,
+    groups=None,
 ):
     """Compute cross-family RID and return metric results, family counts, and family performance.
 
@@ -1253,6 +1313,12 @@ def compute_rid_cross_family(
 
     ``suppress_warnings`` (default True) ignores every Python warning raised
     while fitting and scoring candidates inside each bootstrap worker.
+
+    ``groups`` (default None: the row bootstrap) is an optional length-n array
+    of hashable, mutually sortable labels, e.g. patient IDs when a patient has
+    many rows. Each bootstrap then resamples whole groups (a cluster
+    bootstrap), so a group's rows are never both in-bag and out-of-bag; see
+    :func:`_bootstrap_split`. Expect more invalid bootstraps with few groups.
 
     Each bootstrap first draws one shared candidate pool
     (:func:`rid.candidate_pool.build_candidate_pool`): ``n_candidates_per_family``
@@ -1293,6 +1359,7 @@ def compute_rid_cross_family(
 
     # Unscaled: each bootstrap standardizes on its own in-bag rows (_scale_in_bag).
     X_values, y_values, feature_names = _prepare_inputs(X, y)
+    group_codes, n_groups = _prepare_groups(groups, len(y_values))
 
     n_candidates_per_family = int(n_candidates_per_family)
     truvarimp_config = dict(truvarimp_config or {})
@@ -1345,6 +1412,7 @@ def compute_rid_cross_family(
         f"{pool_description}, epsilon={epsilon}, n_jobs={n_jobs}, "
         f"metrics={vi_metric_names}, performance_metrics={performance_metric_names}, "
         f"family_balance_mode={family_balance_mode}"
+        + (f", grouped bootstrap over {n_groups} groups" if group_codes is not None else "")
     )
 
     progress_label = f"cross-family RID[{family_balance_mode}, {candidate_search}] bootstraps"
@@ -1367,6 +1435,7 @@ def compute_rid_cross_family(
             truvarimp_config,
             n_candidates_per_family,
             return_search_diagnostics,
+            group_codes,
         )
         for b in range(n_bootstraps)
     )
@@ -1490,7 +1559,14 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
         self.n_jobs = n_jobs
         self.suppress_warnings = suppress_warnings
 
-    def fit(self, X, y):
+    def fit(self, X, y, groups=None):
+        """Fit RID on ``X, y``.
+
+        ``groups`` (optional, length n) switches to a cluster bootstrap over
+        those labels (see :func:`compute_rid`); ``n_groups_`` records the number
+        of distinct groups, or ``None`` for the default row bootstrap.
+        """
+
         self.metric_results_, self.perf_stats_, self.n_valid_bootstraps_ = compute_rid(
             X,
             y,
@@ -1506,8 +1582,10 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
             n_cdf_points=self.n_cdf_points,
             n_jobs=self.n_jobs,
             suppress_warnings=self.suppress_warnings,
+            groups=groups,
         )
-        _, _, self.feature_names_ = _prepare_inputs(X, y)
+        _, y_values, self.feature_names_ = _prepare_inputs(X, y)
+        self.n_groups_ = _prepare_groups(groups, len(y_values))[1]
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()
         return self
 
@@ -1673,6 +1751,10 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         (evaluated pool candidates with their OOB losses, Rashomon members,
         min loss, fit count, wall-clock), else ``None``.
 
+    n_groups_ : int or None
+        Number of distinct ``groups`` labels when ``fit`` was given ``groups``
+        (cluster bootstrap), else ``None`` (row bootstrap).
+
     Notes
     -----
     Metric callables are invoked by signature introspection. Any subset of the
@@ -1712,7 +1794,15 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         self.n_candidates_per_family = n_candidates_per_family
         self.record_search_diagnostics = record_search_diagnostics
 
-    def fit(self, X, y):
+    def fit(self, X, y, groups=None):
+        """Fit cross-family RID on ``X, y``.
+
+        ``groups`` (optional, length n) switches to a cluster bootstrap over
+        those labels (see :func:`compute_rid_cross_family`); ``n_groups_``
+        records the number of distinct groups, or ``None`` for the default row
+        bootstrap.
+        """
+
         results = compute_rid_cross_family(
             X,
             y,
@@ -1730,6 +1820,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             suppress_warnings=self.suppress_warnings,
             n_candidates_per_family=self.n_candidates_per_family,
             return_search_diagnostics=self.record_search_diagnostics,
+            groups=groups,
         )
         (
             self.metric_results_,
@@ -1738,6 +1829,7 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             self.n_valid_bootstraps_,
         ) = results[:4]
         self.search_diagnostics_ = results[4] if self.record_search_diagnostics else None
-        _, _, self.feature_names_ = _prepare_inputs(X, y)
+        _, y_values, self.feature_names_ = _prepare_inputs(X, y)
+        self.n_groups_ = _prepare_groups(groups, len(y_values))[1]
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()
         return self
