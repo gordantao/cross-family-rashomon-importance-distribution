@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import cProfile
 import logging
+import os
+import sys
 import time
 import warnings
 from collections import Counter
@@ -30,6 +33,7 @@ VALID_VI_METRICS = ("sub_mr", "loco", "coef", "iloco")
 VALID_PERFORMANCE_METRICS = ("accuracy", "f1", "auprc")
 VALID_CROSS_FAMILY_BALANCE_MODES = ("unweighted", "weighted")
 VALID_CANDIDATE_SEARCH_MODES = ("grid", "truvarimp_joint")
+VALID_PROFILE_MODES = ("timers", "cprofile")
 
 logger = logging.getLogger(__name__)
 
@@ -460,6 +464,29 @@ def normalize_candidate_search(candidate_search):
     return candidate_search
 
 
+def normalize_profile(profile, profile_dir=None):
+    """Validate the opt-in per-bootstrap profiler; return ``(profile, profile_dir)``.
+
+    ``profile`` is ``None``/``"off"`` (no profiling; returned as ``None``),
+    ``"timers"`` or ``"cprofile"``. ``"cprofile"`` needs ``profile_dir``, which
+    is created here (in the parent, before any worker writes into it) and
+    returned as an absolute path so loky workers resolve it the same way.
+    """
+
+    if profile is None or profile == "off":
+        profile = None
+    elif profile not in VALID_PROFILE_MODES:
+        raise ValueError(f"Unknown profile={profile!r}. Choose None/'off', 'timers' or 'cprofile'.")
+    if profile == "cprofile":
+        if profile_dir is None:
+            raise ValueError("profile='cprofile' needs profile_dir (where bootstrap_<b>.prof files go)")
+        profile_dir = os.path.abspath(os.fspath(profile_dir))
+        os.makedirs(profile_dir, exist_ok=True)
+    elif profile_dir is not None:
+        raise ValueError(f"profile_dir is only used with profile='cprofile', not profile={profile!r}")
+    return profile, profile_dir
+
+
 def summarize_metric_result(metric_result):
     """Compute per-feature expected importance and P(phi > 0).
 
@@ -677,7 +704,7 @@ def _format_perf_stats(perf_stats, performance_metric_specs):
     return "  ".join(parts)
 
 
-def _run_bootstrap_task(worker, b, suppress_warnings, *args):
+def _run_bootstrap_task(worker, b, suppress_warnings, *args, profile=None, profile_dir=None):
     """Run one bootstrap worker, returning ``(b, result, stats)``.
 
     Warnings are ignored here, inside the worker process, because joblib's loky
@@ -685,15 +712,145 @@ def _run_bootstrap_task(worker, b, suppress_warnings, *args):
     sklearn ConvergenceWarning/FutureWarning from every candidate fit lands in
     the job's stderr. ``catch_warnings`` restores the filters afterwards, which
     matters when ``n_jobs=1`` runs the worker in the caller's own process.
+
+    ``profile`` (see :func:`normalize_profile`): ``"timers"`` passes the worker a
+    ``timers`` dict to fill with stage wall-clocks and stores a flat record in
+    ``stats["profile"]`` (:func:`_profile_record`); ``"cprofile"`` does the same
+    and also runs the worker under :class:`cProfile.Profile`, dumping
+    ``<profile_dir>/bootstrap_<b>.prof`` from here, i.e. inside the joblib
+    worker where the time is actually spent. ``None`` calls the worker exactly
+    as before.
     """
 
     start = time.perf_counter()
-    with warnings.catch_warnings():
-        if suppress_warnings:
-            warnings.simplefilter("ignore")
-        result, stats = worker(b, *args)
-    stats["seconds"] = time.perf_counter() - start
+    kwargs = {}
+    timers = None
+    if profile is not None:
+        timers = kwargs["timers"] = {}
+    profiler = cProfile.Profile() if profile == "cprofile" else None
+    if profiler is not None:
+        try:
+            profiler.enable()
+        except ValueError:
+            # Python >= 3.12 allows one active profiler per process, so this
+            # fails when n_jobs=1 runs the worker inside a caller that is
+            # already profiled. Keep the timers rather than fail the fit.
+            logger.warning(
+                "bootstrap %d: another profiler is already active in this process; "
+                "skipping its cProfile dump (timers are still recorded)",
+                b,
+            )
+            profiler = None
+    try:
+        with warnings.catch_warnings():
+            if suppress_warnings:
+                warnings.simplefilter("ignore")
+            result, stats = worker(b, *args, **kwargs)
+        stats["seconds"] = time.perf_counter() - start
+    finally:
+        if profiler is not None:
+            profiler.disable()
+            profiler.dump_stats(os.path.join(profile_dir, f"bootstrap_{b}.prof"))
+    if timers is not None:
+        stats["profile"] = _profile_record(b, stats, timers)
     return b, result, stats
+
+
+def _profile_task_kwargs(profile, profile_dir):
+    """Keyword arguments for ``_run_bootstrap_task``: none at all when profiling is off."""
+
+    return {"profile": profile, "profile_dir": profile_dir} if profile else {}
+
+
+def _add_time(timers, key, start):
+    """Add the wall-clock since ``start`` to ``timers[key]``; no-op when profiling is off."""
+
+    if timers is not None:
+        timers[key] = timers.get(key, 0.0) + (time.perf_counter() - start)
+
+
+def _worker_max_rss_mb():
+    """Peak resident memory of this (worker) process so far, in MB, or None if unavailable."""
+
+    try:
+        import resource
+    except ImportError:  # Windows
+        return None
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is bytes on macOS, kilobytes on Linux.
+    return float(max_rss) / (1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0)
+
+
+def _profile_record(b, stats, timers):
+    """One bootstrap's flat profiler record (one entry of ``profile_``).
+
+    Totals: ``seconds`` (whole bootstrap), ``split_seconds`` (bootstrap split
+    and in-bag scaling), ``search_seconds`` (candidate pool and fits; for
+    ``truvarimp_joint`` also the GP/acquisition, split into ``fit_seconds`` and
+    ``gp_seconds``), ``vi_seconds`` and ``perf_seconds`` (VI / performance
+    metrics over the Rashomon members) and ``other_seconds`` (the remainder:
+    Rashomon filtering and bookkeeping). Breakdowns:
+    ``vi_seconds/<family>/<metric>`` (single-family: ``vi_seconds/<metric>``),
+    ``perf_seconds/<family>``, ``rashomon_size[/<family>]`` and
+    ``n_fits[/<family>]``. ``worker_pid`` and ``worker_max_rss_mb`` (the worker
+    process's peak RSS so far -- a loky worker runs many bootstraps, so this
+    is a running maximum, not this bootstrap's own peak) help attribute memory.
+    """
+
+    vi_seconds = sum(v for k, v in timers.items() if k.startswith("vi_seconds/"))
+    perf_seconds = sum(v for k, v in timers.items() if k == "perf_seconds" or k.startswith("perf_seconds/"))
+    record = {
+        "b": int(b),
+        "valid": bool(stats.get("valid")),
+        "seconds": float(stats["seconds"]),
+        "split_seconds": timers.get("split_seconds", 0.0),
+        "search_seconds": timers.get("search_seconds", 0.0),
+    }
+    for key in ("fit_seconds", "gp_seconds"):
+        if key in timers:
+            record[key] = timers[key]
+    record["vi_seconds"] = vi_seconds
+    record["perf_seconds"] = perf_seconds
+    record["other_seconds"] = record["seconds"] - (
+        record["split_seconds"] + record["search_seconds"] + vi_seconds + perf_seconds
+    )
+    record.update({k: v for k, v in timers.items() if k.startswith(("vi_seconds/", "perf_seconds/"))})
+    for key in ("rashomon_size", "n_fits"):
+        value = stats.get(key)
+        if isinstance(value, Mapping):
+            record.update({f"{key}/{name}": int(count) for name, count in value.items()})
+        else:
+            record[key] = int(value or 0)
+    record["worker_pid"] = os.getpid()
+    record["worker_max_rss_mb"] = _worker_max_rss_mb()
+    return record
+
+
+def _format_profile_record(record):
+    """One-line stage summary of a profiler record, for the per-bootstrap INFO log."""
+
+    search = f"search={record['search_seconds']:.1f}s"
+    if "fit_seconds" in record:
+        search += f" (fit={record['fit_seconds']:.1f}s gp={record['gp_seconds']:.1f}s)"
+    vi_parts = [
+        f"{key[len('vi_seconds/'):]}={value:.1f}s"
+        for key, value in record.items()
+        if key.startswith("vi_seconds/") and value > 0
+    ]
+    vi = f"vi={record['vi_seconds']:.1f}s" + (f" [{', '.join(vi_parts)}]" if vi_parts else "")
+    sizes = {k[len("rashomon_size/"):]: v for k, v in record.items() if k.startswith("rashomon_size/")}
+    parts = [
+        f"total={record['seconds']:.1f}s",
+        f"split={record['split_seconds']:.1f}s",
+        search,
+        vi,
+        f"perf={record['perf_seconds']:.1f}s",
+        f"other={record['other_seconds']:.1f}s",
+        f"rashomon={sizes if sizes else record.get('rashomon_size', 0)}",
+    ]
+    if record.get("worker_max_rss_mb") is not None:
+        parts.append(f"worker_max_rss={record['worker_max_rss_mb']:.0f}MB")
+    return " ".join(parts)
 
 
 def _make_parallel(n_jobs):
@@ -721,6 +878,8 @@ def _collect_bootstrap_results(tasks, n_jobs, n_bootstraps, label):
         n_valid += bool(stats.get("valid"))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("%s: bootstrap %d %s", label, b, _format_bootstrap_stats(stats))
+        if "profile" in stats:
+            logger.info("%s: bootstrap %d profile: %s", label, b, _format_profile_record(stats["profile"]))
         progress.update(extra=f"valid={n_valid}")
     collected.sort(key=lambda item: item[0])
     return [result for _, result, _ in collected], [stats for _, _, stats in collected]
@@ -866,17 +1025,28 @@ def _run_single_bootstrap(
     vi_metric_specs,
     performance_metric_specs,
     groups=None,
+    timers=None,
 ):
+    # timers: None (profiling off) or a dict this fills with stage wall-clocks
+    # (see _profile_record); never changes the result.
+    if timers is not None:
+        timers.update({"split_seconds": 0.0, "search_seconds": 0.0, "perf_seconds": 0.0})
+        timers.update({f"vi_seconds/{metric_name}": 0.0 for metric_name, _ in vi_metric_specs})
     rng = np.random.default_rng(seed=b)
+    stage_start = time.perf_counter()
     split = _bootstrap_split(X, y, b, groups)
     if split is None:
+        _add_time(timers, "split_seconds", stage_start)
         return None, {"n_fits": 0, "rashomon_size": 0, "valid": False}
     X_boot, y_boot, X_oob, y_oob = split
     X_boot, X_oob = _scale_in_bag(X_boot, X_oob)
+    _add_time(timers, "split_seconds", stage_start)
 
+    stage_start = time.perf_counter()
     models, losses = train_candidate_models(
         model_trainer, X_boot, y_boot, X_oob, y_oob, n_models_pool, b, model_kwargs
     )
+    _add_time(timers, "search_seconds", stage_start)
 
     min_loss = np.min(losses)
     rashomon_mask = losses <= min_loss + epsilon
@@ -898,11 +1068,13 @@ def _run_single_bootstrap(
     for model in rashomon_models:
         metric_values = {}
         for metric_name, metric_fn in vi_metric_specs:
+            stage_start = time.perf_counter()
             metric_values[metric_name] = _coerce_importance_values(
                 metric_name,
                 _call_metric(metric_fn, model=model, X=X_oob, y=y_oob, rng=rng),
                 len(feature_names),
             )
+            _add_time(timers, f"vi_seconds/{metric_name}", stage_start)
 
         for index, feature_name in enumerate(feature_names):
             for metric_name, _ in vi_metric_specs:
@@ -911,6 +1083,7 @@ def _run_single_bootstrap(
                         float(metric_values[metric_name][index])
                     )
 
+        stage_start = time.perf_counter()
         y_pred = model.predict(X_oob)
         y_prob = model.predict_proba(X_oob)
         for metric_name, metric_fn in performance_metric_specs:
@@ -928,6 +1101,7 @@ def _run_single_bootstrap(
             )
             if metric_value is not None:
                 boot_perf[metric_name].append(metric_value)
+        _add_time(timers, "perf_seconds", stage_start)
 
     return (boot_importances, boot_perf), stats
 
@@ -974,10 +1148,22 @@ def _run_single_bootstrap_cross_family(
     n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
     record_diagnostics=False,
     groups=None,
+    timers=None,
 ):
+    # timers: None (profiling off) or a dict this fills with stage wall-clocks
+    # (see _profile_record); never changes the result.
+    if timers is not None:
+        timers.update({"split_seconds": 0.0, "search_seconds": 0.0})
+        if candidate_search == "truvarimp_joint":
+            timers.update({"fit_seconds": 0.0, "gp_seconds": 0.0})
+        for name in model_configs:
+            timers.update({f"vi_seconds/{name}/{metric_name}": 0.0 for metric_name, _ in vi_metric_specs})
+        timers.update({f"perf_seconds/{name}": 0.0 for name in model_configs})
     rng = np.random.default_rng(seed=b)
+    stage_start = time.perf_counter()
     split = _bootstrap_split(X, y, b, groups)
     if split is None:
+        _add_time(timers, "split_seconds", stage_start)
         stats = {
             "n_fits": {name: 0 for name in model_configs},
             "rashomon_size": {name: 0 for name in model_configs},
@@ -989,6 +1175,7 @@ def _run_single_bootstrap_cross_family(
         return (None, None, None, None), stats
     X_boot, y_boot, X_oob, y_oob = split
     X_boot, X_oob = _scale_in_bag(X_boot, X_oob)
+    _add_time(timers, "split_seconds", stage_start)
     search_start = time.perf_counter()
 
     # Both search modes draw from this one pool, so for a given b they see the
@@ -1012,6 +1199,7 @@ def _run_single_bootstrap_cross_family(
             candidate_pool=candidate_pool,
         )
         family_indices = search_stats.pop("evaluated_candidate_indices")
+        fit_seconds = search_stats.pop("fit_seconds")
     else:
         family_models = {}
         family_losses = {}
@@ -1030,6 +1218,12 @@ def _run_single_bootstrap_cross_family(
         # pool is keyed by its own fit order.
         family_indices = {name: list(range(len(family_losses[name]))) for name in model_configs}
     search_seconds = time.perf_counter() - search_start
+    if timers is not None:
+        timers["search_seconds"] = search_seconds
+        if candidate_search == "truvarimp_joint":
+            # gp_seconds also covers pool construction and result collapsing.
+            timers["fit_seconds"] = fit_seconds
+            timers["gp_seconds"] = search_seconds - fit_seconds
 
     stats = {
         "n_fits": {name: len(family_losses[name]) for name in model_configs},
@@ -1102,11 +1296,13 @@ def _run_single_bootstrap_cross_family(
     for model, label in zip(rashomon_models, rashomon_labels):
         metric_values = {}
         for metric_name, metric_fn in vi_metric_specs:
+            stage_start = time.perf_counter()
             metric_values[metric_name] = _coerce_importance_values(
                 metric_name,
                 _call_metric(metric_fn, model=model, X=X_oob, y=y_oob, rng=rng),
                 len(feature_names),
             )
+            _add_time(timers, f"vi_seconds/{label}/{metric_name}", stage_start)
 
         for index, feature_name in enumerate(feature_names):
             for metric_name, _ in vi_metric_specs:
@@ -1118,6 +1314,7 @@ def _run_single_bootstrap_cross_family(
             if metric_values[metric_name] is not None:
                 metric_labels[metric_name].append(label)
 
+        stage_start = time.perf_counter()
         y_pred = model.predict(X_oob)
         y_prob = model.predict_proba(X_oob)
         for metric_name, metric_fn in performance_metric_specs:
@@ -1135,6 +1332,7 @@ def _run_single_bootstrap_cross_family(
             )
             if metric_value is not None:
                 boot_family_perf[label][metric_name].append(metric_value)
+        _add_time(timers, f"perf_seconds/{label}", stage_start)
 
     if family_balance_mode == "weighted":
         # Per metric, each family with >=1 scored Rashomon member gets total
@@ -1169,6 +1367,8 @@ def compute_rid(
     n_jobs=1,
     suppress_warnings=True,
     groups=None,
+    profile=None,
+    profile_dir=None,
 ):
     """Compute single-family RID and return metric results, performance, and valid bootstrap count.
 
@@ -1186,8 +1386,18 @@ def compute_rid(
     many rows. Each bootstrap then resamples whole groups (a cluster
     bootstrap), so a group's rows are never both in-bag and out-of-bag; see
     :func:`_bootstrap_split`. Expect more invalid bootstraps with few groups.
+
+    ``profile`` (default None: off) is an opt-in per-bootstrap profiler:
+    ``"timers"`` records stage wall-clocks, ``"cprofile"`` also runs each
+    bootstrap under :class:`cProfile.Profile` inside its joblib worker and
+    dumps ``<profile_dir>/bootstrap_<b>.prof``. When on, a fourth return value
+    is appended: one flat record per bootstrap, in bootstrap order (keys in
+    :func:`_profile_record`), and each bootstrap's stage summary is logged at
+    INFO as it finishes. Profiling never changes the other outputs; when off
+    the return value is the usual 3-tuple.
     """
 
+    profile, profile_dir = normalize_profile(profile, profile_dir)
     if model_config is not None:
         if model_class is not None or model_trainer is not None or model_kwargs is not None:
             raise ValueError(
@@ -1236,6 +1446,7 @@ def compute_rid(
             vi_metric_specs,
             performance_metric_specs,
             group_codes,
+            **_profile_task_kwargs(profile, profile_dir),
         )
         for b in range(n_bootstraps)
     )
@@ -1243,6 +1454,8 @@ def compute_rid(
         tasks, n_jobs, n_bootstraps, progress_label
     )
     _log_bootstrap_summary(progress_label, bootstrap_stats)
+    profile_records = [stats["profile"] for stats in bootstrap_stats] if profile else None
+    profile_suffix = (profile_records,) if profile else ()
 
     per_bootstrap_importances = []
     per_bootstrap_perf = []
@@ -1256,7 +1469,7 @@ def compute_rid(
     n_valid = len(per_bootstrap_importances)
     if n_valid == 0:
         logger.warning("No bootstraps produced a non-empty Rashomon set.")
-        return None, None, 0
+        return (None, None, 0) + profile_suffix
 
     active_metrics = _active_metrics(per_bootstrap_importances, feature_names, vi_metric_names)
     if not active_metrics:
@@ -1275,7 +1488,7 @@ def compute_rid(
         f"Metrics: {list(metric_results.keys())}  "
         f"{_format_perf_stats(perf_stats, performance_metric_specs)}"
     )
-    return metric_results, perf_stats, n_valid
+    return (metric_results, perf_stats, n_valid) + profile_suffix
 
 
 def compute_rid_cross_family(
@@ -1296,6 +1509,8 @@ def compute_rid_cross_family(
     n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
     return_search_diagnostics=False,
     groups=None,
+    profile=None,
+    profile_dir=None,
 ):
     """Compute cross-family RID and return metric results, family counts, and family performance.
 
@@ -1310,6 +1525,19 @@ def compute_rid_cross_family(
     modes key the same model identically; this is what lets a ``"grid"`` run
     serve as the exact Rashomon-set ground truth for a ``"truvarimp_joint"``
     run. Recording it changes no other output.
+
+    ``profile`` (default None: off) is an opt-in per-bootstrap profiler:
+    ``"timers"`` records stage wall-clocks (split, candidate search -- for
+    ``"truvarimp_joint"`` split into real fits vs. GP/acquisition -- VI per
+    family and metric, performance metrics per family) plus per-family
+    Rashomon sizes and fit counts; ``"cprofile"`` also runs each bootstrap
+    under :class:`cProfile.Profile` inside its joblib worker and dumps
+    ``<profile_dir>/bootstrap_<b>.prof``. When on, one more value is appended
+    to the return tuple (after the search diagnostics, if requested): one flat
+    record per bootstrap, in bootstrap order (keys in :func:`_profile_record`),
+    and each bootstrap's stage summary is logged at INFO as it finishes.
+    Profiling never changes the other outputs; when off the return value is
+    exactly as without it.
 
     ``suppress_warnings`` (default True) ignores every Python warning raised
     while fitting and scoring candidates inside each bootstrap worker.
@@ -1356,6 +1584,7 @@ def compute_rid_cross_family(
     performance_metric_names = tuple(metric_name for metric_name, _ in performance_metric_specs)
     family_balance_mode = normalize_cross_family_balance_mode(family_balance_mode)
     candidate_search = normalize_candidate_search(candidate_search)
+    profile, profile_dir = normalize_profile(profile, profile_dir)
 
     # Unscaled: each bootstrap standardizes on its own in-bag rows (_scale_in_bag).
     X_values, y_values, feature_names = _prepare_inputs(X, y)
@@ -1436,6 +1665,7 @@ def compute_rid_cross_family(
             n_candidates_per_family,
             return_search_diagnostics,
             group_codes,
+            **_profile_task_kwargs(profile, profile_dir),
         )
         for b in range(n_bootstraps)
     )
@@ -1452,6 +1682,9 @@ def compute_rid_cross_family(
             if record is not None:
                 record = {**record, "seconds": stats["seconds"]}
             search_diagnostics.append(record)
+    extra_returns = (search_diagnostics,) if return_search_diagnostics else ()
+    if profile:
+        extra_returns += ([stats["profile"] for stats in bootstrap_stats],)
 
     per_bootstrap_importances = []
     per_bootstrap_family_perf = []
@@ -1470,9 +1703,7 @@ def compute_rid_cross_family(
     n_valid = len(per_bootstrap_importances)
     if n_valid == 0:
         logger.warning("No bootstraps produced a non-empty Rashomon set.")
-        if return_search_diagnostics:
-            return None, family_counts, None, 0, search_diagnostics
-        return None, family_counts, None, 0
+        return (None, family_counts, None, 0) + extra_returns
 
     active_metrics = _active_metrics(per_bootstrap_importances, feature_names, vi_metric_names)
     if not active_metrics:
@@ -1498,9 +1729,7 @@ def compute_rid_cross_family(
     for name, perf_stats in family_perf_stats.items():
         logger.info(f"  {name}: {_format_perf_stats(perf_stats, performance_metric_specs)}")
 
-    if return_search_diagnostics:
-        return metric_results, family_counts, family_perf_stats, n_valid, search_diagnostics
-    return metric_results, family_counts, family_perf_stats, n_valid
+    return (metric_results, family_counts, family_perf_stats, n_valid) + extra_returns
 
 
 class _RIDSummaryMixin:
@@ -1529,7 +1758,13 @@ class _RIDSummaryMixin:
 
 
 class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
-    """Single-family RID estimator with a sklearn-style fit API."""
+    """Single-family RID estimator with a sklearn-style fit API.
+
+    ``profile`` (None/"off", "timers" or "cprofile") and ``profile_dir`` turn on
+    the opt-in per-bootstrap profiler (see :func:`compute_rid`); ``profile_``
+    then holds one flat record per bootstrap, else ``None``. Profiling never
+    changes any other fitted attribute.
+    """
 
     def __init__(
         self,
@@ -1545,6 +1780,8 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
         n_cdf_points=200,
         n_jobs=1,
         suppress_warnings=True,
+        profile=None,
+        profile_dir=None,
     ):
         self.epsilon = epsilon
         self.n_bootstraps = n_bootstraps
@@ -1558,6 +1795,8 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
         self.n_cdf_points = n_cdf_points
         self.n_jobs = n_jobs
         self.suppress_warnings = suppress_warnings
+        self.profile = profile
+        self.profile_dir = profile_dir
 
     def fit(self, X, y, groups=None):
         """Fit RID on ``X, y``.
@@ -1567,7 +1806,7 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
         of distinct groups, or ``None`` for the default row bootstrap.
         """
 
-        self.metric_results_, self.perf_stats_, self.n_valid_bootstraps_ = compute_rid(
+        results = compute_rid(
             X,
             y,
             epsilon=self.epsilon,
@@ -1583,7 +1822,11 @@ class RashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator):
             n_jobs=self.n_jobs,
             suppress_warnings=self.suppress_warnings,
             groups=groups,
+            profile=self.profile,
+            profile_dir=self.profile_dir,
         )
+        self.metric_results_, self.perf_stats_, self.n_valid_bootstraps_ = results[:3]
+        self.profile_ = results[3] if len(results) > 3 else None
         _, y_values, self.feature_names_ = _prepare_inputs(X, y)
         self.n_groups_ = _prepare_groups(groups, len(y_values))[1]
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()
@@ -1718,6 +1961,17 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         ``search_diagnostics_`` (see ``compute_rid_cross_family``'s
         ``return_search_diagnostics``). Changes no other output.
 
+    profile : {None, "off", "timers", "cprofile"}, default=None
+        Opt-in per-bootstrap profiler (see ``compute_rid_cross_family``'s
+        ``profile``): ``"timers"`` records stage wall-clocks, VI time per
+        family and metric, and Rashomon sizes per family in ``profile_``;
+        ``"cprofile"`` additionally dumps ``<profile_dir>/bootstrap_<b>.prof``
+        from inside each joblib worker. Changes no other output.
+
+    profile_dir : str or path-like, optional
+        Directory for the ``.prof`` files; required by (and only allowed with)
+        ``profile="cprofile"``. Created if missing.
+
     Attributes
     ----------
     metric_results_ : dict or None
@@ -1751,6 +2005,15 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         (evaluated pool candidates with their OOB losses, Rashomon members,
         min loss, fit count, wall-clock), else ``None``.
 
+    profile_ : list of dict or None
+        One flat record per bootstrap (in bootstrap order) when ``profile`` is
+        on -- keys such as ``seconds``, ``search_seconds``, ``fit_seconds``/
+        ``gp_seconds`` (TruVaRImp only), ``vi_seconds``,
+        ``vi_seconds/<family>/<metric>``, ``perf_seconds/<family>``,
+        ``rashomon_size/<family>``, ``n_fits/<family>``,
+        ``worker_max_rss_mb`` -- else ``None``. ``pandas.DataFrame(profile_)``
+        gives one row per bootstrap.
+
     n_groups_ : int or None
         Number of distinct ``groups`` labels when ``fit`` was given ``groups``
         (cluster bootstrap), else ``None`` (row bootstrap).
@@ -1778,6 +2041,8 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         suppress_warnings=True,
         n_candidates_per_family=DEFAULT_N_CANDIDATES_PER_FAMILY,
         record_search_diagnostics=False,
+        profile=None,
+        profile_dir=None,
     ):
         self.model_configs = model_configs
         self.epsilon = epsilon
@@ -1793,6 +2058,8 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
         self.suppress_warnings = suppress_warnings
         self.n_candidates_per_family = n_candidates_per_family
         self.record_search_diagnostics = record_search_diagnostics
+        self.profile = profile
+        self.profile_dir = profile_dir
 
     def fit(self, X, y, groups=None):
         """Fit cross-family RID on ``X, y``.
@@ -1821,6 +2088,8 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             n_candidates_per_family=self.n_candidates_per_family,
             return_search_diagnostics=self.record_search_diagnostics,
             groups=groups,
+            profile=self.profile,
+            profile_dir=self.profile_dir,
         )
         (
             self.metric_results_,
@@ -1829,6 +2098,9 @@ class CrossFamilyRashomonImportanceDistribution(_RIDSummaryMixin, BaseEstimator)
             self.n_valid_bootstraps_,
         ) = results[:4]
         self.search_diagnostics_ = results[4] if self.record_search_diagnostics else None
+        # The profile records, when on, are always the last return value.
+        n_base = 5 if self.record_search_diagnostics else 4
+        self.profile_ = results[n_base] if len(results) > n_base else None
         _, y_values, self.feature_names_ = _prepare_inputs(X, y)
         self.n_groups_ = _prepare_groups(groups, len(y_values))[1]
         self.available_metrics_ = tuple(self.metric_results_.keys()) if self.metric_results_ else tuple()

@@ -37,6 +37,7 @@ best next candidate is computed independently and cheaply, and only the final
 from __future__ import annotations
 
 import logging
+import time
 
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -124,6 +125,9 @@ class _FamilySearchState:
         self.evaluated_y = []
         self.models = []
         self.losses = []
+        # Wall-clock spent in real candidate fits (vs. GP refits/acquisition),
+        # reported as stats["fit_seconds"] for rid.core's opt-in profiler.
+        self.fit_seconds = 0.0
 
         self.mu = np.zeros(self.n_candidates)
         # Uninformed prior: huge variance until the GP has at least one observation.
@@ -218,6 +222,7 @@ class _FamilySearchState:
         self._K_post_full = (kernel(self._X_gp) - K_cross_all.T @ K_inv_cross) * y_var_scale
 
     def evaluate(self, idx, X_boot, y_boot, X_eval, y_eval, refit=True):
+        fit_start = time.perf_counter()
         model, loss = fit_pool_candidate(
             self.build_estimator,
             self.candidate_configs[idx],
@@ -227,6 +232,7 @@ class _FamilySearchState:
             X_eval,
             y_eval,
         )
+        self.fit_seconds += time.perf_counter() - fit_start
 
         self.evaluated_idx.append(idx)
         self._evaluated_set.add(idx)
@@ -431,7 +437,9 @@ def run_joint_truvarimp(
         ``pinned``: the search-space dimensions each family fixes through its
         model kwargs (``{family_name: [dimension, ...]}``), and
         ``evaluated_candidate_indices``: each family's pool ``candidate_index``
-        per evaluated candidate, aligned with ``family_models``/``family_losses``.
+        per evaluated candidate, aligned with ``family_models``/``family_losses``,
+        and ``fit_seconds``: wall-clock spent in real candidate fits (the rest
+        of the search is GP refits and acquisition).
     candidate_pool : dict, optional
         This bootstrap's shared pool from
         :func:`rid.candidate_pool.build_candidate_pool` (what
@@ -494,8 +502,10 @@ def run_joint_truvarimp(
             # trainer with no known continuous space): fall back to its own
             # .train() once, and fold the result straight into the output
             # rather than active-searching it.
+            fit_start = time.perf_counter()
             models, losses = trainer.train(X_boot, y_boot, X_eval, y_eval, 1, b, model_kwargs)
             state = _FallbackFamilyState(family_name, models, losses)
+            state.fit_seconds = time.perf_counter() - fit_start
             states.append(state)
             family_of_state[family_name] = family_name
 
@@ -608,6 +618,9 @@ def run_joint_truvarimp(
         # Pool candidate_index of every evaluated candidate, aligned with
         # family_models/family_losses (for a fallback family: its own fit order).
         "evaluated_candidate_indices": family_indices,
+        # Wall-clock of the real candidate fits alone; the rest of the search
+        # time is GP refits and acquisition.
+        "fit_seconds": float(sum(state.fit_seconds for state in states)),
     }
     return family_models, family_losses, stats
 

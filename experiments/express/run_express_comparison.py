@@ -61,6 +61,12 @@ feature for RID methods), and once all four are checkpointed,
 top_feature_overlap.csv, answer_key_recovery.csv (each method's rank of each
 answer-key gene), run_settings.json and summary_row.json;
 <--output-dir>/overall_summary.csv collects every finished label.
+
+--profile timers|cprofile (default off) profiles each RID bootstrap without
+changing results: <label>/<method>_profile.csv (one row per bootstrap) and, for
+cprofile, <label>/<method>_profile/bootstrap_<b>.prof. It is not a checkpoint
+setting, so a profiling run resumes from (and is skipped by) existing
+checkpoints; use a separate --output-dir to profile a method already done.
 """
 
 from __future__ import annotations
@@ -287,6 +293,19 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="RID parallel jobs (default: 1)",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("off", "timers", "cprofile"),
+        default="off",
+        help=(
+            "Per-bootstrap profiling of the RID methods (default: off). 'timers' writes "
+            "<label>/<method>_profile.csv (one row per bootstrap: stage seconds, VI seconds per "
+            "family and metric, Rashomon size per family, worker peak RSS) and logs each "
+            "bootstrap's stage summary; 'cprofile' also writes <label>/<method>_profile/"
+            "bootstrap_<b>.prof (cProfile, from inside each joblib worker). Doesn't change "
+            "results, so it isn't a checkpoint setting."
+        ),
     )
     parser.add_argument(
         "--truvarimp-total-budget",
@@ -756,7 +775,9 @@ def run_single_family_tree_rid(
     epsilon: float,
     n_bootstraps: int,
     n_jobs: int,
-) -> tuple[list[str], pd.DataFrame, dict]:
+    profile: str | None = None,
+    profile_dir: Path | None = None,
+) -> tuple[list[str], pd.DataFrame, dict, list | None]:
     # n_models_pool is left at its default: it only sets seed refits for
     # refit_seeds=True grids, and the tree grid fits each config once.
     estimator = RashomonImportanceDistribution(
@@ -766,6 +787,8 @@ def run_single_family_tree_rid(
         vi_metrics=(rid_metric,),
         performance_metrics=("accuracy", "auprc"),
         n_jobs=n_jobs,
+        profile=profile,
+        profile_dir=profile_dir,
     )
     estimator.fit(X, y, groups=groups.to_numpy())
     n_groups = _check_n_groups(estimator, groups)
@@ -782,7 +805,7 @@ def run_single_family_tree_rid(
     perf_stats = dict(estimator.perf_stats_ or {})
     perf_stats["n_valid_bootstraps"] = estimator.n_valid_bootstraps_
     perf_stats["n_groups"] = n_groups
-    return top_features, table, perf_stats
+    return top_features, table, perf_stats, estimator.profile_
 
 
 def _build_cross_family_model_configs() -> dict:
@@ -806,7 +829,9 @@ def run_cross_family_rid(
     n_bootstraps: int,
     n_jobs: int,
     truvarimp_total_budget: int,
-) -> tuple[list[str], pd.DataFrame, dict]:
+    profile: str | None = None,
+    profile_dir: Path | None = None,
+) -> tuple[list[str], pd.DataFrame, dict, list | None]:
     # Every family is in the shared candidate pool, so n_models_per_class is unused.
     estimator = CrossFamilyRashomonImportanceDistribution(
         model_configs=_build_cross_family_model_configs(),
@@ -818,6 +843,8 @@ def run_cross_family_rid(
         n_jobs=n_jobs,
         candidate_search="truvarimp_joint",
         truvarimp_config={"total_budget": truvarimp_total_budget},
+        profile=profile,
+        profile_dir=profile_dir,
     )
     estimator.fit(X, y, groups=groups.to_numpy())
     n_groups = _check_n_groups(estimator, groups)
@@ -837,7 +864,7 @@ def run_cross_family_rid(
         "n_valid_bootstraps": estimator.n_valid_bootstraps_,
         "n_groups": n_groups,
     }
-    return top_features, table, perf_summary
+    return top_features, table, perf_summary, estimator.profile_
 
 
 def _build_comparison_table(method_feature_lists: dict[str, list[str]]) -> pd.DataFrame:
@@ -1127,9 +1154,14 @@ def _run_method(
     args: argparse.Namespace,
     cv,
     stepwise_scoring: str,
-) -> tuple[list[str], pd.DataFrame, dict]:
+    profile_dir: Path | None = None,
+) -> tuple[list[str], pd.DataFrame, dict, list | None]:
     """Run one method on the train rows only (X, y, groups are the holdout split's
-    train part); return (top_features, per-feature table, method-specific info)."""
+    train part); return (top_features, per-feature table, method-specific info,
+    RID per-bootstrap profile records or None). --profile only affects the RID
+    methods; profile_dir is where --profile cprofile puts their .prof files."""
+
+    profile = None if args.profile == "off" else args.profile
 
     if method in ("stepwise_rf", "stepwise_logreg"):
         if method == "stepwise_rf":
@@ -1160,14 +1192,14 @@ def _run_method(
             "model_kwargs": model_kwargs,
             "search_model_train_cv_evaluation": search_eval,
         }
-        return features, history, info
+        return features, history, info, None
 
     if method == "rid_tree":
         logger.info(
             f"[rid_tree] metric={args.rid_metric} epsilon={args.rid_epsilon} "
             f"n_bootstraps={args.rid_n_bootstraps} (grouped by patient)"
         )
-        features, table, perf = run_single_family_tree_rid(
+        features, table, perf, profile_records = run_single_family_tree_rid(
             X=X,
             y=y,
             groups=groups,
@@ -1176,8 +1208,11 @@ def _run_method(
             epsilon=args.rid_epsilon,
             n_bootstraps=args.rid_n_bootstraps,
             n_jobs=args.rid_n_jobs,
+            profile=profile,
+            profile_dir=profile_dir,
         )
-        return features, table, {"metric": args.rid_metric, "rashomon_oob_perf_stats": perf}
+        info = {"metric": args.rid_metric, "rashomon_oob_perf_stats": perf}
+        return features, table, info, profile_records
 
     candidate_search = "truvarimp_joint"
     logger.info(
@@ -1185,7 +1220,7 @@ def _run_method(
         f"n_bootstraps={args.rid_n_bootstraps} (grouped by patient) candidate_search={candidate_search} "
         f"total_budget={args.truvarimp_total_budget}"
     )
-    features, table, perf = run_cross_family_rid(
+    features, table, perf, profile_records = run_cross_family_rid(
         X=X,
         y=y,
         groups=groups,
@@ -1195,13 +1230,15 @@ def _run_method(
         n_bootstraps=args.rid_n_bootstraps,
         n_jobs=args.rid_n_jobs,
         truvarimp_total_budget=args.truvarimp_total_budget,
+        profile=profile,
+        profile_dir=profile_dir,
     )
     info = {
         "metric": args.rid_metric,
         "candidate_search": candidate_search,
         "rashomon_oob_perf_stats": perf,
     }
-    return features, table, info
+    return features, table, info, profile_records
 
 
 def _run_label(args: argparse.Namespace, output_dir: Path) -> dict | None:
@@ -1257,8 +1294,18 @@ def _run_label(args: argparse.Namespace, output_dir: Path) -> dict | None:
             continue
 
         started = time.time()
-        features, table, info = _run_method(method, X_train, y_train, groups_train, args, cv, stepwise_scoring)
+        profile_dir = label_output_dir / f"{method}_profile" if args.profile == "cprofile" else None
+        features, table, info, profile_records = _run_method(
+            method, X_train, y_train, groups_train, args, cv, stepwise_scoring, profile_dir=profile_dir
+        )
         elapsed = time.time() - started
+        if profile_records is not None:
+            # One row per bootstrap; written before the checkpoint so a profiling
+            # run that dies in the evaluator panel still leaves its profile.
+            profile_path = label_output_dir / f"{method}_profile.csv"
+            _write_csv_atomic(pd.DataFrame(profile_records), profile_path)
+            logger.info(f"[{method}] per-bootstrap profile: {profile_path}"
+                        + (f" (cProfile dumps in {profile_dir})" if profile_dir is not None else ""))
 
         # Common holdout evaluation: every method's features scored the same way (fit on
         # train, scored on the untouched test patients), under a panel of evaluators
@@ -1275,6 +1322,8 @@ def _run_label(args: argparse.Namespace, output_dir: Path) -> dict | None:
             "top_features": features,
             "ranking": table["feature"].tolist(),
             "elapsed_seconds": elapsed,
+            # Not a setting: profiling doesn't change results (it does inflate elapsed_seconds).
+            "profile": args.profile,
             "common_eval": common_eval,
             **info,
         }
@@ -1417,6 +1466,7 @@ def main() -> None:
     logger.info(f"  correlation_threshold:    {args.correlation_threshold}")
     logger.info(f"  holdout:                  fraction={args.holdout_fraction} seed={args.holdout_seed} (by patient)")
     logger.info(f"  truvarimp_total_budget:   {args.truvarimp_total_budget}")
+    logger.info(f"  profile:                  {args.profile}")
     logger.info(f"  output_dir:               {output_dir}")
     logger.info("=" * 70)
 
