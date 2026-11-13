@@ -729,7 +729,18 @@ def _run_bootstrap_task(worker, b, suppress_warnings, *args, profile=None, profi
         timers = kwargs["timers"] = {}
     profiler = cProfile.Profile() if profile == "cprofile" else None
     if profiler is not None:
-        profiler.enable()
+        try:
+            profiler.enable()
+        except ValueError:
+            # Python >= 3.12 allows one active profiler per process, so this
+            # fails when n_jobs=1 runs the worker inside a caller that is
+            # already profiled. Keep the timers rather than fail the fit.
+            logger.warning(
+                "bootstrap %d: another profiler is already active in this process; "
+                "skipping its cProfile dump (timers are still recorded)",
+                b,
+            )
+            profiler = None
     try:
         with warnings.catch_warnings():
             if suppress_warnings:
