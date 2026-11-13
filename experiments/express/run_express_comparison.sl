@@ -4,7 +4,7 @@
 #SBATCH --error=express-comparison_%A_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=50
-#SBATCH --mem=32G
+#SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --array=0-3
 #SBATCH --mail-type=END,FAIL
@@ -36,6 +36,9 @@
 # Timed-out or failed methods: resubmit -- checkpointed methods are skipped. To
 # rerun one method only, e.g. cross_family_unweighted_truvarimp (method 3):
 #   sbatch --array=3 experiments/express/run_express_comparison.sl
+#
+# Memory: 128G. cross_family_unweighted_truvarimp OOM'd at 32G and peaked at
+# ~70G RSS across its 50 workers (job 9043384); the other methods need far less.
 # -------------------------------------------------------
 
 set -euo pipefail
