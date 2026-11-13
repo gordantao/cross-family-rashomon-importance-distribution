@@ -1,0 +1,18 @@
+name: zikry_lab-express
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - numpy>=1.26
+  - pandas>=2.1
+  - scikit-learn>=1.4  # >=1.4 also covers StratifiedGroupKFold (added in 1.0)
+  - joblib>=1.4        # bundled with scikit-learn; >=1.4 for Parallel(return_as="generator_unordered")
+  - openpyxl>=3.1      # reads Table S9 and the BeatAML sample mapping (.xlsx), prepare step only
+  - kneed>=0.8          # Kneedle elbow detection for --correlation-threshold auto
+  - pip
+
+# Covers: download_express_data.sh (curl/shasum only), prepare_express_data.py and
+# run_express_comparison.py. Same packages as experiments/gdsc/environment.yml.
+# The scripts import the shared `rid` package from the repo root at runtime via a
+# sys.path insert, so `rid` is not listed here.
